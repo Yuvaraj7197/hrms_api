@@ -2,8 +2,8 @@ from rest_framework import status, views, permissions
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import authenticate
-from .models import User, Tenant, OTP
-from .serializers import RegisterSerializer, OTPVerifySerializer, OnboardingSerializer, UserSerializer
+from .models import User, Tenant, OTP, Department, Role, Employee
+from .serializers import RegisterSerializer, OTPVerifySerializer, OnboardingSerializer, UserSerializer, DepartmentSerializer, RoleSerializer, EmployeeSerializer
 import random
 
 class RegisterView(views.APIView):
@@ -86,6 +86,63 @@ class VerifyOTPView(views.APIView):
         
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+class OnboardingRolesView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        tenant = request.user.tenant
+        roles_data = request.data.get('roles', [])
+        
+        # Clear existing and save new
+        Role.objects.filter(tenant=tenant).delete()
+        
+        for role in roles_data:
+            Role.objects.create(
+                tenant=tenant,
+                name=role.get('name'),
+                description=role.get('description'),
+                level=role.get('level', 1)
+            )
+        
+        return Response({"message": "Roles saved successfully"})
+
+class OnboardingEmployeesView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        tenant = request.user.tenant
+        employees_data = request.data.get('employees', [])
+        
+        # We handle employee creation and hierarchy
+        # 1. Create employees first
+        for emp in employees_data:
+            dept_name = emp.get('department')
+            role_name = emp.get('role')
+            
+            dept = Department.objects.filter(tenant=tenant, name=dept_name).first()
+            role = Role.objects.filter(tenant=tenant, name=role_name).first()
+            
+            Employee.objects.update_or_create(
+                tenant=tenant,
+                email=emp.get('email'),
+                defaults={
+                    'name': emp.get('name'),
+                    'employee_code': emp.get('employeeCode'),
+                    'department': dept,
+                    'designation': role,
+                }
+            )
+        
+        # 2. Setup Reporting Hierarchy
+        for emp in employees_data:
+            manager_email = emp.get('reportingTo')
+            if manager_email:
+                manager = Employee.objects.filter(tenant=tenant, email=manager_email).first()
+                if manager:
+                    Employee.objects.filter(tenant=tenant, email=emp.get('email')).update(reporting_to=manager)
+        
+        return Response({"message": "Employees and Hierarchy saved successfully"})
+
 class OnboardingSetupView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -94,13 +151,36 @@ class OnboardingSetupView(views.APIView):
         serializer = OnboardingSerializer(tenant, data=request.data, partial=True)
         if serializer.is_valid():
             serializer.save()
-            tenant.onboarding_step = 2 # Setup done
+            step = request.data.get('onboarding_step', 2)
+            tenant.onboarding_step = step
             tenant.save()
             return Response({
                 "message": "Onboarding step updated",
                 "tenant": serializer.data
             })
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class OnboardingDepartmentsView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        tenant = request.user.tenant
+        departments_data = request.data.get('departments', [])
+        
+        # Clear existing and save new
+        Department.objects.filter(tenant=tenant).delete()
+        
+        for dept in departments_data:
+            Department.objects.create(
+                tenant=tenant,
+                name=dept.get('name'),
+                head_count=dept.get('headCount', 0)
+            )
+        
+        tenant.onboarding_step = 3
+        tenant.save()
+        
+        return Response({"message": "Departments saved successfully"})
 
 class LoginView(views.APIView):
     permission_classes = [permissions.AllowAny]

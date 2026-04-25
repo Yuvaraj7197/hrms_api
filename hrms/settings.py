@@ -86,7 +86,7 @@ DATABASES = {
         "ENGINE": "django.db.backends.mysql",
         "NAME": "hrms_local_v1",
         "USER": "root",
-       "PASSWORD": os.getenv("DAP_DB_PASSWORD", "pms@123"),
+        "PASSWORD": os.getenv("DAP_DB_PASSWORD", "pms@123"),
         "HOST": "localhost",
         "PORT": "3306",
     }
