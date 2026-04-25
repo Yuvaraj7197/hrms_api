@@ -1,0 +1,31 @@
+django
+djangorestframework
+mysqlclient
+django-storages
+django-cors-headers
+gunicorn
+django-role-permissions
+requests
+dj-rest-auth[with_social]==6.0.0 
+djangorestframework-simplejwt
+django-ratelimit
+google-auth
+WeasyPrint
+pillow
+
+# Specify the primary index for the internal UAT repository
+# --index-url https://phonepe.mycloudrepo.io/public/repositories/phonepe-pg-sdk-python
+
+# Specify an additional index for fallback (e.g., PyPI)
+# --extra-index-url https://pypi.org/simple
+
+# List the package to be installed
+# phonepe_sdk==1.1.0
+
+#phonepe_sdk==2.1.5 --index-url https://phonepe.mycloudrepo.io/public/repositories/phonepe-pg-sdk-python  --extra-index-url https://pypi.org/simple
+
+# phonepe version 2.1.2
+# Install phonepe_sdk using pip with custom index
+# Note: This package requires Python <3.9
+
+razorpay
