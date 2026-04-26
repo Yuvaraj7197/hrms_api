@@ -6,10 +6,10 @@ class TenantMiddleware:
 
     tenant_map = {
            
-            'localhost:4200': 'hrms_local',
-            'localhost:4211': 'hrms_local',
-            'localhost': 'hrms_local',
-            '127.0.0.1': 'hrms_local'
+            'localhost:4200': 'hrms_local_v1',
+            'localhost:4211': 'hrms_local_v1',
+            'localhost': 'hrms_local_v1',
+            '127.0.0.1': 'hrms_local_v1'
         }
 
     def __init__(self, get_response):

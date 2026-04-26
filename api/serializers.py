@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import User, Tenant, OTP, Department, Role, Employee
+from .models import User, Tenant, OTP, Department, Role, Employee, AttendanceRecord, PayrollRecord, PayrollAuditLog
 
 class TenantSerializer(serializers.ModelSerializer):
     class Meta:
@@ -13,10 +13,11 @@ class TenantSerializer(serializers.ModelSerializer):
 
 class UserSerializer(serializers.ModelSerializer):
     tenant = TenantSerializer(read_only=True)
+    employee_code = serializers.CharField(source='employee_profile.employee_code', read_only=True, default='')
     
     class Meta:
         model = User
-        fields = ['id', 'username', 'email', 'role', 'tenant', 'is_verified']
+        fields = ['id', 'username', 'email', 'role', 'tenant', 'is_verified', 'employee_code']
 
 class RegisterSerializer(serializers.Serializer):
     company_name = serializers.CharField(max_length=255)
@@ -52,3 +53,18 @@ class EmployeeSerializer(serializers.ModelSerializer):
     class Meta:
         model = Employee
         fields = ['id', 'name', 'email', 'employee_code', 'department', 'designation', 'reporting_to', 'status']
+
+class AttendanceRecordSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AttendanceRecord
+        fields = ['id', 'employee', 'date', 'check_in', 'check_out', 'status', 'work_hours', 'location']
+
+class PayrollRecordSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PayrollRecord
+        fields = ['id', 'employee', 'cycle_month', 'base_salary', 'allowances', 'deductions', 'loan_emi', 'tax_status', 'net_pay', 'status']
+
+class PayrollAuditLogSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PayrollAuditLog
+        fields = ['id', 'payroll_record', 'action', 'performed_by', 'created_at', 'notes']
