@@ -102,13 +102,14 @@ class Employee(TenantScopedModel):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='employee_profile', null=True, blank=True)
     name = models.CharField(max_length=255)
     email = models.EmailField()
-    # phone = models.CharField(max_length=20, null=True, blank=True)
+    phone = models.CharField(max_length=20, null=True, blank=True)
     employee_code = models.CharField(max_length=50, null=True, blank=True)
     department = models.ForeignKey(Department, on_delete=models.SET_NULL, null=True, related_name='employees')
     designation = models.ForeignKey(Role, on_delete=models.SET_NULL, null=True, related_name='employees')
     reporting_to = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='subordinates')
     joining_date = models.DateField(null=True, blank=True)
     status = models.CharField(max_length=50, default='Active')
+    base_salary = models.DecimalField(max_digits=12, decimal_places=2, default=0)
 
     class Meta:
         db_table = "t_employee"

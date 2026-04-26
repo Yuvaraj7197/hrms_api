@@ -476,14 +476,14 @@ class PayrollDataView(views.APIView):
 
         employees = Employee.objects.filter(tenant=tenant).select_related('department')
         for employee in employees:
-            base_seed = Decimal(50000 + ((employee.id % 10) * 5000))
+            base_salary = employee.base_salary if employee.base_salary else Decimal('0')
             PayrollRecord.objects.get_or_create(
                 tenant=tenant,
                 employee=employee,
                 cycle_month=cycle_month,
                 defaults={
-                    'base_salary': base_seed,
-                    'allowances': base_seed * Decimal('0.2'),
+                    'base_salary': base_salary,
+                    'allowances': base_salary * Decimal('0.2'),
                     'deductions': Decimal('0'),
                     'loan_emi': Decimal('5000') if employee.id % 4 == 0 else Decimal('0'),
                     'tax_status': 'Pending',
@@ -701,7 +701,7 @@ class HREmployeeListView(views.APIView):
                 "employee_code": e.employee_code or "",
                 "name": e.name,
                 "email": e.email,
-                # "phone": e.phone or "",
+                "phone": e.phone or "",
                 "department_id": e.department_id,
                 "department_name": e.department.name if e.department else "",
                 "designation_id": e.designation_id,
@@ -711,6 +711,7 @@ class HREmployeeListView(views.APIView):
                 "joining_date": str(e.joining_date) if e.joining_date else "",
                 "status": e.status,
                 "invite_sent": getattr(e, 'invite_sent', False),
+                "base_salary": float(e.base_salary) if e.base_salary else 0,
             }
             for e in qs
         ]
@@ -735,13 +736,14 @@ class HREmployeeListView(views.APIView):
                 tenant=tenant,
                 name=payload.get('name'),
                 email=payload.get('email'),
-                # phone=payload.get('phone', ''),
+                phone=payload.get('phone', ''),
                 employee_code=emp_code,
                 department=dept,
                 designation=role,
                 reporting_to=manager,
                 joining_date=payload.get('joining_date') or None,
                 status=payload.get('status', 'Active'),
+                base_salary=payload.get('base_salary', 0),
             )
 
             # Create login account if requested
@@ -796,10 +798,11 @@ class HREmployeeDetailView(views.APIView):
             return Response({"error": "Employee not found"}, status=404)
         return Response({
             "id": e.id, "employee_code": e.employee_code, "name": e.name,
-            "email": e.email, "status": e.status,
+            "email": e.email, "phone": e.phone or "", "status": e.status,
             "department_id": e.department_id, "department_name": e.department.name if e.department else "",
             "designation_id": e.designation_id, "designation_name": e.designation.name if e.designation else "",
             "reporting_to_id": e.reporting_to_id, "joining_date": str(e.joining_date) if e.joining_date else "",
+            "base_salary": float(e.base_salary) if e.base_salary else 0,
         })
 
     def put(self, request, employee_id):
@@ -813,9 +816,11 @@ class HREmployeeDetailView(views.APIView):
 
         p = request.data
         e.name = p.get('name', e.name)
-        # e.phone = p.get('phone', e.phone)
+        e.phone = p.get('phone', e.phone)
         e.status = p.get('status', e.status)
         e.joining_date = p.get('joining_date', e.joining_date)
+        if 'base_salary' in p:
+            e.base_salary = p['base_salary']
         if p.get('department_id'):
             e.department = Department.objects.filter(tenant=tenant, id=safe_int(p['department_id'])).first()
         if p.get('designation_id'):
