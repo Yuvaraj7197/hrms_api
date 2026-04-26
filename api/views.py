@@ -139,18 +139,37 @@ class OnboardingEmployeesView(views.APIView):
         employees_data = request.data.get('employees', [])
         
         # We handle employee creation and hierarchy
-        # 1. Create employees first
+        # 1. Create employees and their User accounts first
         for emp in employees_data:
             dept_name = emp.get('department') or emp.get('departmentId')
             role_name = emp.get('role') or emp.get('roleId')
+            email = emp.get('email')
+            password = emp.get('password')
             
             dept = Department.objects.filter(tenant=tenant, name=dept_name).first()
             role = Role.objects.filter(tenant=tenant, name=role_name).first()
             
-            Employee.objects.update_or_create(
+            # Create/Update User account if password is provided
+            user = None
+            if email and password:
+                username = email.split('@')[0] + "_" + str(random.randint(100, 999))
+                user, created = User.objects.get_or_create(
+                    email=email,
+                    defaults={
+                        'username': username,
+                        'tenant': tenant,
+                        'role': 'EMPLOYEE',
+                        'is_verified': True
+                    }
+                )
+                user.set_password(password)
+                user.save()
+
+            employee, _ = Employee.objects.update_or_create(
                 tenant=tenant,
-                email=emp.get('email'),
+                email=email,
                 defaults={
+                    'user': user,
                     'name': emp.get('name'),
                     # 'phone': emp.get('phone') or '',
                     'employee_code': emp.get('employeeCode') or emp.get('employee_code'),
@@ -172,7 +191,7 @@ class OnboardingEmployeesView(views.APIView):
         tenant.onboarding_step = 5
         tenant.save(update_fields=['onboarding_step'])
 
-        return Response({"message": "Employees and Hierarchy saved successfully"})
+        return Response({"message": "Employees and User accounts created successfully"})
 
 class OnboardingSetupView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -699,7 +718,7 @@ class HREmployeeListView(views.APIView):
 
     def post(self, request):
         """HR/Admin creates a new employee and optionally creates a User account."""
-        if request.user.role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+        if request.user.role not in ['ADMIN', 'SUPER_ADMIN', 'HR','MANAGER']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         payload = request.data
@@ -726,20 +745,30 @@ class HREmployeeListView(views.APIView):
             )
 
             # Create login account if requested
-            if payload.get('create_account', True):
-                temp_password = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
-                username = payload.get('email').split('@')[0] + str(employee.id)
-                user = User.objects.create_user(
-                    username=username,
+            create_account = payload.get('create_account')
+            if str(create_account).lower() == 'true' or create_account is True:
+                password = payload.get('password')
+                temp_password = password if password else ''.join(random.choices(string.ascii_letters + string.digits, k=10))
+                username = payload.get('email').split('@')[0] + "_" + str(random.randint(100, 999))
+                
+                user, created = User.objects.get_or_create(
                     email=payload.get('email'),
-                    password=temp_password,
-                    tenant=tenant,
-                    role='EMPLOYEE',
-                    is_verified=True,
+                    defaults={
+                        'username': username,
+                        'tenant': tenant,
+                        'role': 'EMPLOYEE',
+                        'is_verified': True
+                    }
                 )
+                
+                # Update password if newly created or if admin explicitly provided one
+                if created or password:
+                    user.set_password(temp_password)
+                    user.save()
+                    
                 employee.user = user
                 employee.save()
-                print(f"[HR] New employee account: {username} / {temp_password}")
+                print(f"[HR] New/Updated employee account: {username} / {temp_password}")
 
         return Response({
             "message": "Employee created successfully",
