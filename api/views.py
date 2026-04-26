@@ -425,47 +425,83 @@ class AttendanceDataView(views.APIView):
 
     def get(self, request):
         tenant = request.user.tenant
-        target_date = request.query_params.get('date') or timezone.localdate().isoformat()
+        target_date = request.query_params.get('date')
+        target_month = request.query_params.get('month')
 
-        employees = Employee.objects.filter(tenant=tenant).select_related('department')
-        for idx, employee in enumerate(employees):
-            default_status = 'Absent' if idx % 5 == 0 else ('Late' if idx % 3 == 0 else 'Present')
-            default_check_in = '09:45:00' if default_status == 'Late' else '09:00:00'
-            default_check_out = '18:00:00' if default_status != 'Absent' else None
-            default_work_hours = 0 if default_status == 'Absent' else (8.25 if default_status == 'Late' else 9.0)
-
-            AttendanceRecord.objects.get_or_create(
-                tenant=tenant,
-                employee=employee,
-                date=target_date,
-                defaults={
-                    'check_in': default_check_in,
-                    'check_out': default_check_out,
-                    'status': default_status,
-                    'work_hours': default_work_hours,
-                    'location': 'Remote/Office',
-                }
+        if target_month:
+            # Monthly view - Fetch all employees to ensure everyone is in the grid
+            employees = Employee.objects.filter(tenant=tenant).select_related('department')
+            records = AttendanceRecord.objects.filter(
+                tenant=tenant, date__startswith=target_month
             )
+            
+            # Map records by employee ID
+            record_map = {}
+            for record in records:
+                emp_id = str(record.employee_id)
+                if emp_id not in record_map:
+                    record_map[emp_id] = {}
+                record_map[emp_id][record.date.isoformat()] = {
+                    'id': str(record.id),
+                    'status': record.status,
+                    'checkIn': record.check_in.strftime('%H:%M') if record.check_in else '',
+                    'checkOut': record.check_out.strftime('%H:%M') if record.check_out else '',
+                    'workHours': float(record.work_hours)
+                }
 
-        records = AttendanceRecord.objects.filter(tenant=tenant, date=target_date).select_related('employee__department')
-        response_data = [
-            {
-                'id': str(record.id),
-                'employeeId': str(record.employee_id),
-                'employeeName': record.employee.name,
-                'employeeCode': record.employee.employee_code or '',
-                'departmentName': record.employee.department.name if record.employee.department else 'N/A',
-                'date': record.date.isoformat(),
-                'checkIn': record.check_in.strftime('%H:%M') if record.check_in else '',
-                'checkOut': record.check_out.strftime('%H:%M') if record.check_out else '',
-                'status': record.status,
-                'workHours': float(record.work_hours),
-                'location': record.location,
-            }
-            for record in records
-        ]
+            grouped_data = []
+            for emp in employees:
+                emp_id = str(emp.id)
+                grouped_data.append({
+                    'employeeId': emp_id,
+                    'employeeName': emp.name,
+                    'employeeCode': emp.employee_code or '',
+                    'departmentName': emp.department.name if emp.department else 'N/A',
+                    'records': record_map.get(emp_id, {})
+                })
+            
+            return Response({'monthly_data': grouped_data})
 
-        return Response({'records': response_data})
+        else:
+            target_date = target_date or timezone.localdate().isoformat()
+            employees = Employee.objects.filter(tenant=tenant).select_related('department')
+            records = AttendanceRecord.objects.filter(tenant=tenant, date=target_date)
+            record_map = {str(r.employee_id): r for r in records}
+
+            response_data = []
+            for employee in employees:
+                record = record_map.get(str(employee.id))
+                if record:
+                    response_data.append({
+                        'id': str(record.id),
+                        'employeeId': str(employee.id),
+                        'employeeName': employee.name,
+                        'employeeCode': employee.employee_code or '',
+                        'departmentName': employee.department.name if employee.department else 'N/A',
+                        'date': record.date.isoformat(),
+                        'checkIn': record.check_in.strftime('%H:%M') if record.check_in else '',
+                        'checkOut': record.check_out.strftime('%H:%M') if record.check_out else '',
+                        'status': record.status,
+                        'workHours': float(record.work_hours),
+                        'location': record.location,
+                    })
+                else:
+                    # No record found in DB, return as Absent or '-' status but don't create it in DB
+                    response_data.append({
+                        'id': None,
+                        'employeeId': str(employee.id),
+                        'employeeName': employee.name,
+                        'employeeCode': employee.employee_code or '',
+                        'departmentName': employee.department.name if employee.department else 'N/A',
+                        'date': target_date,
+                        'checkIn': '',
+                        'checkOut': '',
+                        'status': 'Absent',
+                        'workHours': 0.0,
+                        'location': 'N/A',
+                    })
+
+            return Response({'records': response_data})
 
 class PayrollDataView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -477,7 +513,7 @@ class PayrollDataView(views.APIView):
         employees = Employee.objects.filter(tenant=tenant).select_related('department')
         for employee in employees:
             base_salary = employee.base_salary if employee.base_salary else Decimal('0')
-            PayrollRecord.objects.get_or_create(
+            record, created = PayrollRecord.objects.get_or_create(
                 tenant=tenant,
                 employee=employee,
                 cycle_month=cycle_month,
@@ -491,6 +527,12 @@ class PayrollDataView(views.APIView):
                     'status': 'Pending',
                 }
             )
+            
+            # Sync base salary if the record is still pending and doesn't match
+            if not created and record.status == 'Pending' and record.base_salary != base_salary:
+                record.base_salary = base_salary
+                record.allowances = base_salary * Decimal('0.2')
+                record.save(update_fields=['base_salary', 'allowances'])
 
         records = PayrollRecord.objects.filter(tenant=tenant, cycle_month=cycle_month).select_related('employee__department')
         response_data = [
@@ -612,19 +654,48 @@ class AttendanceRegularizeView(views.APIView):
     def post(self, request):
         tenant = request.user.tenant
         record_id = request.data.get('record_id')
+        employee_id = request.data.get('employee_id')
+        target_date = request.data.get('date')
         check_in = request.data.get('check_in')
         check_out = request.data.get('check_out')
         status_val = request.data.get('status')
 
         try:
-            record = AttendanceRecord.objects.get(tenant=tenant, id=record_id)
-            if check_in: record.check_in = check_in
-            if check_out: record.check_out = check_out
-            if status_val: record.status = status_val
-            record.save()
-            return Response({"message": "Attendance regularized successfully"})
+            if record_id:
+                record = AttendanceRecord.objects.get(tenant=tenant, id=record_id)
+            elif employee_id and target_date:
+                # If record doesn't exist, get or create it
+                record, created = AttendanceRecord.objects.get_or_create(
+                    tenant=tenant,
+                    employee_id=employee_id,
+                    date=target_date,
+                    defaults={
+                        'status': status_val or 'Present',
+                        'check_in': check_in or '09:00:00',
+                        'check_out': check_out or '18:00:00',
+                        'work_hours': 9.0,
+                        'location': 'Office'
+                    }
+                )
+                if not created:
+                    if check_in: record.check_in = check_in
+                    if check_out: record.check_out = check_out
+                    if status_val: record.status = status_val
+                    record.save()
+            else:
+                return Response({"error": "Missing record_id or employee_id + date"}, status=400)
+
+            if record_id and not (employee_id and target_date):
+                 if check_in: record.check_in = check_in
+                 if check_out: record.check_out = check_out
+                 if status_val: record.status = status_val
+                 record.save()
+                 
+            return Response({"message": "Attendance processed successfully"})
         except AttendanceRecord.DoesNotExist:
             return Response({"error": "Record not found"}, status=404)
+        except Exception as e:
+            return Response({"error": str(e)}, status=500)
 
 class PayrollProcessView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
