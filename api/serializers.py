@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import User, Tenant, OTP, Department, Role, Employee, AttendanceRecord, PayrollRecord, PayrollAuditLog
+from .models import User, Tenant, OTP, Department, Role, Employee, EmployeeDocument, AttendanceRecord, PayrollRecord, PayrollAuditLog
 
 class TenantSerializer(serializers.ModelSerializer):
     class Meta:
@@ -49,10 +49,26 @@ class RoleSerializer(serializers.ModelSerializer):
         model = Role
         fields = ['id', 'name', 'description', 'level']
 
+class EmployeeDocumentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = EmployeeDocument
+        fields = ['id', 'document_type', 'file_url', 'uploaded_at']
+
 class EmployeeSerializer(serializers.ModelSerializer):
+    documents = EmployeeDocumentSerializer(many=True, read_only=True)
+    
     class Meta:
         model = Employee
-        fields = ['id', 'name', 'email', 'employee_code', 'department', 'designation', 'reporting_to', 'status']
+        fields = [
+            'id', 'name', 'email', 'phone', 'employee_code', 
+            'department', 'designation', 'reporting_to', 'joining_date', 
+            'status', 'base_salary',
+            'dob', 'gender', 'address',
+            'bank_name', 'account_number', 'ifsc_code',
+            'emergency_contact_name', 'emergency_contact_phone',
+            'onboarding_status', 'onboarding_completed_at',
+            'documents'
+        ]
 
 class AttendanceRecordSerializer(serializers.ModelSerializer):
     class Meta:

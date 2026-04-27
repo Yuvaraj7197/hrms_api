@@ -4,8 +4,8 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import authenticate
 from django.utils import timezone
 from decimal import Decimal
-from .models import User, Tenant, OTP, Department, Role, Employee, AttendanceRecord, PayrollRecord, PayrollAuditLog
-from .serializers import RegisterSerializer, OTPVerifySerializer, OnboardingSerializer, UserSerializer, DepartmentSerializer, RoleSerializer, EmployeeSerializer, AttendanceRecordSerializer
+from .models import User, Tenant, OTP, Department, Role, Employee, AttendanceRecord, PayrollRecord, PayrollAuditLog, EmployeeDocument
+from .serializers import RegisterSerializer, OTPVerifySerializer, OnboardingSerializer, UserSerializer, DepartmentSerializer, RoleSerializer, EmployeeSerializer, AttendanceRecordSerializer, EmployeeDocumentSerializer
 from django.db import transaction
 import random
 from rest_framework.permissions import AllowAny
@@ -387,6 +387,10 @@ class OnboardingEmployeeDetailView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def put(self, request, employee_id):
+        """Update an employee (full or partial).
+        All fields are optional; if a field is omitted its current value is retained.
+        Foreign‑key fields are only altered when the corresponding ID is supplied in the payload.
+        """
         tenant = request.user.tenant
         employee = Employee.objects.filter(tenant=tenant, id=employee_id).first()
         if not employee:
@@ -394,21 +398,32 @@ class OnboardingEmployeeDetailView(views.APIView):
 
         payload = request.data
 
-        department_id = payload.get('departmentId') or payload.get('department_id')
-        role_id = payload.get('roleId') or payload.get('role_id')
-        reporting_to_id = payload.get('reportingTo') or payload.get('reporting_to')
+        # Helper to fetch related objects safely
+        def get_related(model, pk):
+            return model.objects.filter(tenant=tenant, id=safe_int(pk)).first() if pk else None
 
         employee.name = payload.get('name', employee.name)
         employee.email = payload.get('email', employee.email)
-        # employee.phone = payload.get('phone', employee.phone)
         employee.employee_code = payload.get('employeeCode') or payload.get('employee_code') or employee.employee_code
         employee.status = payload.get('status', employee.status)
         employee.joining_date = payload.get('joiningDate') or payload.get('joining_date') or employee.joining_date
-        employee.department = Department.objects.filter(tenant=tenant, id=safe_int(department_id)).first() if department_id else None
-        employee.designation = Role.objects.filter(tenant=tenant, id=safe_int(role_id)).first() if role_id else None
-        employee.reporting_to = Employee.objects.filter(tenant=tenant, id=safe_int(reporting_to_id)).first() if reporting_to_id else None
-        employee.save()
+        # Onboarding fields – optional updates
+        employee.dob = payload.get('dob') or employee.dob
+        employee.gender = payload.get('gender') or employee.gender
+        employee.address = payload.get('address') or employee.address
+        employee.bank_name = payload.get('bank_name') or employee.bank_name
+        employee.account_number = payload.get('account_number') or employee.account_number
+        employee.ifsc_code = payload.get('ifsc_code') or employee.ifsc_code
+        employee.emergency_contact_name = payload.get('emergency_contact_name') or employee.emergency_contact_name
+        employee.emergency_contact_phone = payload.get('emergency_contact_phone') or employee.emergency_contact_phone
+        employee.onboarding_status = payload.get('onboarding_status') or employee.onboarding_status
 
+        # Update FK relationships only when IDs are present in the request
+        employee.department = get_related(Department, payload.get('departmentId') or payload.get('department_id'))
+        employee.designation = get_related(Role, payload.get('roleId') or payload.get('role_id'))
+        employee.reporting_to = get_related(Employee, payload.get('reportingTo') or payload.get('reporting_to'))
+
+        employee.save()
         return Response({"message": "Employee updated successfully"})
 
     def delete(self, request, employee_id):
@@ -416,9 +431,12 @@ class OnboardingEmployeeDetailView(views.APIView):
         employee = Employee.objects.filter(tenant=tenant, id=employee_id).first()
         if not employee:
             return Response({"error": "Employee not found"}, status=status.HTTP_404_NOT_FOUND)
-
         employee.delete()
         return Response({"message": "Employee deleted successfully"})
+
+    def patch(self, request, employee_id):
+        """Partial update – delegate to the PUT logic for consistency."""
+        return self.put(request, employee_id)
 
 class AttendanceDataView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -758,7 +776,8 @@ class HREmployeeListView(views.APIView):
         if request.user.role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
-        qs = Employee.objects.filter(tenant=tenant).select_related('department', 'designation', 'reporting_to')
+        qs = Employee.objects.filter(tenant=tenant).select_related('department', 'designation', 'reporting_to').prefetch_related('documents')
+        
         # MANAGER sees only their department
         if request.user.role == 'MANAGER':
             try:
@@ -766,27 +785,9 @@ class HREmployeeListView(views.APIView):
                 qs = qs.filter(department=mgr_emp.department)
             except Exception:
                 qs = qs.none()
-        data = [
-            {
-                "id": e.id,
-                "employee_code": e.employee_code or "",
-                "name": e.name,
-                "email": e.email,
-                "phone": e.phone or "",
-                "department_id": e.department_id,
-                "department_name": e.department.name if e.department else "",
-                "designation_id": e.designation_id,
-                "designation_name": e.designation.name if e.designation else "",
-                "reporting_to_id": e.reporting_to_id,
-                "reporting_to_name": e.reporting_to.name if e.reporting_to else "",
-                "joining_date": str(e.joining_date) if e.joining_date else "",
-                "status": e.status,
-                "invite_sent": getattr(e, 'invite_sent', False),
-                "base_salary": float(e.base_salary) if e.base_salary else 0,
-            }
-            for e in qs
-        ]
-        return Response({"employees": data, "total": len(data)})
+        
+        serializer = EmployeeSerializer(qs, many=True)
+        return Response({"employees": serializer.data, "total": qs.count()})
 
     def post(self, request):
         """HR/Admin creates a new employee and optionally creates a User account."""
@@ -815,6 +816,15 @@ class HREmployeeListView(views.APIView):
                 joining_date=payload.get('joining_date') or None,
                 status=payload.get('status', 'Active'),
                 base_salary=payload.get('base_salary', 0),
+                dob=payload.get('dob'),
+                gender=payload.get('gender'),
+                address=payload.get('address'),
+                bank_name=payload.get('bank_name'),
+                account_number=payload.get('account_number'),
+                ifsc_code=payload.get('ifsc_code'),
+                emergency_contact_name=payload.get('emergency_contact_name'),
+                emergency_contact_phone=payload.get('emergency_contact_phone'),
+                onboarding_status=payload.get('onboarding_status', 'Pending')
             )
 
             # Create login account if requested
@@ -834,7 +844,6 @@ class HREmployeeListView(views.APIView):
                     }
                 )
                 
-                # Update password if newly created or if admin explicitly provided one
                 if created or password:
                     user.set_password(temp_password)
                     user.save()
@@ -864,17 +873,12 @@ class HREmployeeDetailView(views.APIView):
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         try:
-            e = Employee.objects.select_related('department', 'designation', 'reporting_to').get(tenant=tenant, id=employee_id)
+            e = Employee.objects.select_related('department', 'designation', 'reporting_to').prefetch_related('documents').get(tenant=tenant, id=employee_id)
         except Employee.DoesNotExist:
             return Response({"error": "Employee not found"}, status=404)
-        return Response({
-            "id": e.id, "employee_code": e.employee_code, "name": e.name,
-            "email": e.email, "phone": e.phone or "", "status": e.status,
-            "department_id": e.department_id, "department_name": e.department.name if e.department else "",
-            "designation_id": e.designation_id, "designation_name": e.designation.name if e.designation else "",
-            "reporting_to_id": e.reporting_to_id, "joining_date": str(e.joining_date) if e.joining_date else "",
-            "base_salary": float(e.base_salary) if e.base_salary else 0,
-        })
+        
+        serializer = EmployeeSerializer(e)
+        return Response(serializer.data)
 
     def put(self, request, employee_id):
         if request.user.role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
@@ -887,9 +891,20 @@ class HREmployeeDetailView(views.APIView):
 
         p = request.data
         e.name = p.get('name', e.name)
+        e.email = p.get('email', e.email)
         e.phone = p.get('phone', e.phone)
         e.status = p.get('status', e.status)
         e.joining_date = p.get('joining_date', e.joining_date)
+        e.dob = p.get('dob', e.dob)
+        e.gender = p.get('gender', e.gender)
+        e.address = p.get('address', e.address)
+        e.bank_name = p.get('bank_name', e.bank_name)
+        e.account_number = p.get('account_number', e.account_number)
+        e.ifsc_code = p.get('ifsc_code', e.ifsc_code)
+        e.emergency_contact_name = p.get('emergency_contact_name', e.emergency_contact_name)
+        e.emergency_contact_phone = p.get('emergency_contact_phone', e.emergency_contact_phone)
+        e.onboarding_status = p.get('onboarding_status', e.onboarding_status)
+
         if 'base_salary' in p:
             e.base_salary = p['base_salary']
         if p.get('department_id'):
@@ -1220,3 +1235,81 @@ class ESSLoginView(views.APIView):
                 "user": user_data
             })
         return Response({"error": "Invalid credentials"}, status=401)
+
+
+class SendOnboardingInviteView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        if request.user.role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+        
+        employee_id = request.data.get('employee_id')
+        try:
+            employee = Employee.objects.get(tenant=request.user.tenant, id=employee_id)
+            token = employee.generate_invite_token()
+            
+            # In a real app, send email here
+            invite_link = f"http://localhost:4200/onboarding/{token}"
+            print(f"Onboarding Invite for {employee.email}: {invite_link}")
+            
+            return Response({
+                "message": "Invite sent successfully",
+                "invite_link": invite_link
+            })
+        except Employee.DoesNotExist:
+            return Response({"error": "Employee not found"}, status=404)
+
+class EmployeeOnboardingPublicView(views.APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request, token):
+        try:
+            employee = Employee.objects.get(invite_token=token)
+            if employee.onboarding_status == 'Completed':
+                return Response({"error": "Onboarding already completed"}, status=400)
+            
+            serializer = EmployeeSerializer(employee)
+            return Response(serializer.data)
+        except Employee.DoesNotExist:
+            return Response({"error": "Invalid token"}, status=404)
+
+    def post(self, request, token):
+        try:
+            employee = Employee.objects.get(invite_token=token)
+            if employee.onboarding_status == 'Completed':
+                return Response({"error": "Onboarding already completed"}, status=400)
+
+            data = request.data
+            
+            # Update employee details
+            employee.dob = data.get('dob', employee.dob)
+            employee.gender = data.get('gender', employee.gender)
+            employee.address = data.get('address', employee.address)
+            employee.phone = data.get('phone', employee.phone)
+            
+            employee.bank_name = data.get('bank_name', employee.bank_name)
+            employee.account_number = data.get('account_number', employee.account_number)
+            employee.ifsc_code = data.get('ifsc_code', employee.ifsc_code)
+            
+            employee.emergency_contact_name = data.get('emergency_contact_name', employee.emergency_contact_name)
+            employee.emergency_contact_phone = data.get('emergency_contact_phone', employee.emergency_contact_phone)
+            
+            # Documents
+            docs = data.get('documents', [])
+            for doc in docs:
+                EmployeeDocument.objects.update_or_create(
+                    tenant=employee.tenant,
+                    employee=employee,
+                    document_type=doc.get('document_type'),
+                    defaults={'file_url': doc.get('file_url')}
+                )
+            
+            employee.onboarding_status = 'Completed'
+            employee.onboarding_completed_at = timezone.now()
+            employee.status = 'Active'
+            employee.save()
+            
+            return Response({"message": "Onboarding completed successfully"})
+        except Employee.DoesNotExist:
+            return Response({"error": "Invalid token"}, status=404)

@@ -111,6 +111,31 @@ class Employee(TenantScopedModel):
     status = models.CharField(max_length=50, default='Active')
     base_salary = models.DecimalField(max_digits=12, decimal_places=2, default=0)
 
+    # Personal Details
+    dob = models.DateField(null=True, blank=True)
+    gender = models.CharField(max_length=20, null=True, blank=True)
+    address = models.TextField(null=True, blank=True)
+
+    # Bank Details
+    bank_name = models.CharField(max_length=255, null=True, blank=True)
+    account_number = models.CharField(max_length=50, null=True, blank=True)
+    ifsc_code = models.CharField(max_length=20, null=True, blank=True)
+
+    # Emergency Contact
+    emergency_contact_name = models.CharField(max_length=255, null=True, blank=True)
+    emergency_contact_phone = models.CharField(max_length=20, null=True, blank=True)
+
+    # Onboarding Status
+    onboarding_status = models.CharField(max_length=20, default='Pending') # Pending, InProgress, Completed
+    invite_token = models.CharField(max_length=64, null=True, blank=True, unique=True)
+    onboarding_completed_at = models.DateTimeField(null=True, blank=True)
+
+    def generate_invite_token(self):
+        import secrets
+        self.invite_token = secrets.token_urlsafe(32)
+        self.save()
+        return self.invite_token
+
     class Meta:
         db_table = "t_employee"
 
@@ -185,3 +210,12 @@ class LeaveApplication(TenantScopedModel):
 
     def days_count(self):
         return (self.to_date - self.from_date).days + 1
+
+class EmployeeDocument(TenantScopedModel):
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='documents')
+    document_type = models.CharField(max_length=50) # Aadhar, PAN, Resume, Certificate
+    file_url = models.TextField() # In real app, use FileField
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "t_employee_document"

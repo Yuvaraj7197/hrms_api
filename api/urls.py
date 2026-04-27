@@ -19,6 +19,8 @@ from .views import (
     ESSProfileView, ESSPayslipsView,
     # Leave
     LeaveTypeView, LeaveApplicationView, LeaveApproveView,
+    # Onboarding Flow
+    SendOnboardingInviteView, EmployeeOnboardingPublicView,
 )
 
 urlpatterns = [
@@ -63,4 +65,8 @@ urlpatterns = [
     path('leave/types/',             LeaveTypeView.as_view(),               name='leave_types'),
     path('leave/apply/',             LeaveApplicationView.as_view(),        name='leave_apply'),
     path('leave/approve/',           LeaveApproveView.as_view(),            name='leave_approve'),
+
+    # ── Onboarding Flow ────────────────────────────────
+    path('employees/invite/',        SendOnboardingInviteView.as_view(),    name='hr_employee_invite'),
+    path('onboarding/public/<str:token>/', EmployeeOnboardingPublicView.as_view(), name='employee_onboarding_public'),
 ]
