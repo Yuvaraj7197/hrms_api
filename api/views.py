@@ -521,6 +521,66 @@ class AttendanceDataView(views.APIView):
 
             return Response({'records': response_data})
 
+class AttendanceReportView(views.APIView):
+    """
+    GET /api/attendance/report/?month=YYYY-MM
+    Returns per-employee monthly attendance summary:
+      present, late, absent, lop, wo, effective_days, total_work_hours
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        tenant = request.user.tenant
+        target_month = request.query_params.get('month') or timezone.localdate().strftime('%Y-%m')
+        employee_id  = request.query_params.get('employee_id')  # optional filter
+
+        qs = AttendanceRecord.objects.filter(tenant=tenant, date__startswith=target_month)
+        if employee_id:
+            qs = qs.filter(employee_id=employee_id)
+
+        # Aggregate per employee
+        from collections import defaultdict
+        emp_stats = defaultdict(lambda: {
+            'present': 0, 'late': 0, 'absent': 0, 'lop': 0, 'wo': 0,
+            'total_work_hours': 0.0, 'records': []
+        })
+        for r in qs.select_related('employee__department'):
+            eid = str(r.employee_id)
+            s   = r.status
+            if s == 'Present':  emp_stats[eid]['present'] += 1
+            elif s == 'Late':   emp_stats[eid]['late'] += 1
+            elif s == 'Absent': emp_stats[eid]['absent'] += 1
+            elif s == 'LOP':    emp_stats[eid]['lop'] += 1
+            elif s == 'WO':     emp_stats[eid]['wo'] += 1
+            emp_stats[eid]['total_work_hours'] += float(r.work_hours or 0)
+            emp_stats[eid]['_emp'] = r.employee  # keep reference
+
+        report = []
+        for eid, stats in emp_stats.items():
+            emp = stats.pop('_emp', None)
+            if not emp:
+                continue
+            effective = stats['present'] + stats['late']
+            report.append({
+                'employeeId':    str(emp.id),
+                'employeeName':  emp.name,
+                'employeeCode':  emp.employee_code or '',
+                'departmentName': emp.department.name if emp.department else 'N/A',
+                'month':         target_month,
+                'present':       stats['present'],
+                'late':          stats['late'],
+                'absent':        stats['absent'],
+                'lop':           stats['lop'],
+                'wo':            stats['wo'],
+                'effectiveDays': effective,
+                'totalWorkHours': round(stats['total_work_hours'], 2),
+            })
+
+        # Sort by employee name
+        report.sort(key=lambda x: x['employeeName'])
+        return Response({'report': report, 'month': target_month, 'total': len(report)})
+
+
 class PayrollDataView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -669,47 +729,64 @@ class AttendanceMarkView(views.APIView):
 class AttendanceRegularizeView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
+    # Maps status → (check_in, check_out, work_hours)
+    STATUS_DEFAULTS = {
+        'Present': ('09:00:00', '18:00:00', 9.0),
+        'Late':    ('10:00:00', '18:00:00', 8.0),
+        'Absent':  (None, None, 0.0),
+        'LOP':     (None, None, 0.0),  # Loss Of Pay — no work
+        'WO':      (None, None, 0.0),  # Week Off   — no work
+    }
+
     def post(self, request):
         tenant = request.user.tenant
-        record_id = request.data.get('record_id')
+        record_id   = request.data.get('record_id')
         employee_id = request.data.get('employee_id')
         target_date = request.data.get('date')
-        check_in = request.data.get('check_in')
-        check_out = request.data.get('check_out')
-        status_val = request.data.get('status')
+        status_val  = request.data.get('status')
+
+        # Derive sensible defaults from status
+        default_ci, default_co, default_wh = self.STATUS_DEFAULTS.get(status_val, ('09:00:00', '18:00:00', 9.0))
+
+        # Allow explicit override from payload
+        check_in    = request.data.get('check_in',    default_ci)
+        check_out   = request.data.get('check_out',   default_co)
+        work_hours  = request.data.get('work_hours',  default_wh)
 
         try:
             if record_id:
+                # Update existing record by PK
                 record = AttendanceRecord.objects.get(tenant=tenant, id=record_id)
+                if status_val:  record.status     = status_val
+                record.check_in    = check_in
+                record.check_out   = check_out
+                record.work_hours  = work_hours if work_hours is not None else 0.0
+                record.save(update_fields=['status', 'check_in', 'check_out', 'work_hours'])
+
             elif employee_id and target_date:
-                # If record doesn't exist, get or create it
+                # Upsert by employee + date
                 record, created = AttendanceRecord.objects.get_or_create(
                     tenant=tenant,
                     employee_id=employee_id,
                     date=target_date,
                     defaults={
-                        'status': status_val or 'Present',
-                        'check_in': check_in or '09:00:00',
-                        'check_out': check_out or '18:00:00',
-                        'work_hours': 9.0,
-                        'location': 'Office'
+                        'status':     status_val or 'Present',
+                        'check_in':   check_in,
+                        'check_out':  check_out,
+                        'work_hours': work_hours if work_hours is not None else 9.0,
+                        'location':   'Office'
                     }
                 )
                 if not created:
-                    if check_in: record.check_in = check_in
-                    if check_out: record.check_out = check_out
-                    if status_val: record.status = status_val
-                    record.save()
+                    if status_val:  record.status    = status_val
+                    record.check_in   = check_in
+                    record.check_out  = check_out
+                    record.work_hours = work_hours if work_hours is not None else 0.0
+                    record.save(update_fields=['status', 'check_in', 'check_out', 'work_hours'])
             else:
-                return Response({"error": "Missing record_id or employee_id + date"}, status=400)
+                return Response({"error": "Provide record_id OR (employee_id + date)"}, status=400)
 
-            if record_id and not (employee_id and target_date):
-                 if check_in: record.check_in = check_in
-                 if check_out: record.check_out = check_out
-                 if status_val: record.status = status_val
-                 record.save()
-                 
-            return Response({"message": "Attendance processed successfully"})
+            return Response({"message": "Attendance regularized successfully"})
         except AttendanceRecord.DoesNotExist:
             return Response({"error": "Record not found"}, status=404)
         except Exception as e:
