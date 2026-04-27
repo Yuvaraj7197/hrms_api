@@ -4,8 +4,8 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import authenticate
 from django.utils import timezone
 from decimal import Decimal
-from .models import User, Tenant, OTP, Department, Role, Employee, AttendanceRecord, PayrollRecord, PayrollAuditLog, EmployeeDocument
-from .serializers import RegisterSerializer, OTPVerifySerializer, OnboardingSerializer, UserSerializer, DepartmentSerializer, RoleSerializer, EmployeeSerializer, AttendanceRecordSerializer, EmployeeDocumentSerializer
+from .models import User, Tenant, OTP, Department, Role, Employee, AttendanceRecord, PayrollRecord, PayrollAuditLog, EmployeeDocument, AttendanceStatus
+from .serializers import RegisterSerializer, OTPVerifySerializer, OnboardingSerializer, UserSerializer, DepartmentSerializer, RoleSerializer, EmployeeSerializer, AttendanceRecordSerializer, EmployeeDocumentSerializer, AttendanceStatusSerializer
 from django.db import transaction
 import random
 from rest_framework.permissions import AllowAny
@@ -461,7 +461,7 @@ class AttendanceDataView(views.APIView):
                     record_map[emp_id] = {}
                 record_map[emp_id][record.date.isoformat()] = {
                     'id': str(record.id),
-                    'status': record.status,
+                    'status': record.status.code if record.status else record.status_str,
                     'checkIn': record.check_in.strftime('%H:%M') if record.check_in else '',
                     'checkOut': record.check_out.strftime('%H:%M') if record.check_out else '',
                     'workHours': float(record.work_hours)
@@ -482,14 +482,28 @@ class AttendanceDataView(views.APIView):
 
         else:
             target_date = target_date or timezone.localdate().isoformat()
-            employees = Employee.objects.filter(tenant=tenant).select_related('department')
-            records = AttendanceRecord.objects.filter(tenant=tenant, date=target_date)
+            employees = Employee.objects.filter(tenant=tenant).select_related('department').distinct()
+            records = AttendanceRecord.objects.filter(tenant=tenant, date=target_date).select_related('status')
             record_map = {str(r.employee_id): r for r in records}
+
+            # Map for legacy conversion and ID lookup
+            all_statuses = AttendanceStatus.objects.all()
+            status_id_map = {s.code: str(s.id) for s in all_statuses}
+            absent_id = status_id_map.get('A')
+
+            LEGACY_MAP = {
+                'Present': 'P', 'Late': 'L', 'Absent': 'A', 'LOP': 'LOP', 'WO': 'WO',
+                'PRESENT': 'P', 'LATE': 'L', 'ABSENT': 'A'
+            }
 
             response_data = []
             for employee in employees:
                 record = record_map.get(str(employee.id))
                 if record:
+                    raw_status = record.status.code if record.status else record.status_str
+                    status_code = LEGACY_MAP.get(raw_status, raw_status)
+                    status_id = str(record.status_id) if record.status_id else status_id_map.get(status_code)
+                    
                     response_data.append({
                         'id': str(record.id),
                         'employeeId': str(employee.id),
@@ -499,12 +513,13 @@ class AttendanceDataView(views.APIView):
                         'date': record.date.isoformat(),
                         'checkIn': record.check_in.strftime('%H:%M') if record.check_in else '',
                         'checkOut': record.check_out.strftime('%H:%M') if record.check_out else '',
-                        'status': record.status,
+                        'status': status_code,
+                        'statusId': status_id,
+                        'statusLabel': record.status.label if record.status else (record.status_str or 'Absent'),
                         'workHours': float(record.work_hours),
                         'location': record.location,
                     })
                 else:
-                    # No record found in DB, return as Absent or '-' status but don't create it in DB
                     response_data.append({
                         'id': None,
                         'employeeId': str(employee.id),
@@ -514,12 +529,22 @@ class AttendanceDataView(views.APIView):
                         'date': target_date,
                         'checkIn': '',
                         'checkOut': '',
-                        'status': 'Absent',
+                        'status': 'A',
+                        'statusId': absent_id,
+                        'statusLabel': 'Absent',
                         'workHours': 0.0,
                         'location': 'N/A',
                     })
 
             return Response({'records': response_data})
+
+class AttendanceStatusListView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        statuses = AttendanceStatus.objects.all()
+        serializer = AttendanceStatusSerializer(statuses, many=True)
+        return Response(serializer.data)
 
 class AttendanceReportView(views.APIView):
     """
@@ -544,14 +569,14 @@ class AttendanceReportView(views.APIView):
             'present': 0, 'late': 0, 'absent': 0, 'lop': 0, 'wo': 0,
             'total_work_hours': 0.0, 'records': []
         })
-        for r in qs.select_related('employee__department'):
+        for r in qs.select_related('employee__department', 'status'):
             eid = str(r.employee_id)
-            s   = r.status
-            if s == 'Present':  emp_stats[eid]['present'] += 1
-            elif s == 'Late':   emp_stats[eid]['late'] += 1
-            elif s == 'Absent': emp_stats[eid]['absent'] += 1
-            elif s == 'LOP':    emp_stats[eid]['lop'] += 1
-            elif s == 'WO':     emp_stats[eid]['wo'] += 1
+            s   = r.status.code if r.status else r.status_str
+            if s in ['Present', 'P']:  emp_stats[eid]['present'] += 1
+            elif s in ['Late', 'L']:   emp_stats[eid]['late'] += 1
+            elif s in ['Absent', 'A']: emp_stats[eid]['absent'] += 1
+            elif s in ['LOP']:         emp_stats[eid]['lop'] += 1
+            elif s in ['WO']:          emp_stats[eid]['wo'] += 1
             emp_stats[eid]['total_work_hours'] += float(r.work_hours or 0)
             emp_stats[eid]['_emp'] = r.employee  # keep reference
 
@@ -701,12 +726,13 @@ class AttendanceMarkView(views.APIView):
         time_now = now.time()
 
         try:
+            status_p = AttendanceStatus.objects.filter(code='P').first()
             employee = Employee.objects.get(tenant=tenant, id=employee_id)
             record, created = AttendanceRecord.objects.get_or_create(
                 tenant=tenant, 
                 employee=employee, 
                 date=today,
-                defaults={'status': 'Present', 'location': request.data.get('location', 'Office')}
+                defaults={'status': status_p, 'location': request.data.get('location', 'Office')}
             )
 
             if action == 'in':
@@ -729,15 +755,6 @@ class AttendanceMarkView(views.APIView):
 class AttendanceRegularizeView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
-    # Maps status → (check_in, check_out, work_hours)
-    STATUS_DEFAULTS = {
-        'Present': ('09:00:00', '18:00:00', 9.0),
-        'Late':    ('10:00:00', '18:00:00', 8.0),
-        'Absent':  (None, None, 0.0),
-        'LOP':     (None, None, 0.0),  # Loss Of Pay — no work
-        'WO':      (None, None, 0.0),  # Week Off   — no work
-    }
-
     def post(self, request):
         tenant = request.user.tenant
         record_id   = request.data.get('record_id')
@@ -745,23 +762,32 @@ class AttendanceRegularizeView(views.APIView):
         target_date = request.data.get('date')
         status_val  = request.data.get('status')
 
-        # Derive sensible defaults from status
-        default_ci, default_co, default_wh = self.STATUS_DEFAULTS.get(status_val, ('09:00:00', '18:00:00', 9.0))
-
-        # Allow explicit override from payload
-        check_in    = request.data.get('check_in',    default_ci)
-        check_out   = request.data.get('check_out',   default_co)
-        work_hours  = request.data.get('work_hours',  default_wh)
-
         try:
+            # Map status code/label/ID to AttendanceStatus object
+            status_obj = None
+            if status_val:
+                status_obj = AttendanceStatus.objects.filter(code=status_val).first() or \
+                             AttendanceStatus.objects.filter(label=status_val).first() or \
+                             AttendanceStatus.objects.filter(pk=status_val if str(status_val).isdigit() else -1).first()
+
+            # Derive sensible defaults from the status object (if found)
+            check_in   = request.data.get('check_in')
+            check_out  = request.data.get('check_out')
+            work_hours = request.data.get('work_hours')
+
+            if status_obj:
+                check_in   = check_in or (status_obj.default_check_in.strftime('%H:%M:%S') if status_obj.default_check_in else None)
+                check_out  = check_out or (status_obj.default_check_out.strftime('%H:%M:%S') if status_obj.default_check_out else None)
+                work_hours = work_hours if work_hours is not None else status_obj.default_work_hours
+
             if record_id:
                 # Update existing record by PK
                 record = AttendanceRecord.objects.get(tenant=tenant, id=record_id)
-                if status_val:  record.status     = status_val
+                if status_obj: record.status = status_obj
                 record.check_in    = check_in
                 record.check_out   = check_out
                 record.work_hours  = work_hours if work_hours is not None else 0.0
-                record.save(update_fields=['status', 'check_in', 'check_out', 'work_hours'])
+                record.save()
 
             elif employee_id and target_date:
                 # Upsert by employee + date
@@ -770,7 +796,7 @@ class AttendanceRegularizeView(views.APIView):
                     employee_id=employee_id,
                     date=target_date,
                     defaults={
-                        'status':     status_val or 'Present',
+                        'status':     status_obj,
                         'check_in':   check_in,
                         'check_out':  check_out,
                         'work_hours': work_hours if work_hours is not None else 9.0,
@@ -778,11 +804,11 @@ class AttendanceRegularizeView(views.APIView):
                     }
                 )
                 if not created:
-                    if status_val:  record.status    = status_val
+                    if status_obj: record.status = status_obj
                     record.check_in   = check_in
                     record.check_out  = check_out
                     record.work_hours = work_hours if work_hours is not None else 0.0
-                    record.save(update_fields=['status', 'check_in', 'check_out', 'work_hours'])
+                    record.save()
             else:
                 return Response({"error": "Provide record_id OR (employee_id + date)"}, status=400)
 

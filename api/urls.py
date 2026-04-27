@@ -11,7 +11,7 @@ from .views import (
     # HR — Employee Management
     HREmployeeListView, HREmployeeDetailView,
     # Attendance — Admin/HR
-    AttendanceDataView, AttendanceMarkView, AttendanceRegularizeView, AttendanceReportView,
+    AttendanceDataView, AttendanceMarkView, AttendanceRegularizeView, AttendanceReportView, AttendanceStatusListView,
     # Payroll
     PayrollDataView, PayrollProcessView,
     # ESS — Employee Self-Service
@@ -51,6 +51,7 @@ urlpatterns = [
     path('attendance/mark/',         AttendanceMarkView.as_view(),          name='attendance_mark'),
     path('attendance/regularize/',   AttendanceRegularizeView.as_view(),    name='attendance_regularize'),
     path('attendance/report/',       AttendanceReportView.as_view(),        name='attendance_report'),
+    path('attendance/statuses/',     AttendanceStatusListView.as_view(),    name='attendance_statuses'),
 
     # ── Payroll ────────────────────────────────────────
     path('payroll/data/',            PayrollDataView.as_view(),             name='payroll_data'),

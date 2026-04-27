@@ -142,12 +142,29 @@ class Employee(TenantScopedModel):
     def __str__(self):
         return f"{self.name} - {self.employee_code}"
 
+class AttendanceStatus(models.Model):
+    code = models.CharField(max_length=10, unique=True) # P, L, A, LV, WFH, etc.
+    label = models.CharField(max_length=50)
+    color_code = models.CharField(max_length=7, default='#64748b')
+    
+    # Defaults for regularization
+    default_check_in = models.TimeField(null=True, blank=True)
+    default_check_out = models.TimeField(null=True, blank=True)
+    default_work_hours = models.FloatField(default=0)
+
+    class Meta:
+        db_table = "t_attendance_status"
+    
+    def __str__(self):
+        return self.label
+
 class AttendanceRecord(TenantScopedModel):
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='attendance')
     date = models.DateField()
     check_in = models.TimeField(null=True, blank=True)
     check_out = models.TimeField(null=True, blank=True)
-    status = models.CharField(max_length=20, default='Present')
+    status = models.ForeignKey(AttendanceStatus, on_delete=models.PROTECT, related_name='records', null=True)
+    status_str = models.CharField(max_length=20, default='Present', db_column='status') # For legacy support/transition
     work_hours = models.FloatField(default=0)
     location = models.CharField(max_length=100, default='Office')
 

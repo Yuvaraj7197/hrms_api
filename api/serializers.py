@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import User, Tenant, OTP, Department, Role, Employee, EmployeeDocument, AttendanceRecord, PayrollRecord, PayrollAuditLog
+from .models import User, Tenant, OTP, Department, Role, Employee, EmployeeDocument, AttendanceRecord, PayrollRecord, PayrollAuditLog, AttendanceStatus
 
 class TenantSerializer(serializers.ModelSerializer):
     class Meta:
@@ -70,10 +70,18 @@ class EmployeeSerializer(serializers.ModelSerializer):
             'documents'
         ]
 
+class AttendanceStatusSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AttendanceStatus
+        fields = ['id', 'code', 'label', 'color_code', 'default_check_in', 'default_check_out', 'default_work_hours']
+
 class AttendanceRecordSerializer(serializers.ModelSerializer):
+    status_code = serializers.CharField(source='status.code', read_only=True)
+    status_label = serializers.CharField(source='status.label', read_only=True)
+    
     class Meta:
         model = AttendanceRecord
-        fields = ['id', 'employee', 'date', 'check_in', 'check_out', 'status', 'work_hours', 'location']
+        fields = ['id', 'employee', 'date', 'check_in', 'check_out', 'status', 'status_code', 'status_label', 'work_hours', 'location']
 
 class PayrollRecordSerializer(serializers.ModelSerializer):
     class Meta:
