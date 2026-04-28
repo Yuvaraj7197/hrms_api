@@ -172,6 +172,59 @@ class AttendanceRecord(TenantScopedModel):
         db_table = "t_attendance_record"
         unique_together = ('tenant', 'employee', 'date')
 
+class PayrollSetting(TenantScopedModel):
+    pf_rate_employee = models.DecimalField(max_digits=5, decimal_places=2, default=12.0)
+    pf_rate_employer = models.DecimalField(max_digits=5, decimal_places=2, default=12.0)
+    esi_rate_employee = models.DecimalField(max_digits=5, decimal_places=2, default=0.75)
+    esi_rate_employer = models.DecimalField(max_digits=5, decimal_places=2, default=3.25)
+    tax_regime_default = models.CharField(max_length=20, default='New') # Old/New
+    
+    class Meta:
+        db_table = "t_payroll_setting"
+
+class SalaryComponent(TenantScopedModel):
+    name = models.CharField(max_length=100) # Basic, HRA, Conveyance, PF
+    code = models.CharField(max_length=20) # BASIC, HRA, CONV, PF
+    component_type = models.CharField(max_length=20, choices=[('Earning', 'Earning'), ('Deduction', 'Deduction')])
+    is_statutory = models.BooleanField(default=False)
+    is_taxable = models.BooleanField(default=True)
+    
+    class Meta:
+        db_table = "t_salary_component"
+        unique_together = ('tenant', 'code')
+
+    def __str__(self):
+        return self.name
+
+class SalaryStructure(TenantScopedModel):
+    name = models.CharField(max_length=100) # e.g. "Standard Grade A"
+    description = models.TextField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    
+    class Meta:
+        db_table = "t_salary_structure"
+
+    def __str__(self):
+        return self.name
+
+class SalaryStructureComponent(models.Model):
+    structure = models.ForeignKey(SalaryStructure, on_delete=models.CASCADE, related_name='components')
+    component = models.ForeignKey(SalaryComponent, on_delete=models.CASCADE)
+    calculation_type = models.CharField(max_length=20, choices=[('Fixed', 'Fixed Amount'), ('Percentage', 'Percentage of Basic')])
+    value = models.DecimalField(max_digits=12, decimal_places=2, default=0) # amount or percentage
+    
+    class Meta:
+        db_table = "t_salary_structure_component"
+
+class EmployeeSalaryStructure(TenantScopedModel):
+    employee = models.OneToOneField(Employee, on_delete=models.CASCADE, related_name='salary_structure')
+    structure = models.ForeignKey(SalaryStructure, on_delete=models.SET_NULL, null=True)
+    effective_from = models.DateField()
+    is_active = models.BooleanField(default=True)
+    
+    class Meta:
+        db_table = "t_employee_salary_structure"
+
 class PayrollRecord(TenantScopedModel):
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='payroll')
     cycle_month = models.CharField(max_length=7) # YYYY-MM
@@ -182,6 +235,10 @@ class PayrollRecord(TenantScopedModel):
     tax_status = models.CharField(max_length=20, default='Pending')
     net_pay = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     status = models.CharField(max_length=20, default='Pending')
+    
+    # Detailed breakdown for payslip
+    # { "earnings": [{"name": "Basic", "amount": 25000}, ...], "deductions": [...] }
+    breakdown = models.JSONField(null=True, blank=True)
 
     class Meta:
         db_table = "t_payroll_record"
@@ -197,7 +254,6 @@ class PayrollAuditLog(TenantScopedModel):
     class Meta:
         db_table = "t_payroll_audit_log"
 
-
 class LeaveType(TenantScopedModel):
     name = models.CharField(max_length=100)
     days_per_year = models.IntegerField(default=12)
@@ -209,7 +265,6 @@ class LeaveType(TenantScopedModel):
 
     def __str__(self):
         return f"{self.name} ({self.tenant.name})"
-
 
 class LeaveApplication(TenantScopedModel):
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='leave_applications')

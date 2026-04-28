@@ -4,7 +4,11 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import authenticate
 from django.utils import timezone
 from decimal import Decimal
-from .models import User, Tenant, OTP, Department, Role, Employee, AttendanceRecord, PayrollRecord, PayrollAuditLog, EmployeeDocument, AttendanceStatus
+from .models import (
+    User, Tenant, OTP, Department, Role, Employee, AttendanceRecord, PayrollRecord, 
+    PayrollAuditLog, EmployeeDocument, AttendanceStatus, SalaryComponent, 
+    SalaryStructure, SalaryStructureComponent, EmployeeSalaryStructure, PayrollSetting
+)
 from .serializers import RegisterSerializer, OTPVerifySerializer, OnboardingSerializer, UserSerializer, DepartmentSerializer, RoleSerializer, EmployeeSerializer, AttendanceRecordSerializer, EmployeeDocumentSerializer, AttendanceStatusSerializer
 from django.db import transaction
 import random
@@ -613,7 +617,12 @@ class PayrollDataView(views.APIView):
         tenant = request.user.tenant
         cycle_month = request.query_params.get('cycle') or timezone.localdate().strftime('%Y-%m')
 
-        employees = Employee.objects.filter(tenant=tenant).select_related('department')
+        # Seed payroll records for all Active employees (regardless of onboarding status)
+        employees = Employee.objects.filter(
+            tenant=tenant,
+            status='Active'
+        ).select_related('department')
+
         for employee in employees:
             base_salary = employee.base_salary if employee.base_salary else Decimal('0')
             record, created = PayrollRecord.objects.get_or_create(
@@ -665,26 +674,204 @@ class PayrollProcessView(views.APIView):
         cycle_month = request.data.get('cycle') or timezone.localdate().strftime('%Y-%m')
 
         records = PayrollRecord.objects.filter(tenant=tenant, cycle_month=cycle_month)
+        
+        # Check if cycle is locked
+        if records.filter(status='Locked').exists():
+             return Response({'error': 'This payroll cycle is locked and cannot be modified.'}, status=400)
+
         if action == 'pay':
-            updated = records.filter(status='Processed').update(status='Paid')
+            updated = records.filter(status='Approved').update(status='Paid')
             return Response({'message': 'Payroll payment completed', 'updated': updated})
+        
+        if action == 'approve':
+            updated = records.filter(status='Processed').update(status='Approved')
+            return Response({'message': 'Payroll batch approved', 'updated': updated})
+            
+        if action == 'lock':
+            updated = records.update(status='Locked')
+            return Response({'message': 'Payroll cycle locked', 'updated': updated})
+
+        # 1. Fetch Attendance Report for LOP calculation
+        attendance_report = {}
+        try:
+            # Re-use our report logic or similar
+            from collections import defaultdict
+            qs = AttendanceRecord.objects.filter(tenant=tenant, date__startswith=cycle_month)
+            for r in qs.select_related('status'):
+                eid = str(r.employee_id)
+                s = r.status.code if r.status else r.status_str
+                if eid not in attendance_report: attendance_report[eid] = 0
+                if s == 'LOP' or s == 'A':
+                    attendance_report[eid] += 1
+        except:
+            pass
 
         updated = 0
         for record in records:
             if record.status == 'Pending':
                 base_salary = Decimal(record.base_salary)
-                itax = base_salary * (Decimal('0.20') if base_salary > 100000 else (Decimal('0.10') if base_salary > 50000 else Decimal('0.05')))
-                pf = base_salary * Decimal('0.12')
-                ptax = Decimal('200') if base_salary > 15000 else Decimal('0')
-                deductions = (itax + pf + ptax).quantize(Decimal('0.01'))
+                breakdown = {"earnings": [], "deductions": []}
+                
+                # Try to get structure-based components
+                structure_link = EmployeeSalaryStructure.objects.filter(employee=record.employee, is_active=True).first()
+                
+                total_earnings = Decimal('0')
+                total_statutory = Decimal('0')
+
+                if structure_link and structure_link.structure:
+                    # Next-Level Calculation
+                    for sc in structure_link.structure.components.all():
+                        amount = Decimal('0')
+                        if sc.calculation_type == 'Fixed':
+                            amount = sc.value
+                        elif sc.calculation_type == 'Percentage':
+                            amount = (base_salary * sc.value / Decimal('100')).quantize(Decimal('0.01'))
+                        
+                        comp_data = {"name": sc.component.name, "amount": float(amount), "code": sc.component.code}
+                        if sc.component.component_type == 'Earning':
+                            total_earnings += amount
+                            breakdown["earnings"].append(comp_data)
+                        else:
+                            total_statutory += amount
+                            breakdown["deductions"].append(comp_data)
+                else:
+                    # Fallback to Basic + 20% Allowance logic
+                    allowance_amt = (base_salary * Decimal('0.2')).quantize(Decimal('0.01'))
+                    total_earnings = base_salary + allowance_amt
+                    breakdown["earnings"].append({"name": "Basic", "amount": float(base_salary), "code": "BASIC"})
+                    breakdown["earnings"].append({"name": "Standard Allowance", "amount": float(allowance_amt), "code": "SA"})
+                    
+                    # Basic tax/pf logic
+                    itax = base_salary * (Decimal('0.20') if base_salary > 100000 else (Decimal('0.10') if base_salary > 50000 else Decimal('0.05')))
+                    pf = base_salary * Decimal('0.12')
+                    ptax = Decimal('200') if base_salary > 15000 else Decimal('0')
+                    total_statutory = (itax + pf + ptax).quantize(Decimal('0.01'))
+                    
+                    breakdown["deductions"].append({"name": "Income Tax", "amount": float(itax.quantize(Decimal('0.01'))), "code": "ITAX"})
+                    breakdown["deductions"].append({"name": "Provident Fund", "amount": float(pf.quantize(Decimal('0.01'))), "code": "PF"})
+                    if ptax > 0:
+                        breakdown["deductions"].append({"name": "Professional Tax", "amount": float(ptax), "code": "PTAX"})
+
+                # LOP Deduction (Always applies)
+                lop_days = attendance_report.get(str(record.employee_id), 0)
+                lop_deduction = (base_salary / Decimal('30')) * Decimal(lop_days)
+                if lop_deduction > 0:
+                    lop_ded_amt = lop_deduction.quantize(Decimal('0.01'))
+                    total_statutory += lop_ded_amt
+                    breakdown["deductions"].append({"name": "Loss of Pay", "amount": float(lop_ded_amt), "code": "LOP"})
+
                 loan_interest = (Decimal(record.loan_emi) * Decimal('0.085') / Decimal('12')).quantize(Decimal('0.01'))
-                record.deductions = deductions
-                record.net_pay = (Decimal(record.base_salary) + Decimal(record.allowances) - deductions - Decimal(record.loan_emi) - loan_interest).quantize(Decimal('0.01'))
+                if record.loan_emi > 0:
+                    breakdown["deductions"].append({"name": "Loan EMI", "amount": float(record.loan_emi), "code": "EMI"})
+                    breakdown["deductions"].append({"name": "Loan Interest", "amount": float(loan_interest), "code": "INT"})
+
+                record.allowances = total_earnings - base_salary
+                record.deductions = total_statutory
+                record.net_pay = (total_earnings - total_statutory - Decimal(record.loan_emi) - loan_interest).quantize(Decimal('0.01'))
+                record.breakdown = breakdown
                 record.status = 'Processed'
-                record.save(update_fields=['deductions', 'net_pay', 'status'])
+                record.save()
                 updated += 1
 
-        return Response({'message': 'Payroll processing completed', 'updated': updated})
+        return Response({'message': 'Next-Level Payroll processing completed', 'updated': updated})
+
+class SalaryComponentView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        qs = SalaryComponent.objects.filter(tenant=request.user.tenant)
+        return Response([{"id": c.id, "name": c.name, "code": c.code, "type": c.component_type, "is_statutory": c.is_statutory} for c in qs])
+
+    def post(self, request):
+        """Create a new salary component (e.g. Basic, HRA, PF, Conveyance)."""
+        tenant = request.user.tenant
+        data = request.data
+        name = data.get('name', '').strip()
+        code = data.get('code', '').strip().upper()
+        component_type = data.get('type') or data.get('component_type', 'Earning')
+        is_statutory = data.get('is_statutory', False)
+        is_taxable = data.get('is_taxable', True)
+
+        if not name or not code:
+            return Response({"error": "name and code are required."}, status=400)
+
+        if SalaryComponent.objects.filter(tenant=tenant, code=code).exists():
+            return Response({"error": f"Component with code '{code}' already exists."}, status=400)
+
+        comp = SalaryComponent.objects.create(
+            tenant=tenant,
+            name=name,
+            code=code,
+            component_type=component_type,
+            is_statutory=is_statutory,
+            is_taxable=is_taxable,
+        )
+        return Response({"id": comp.id, "name": comp.name, "code": comp.code, "type": comp.component_type}, status=201)
+
+
+class SalaryStructureView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    def get(self, request):
+        qs = SalaryStructure.objects.filter(tenant=request.user.tenant).prefetch_related('components__component')
+        data = []
+        for s in qs:
+            comps = [{"name": c.component.name, "type": c.calculation_type, "value": float(c.value), "id": c.id} for c in s.components.all()]
+            data.append({"id": s.id, "name": s.name, "description": s.description, "components": comps})
+        return Response(data)
+
+    def post(self, request):
+        tenant = request.user.tenant
+        data = request.data
+        with transaction.atomic():
+            structure = SalaryStructure.objects.create(
+                tenant=tenant,
+                name=data.get('name'),
+                description=data.get('description')
+            )
+            for comp in data.get('components', []):
+                SalaryStructureComponent.objects.create(
+                    structure=structure,
+                    component_id=comp.get('component_id'),
+                    calculation_type=comp.get('calculation_type'),
+                    value=comp.get('value')
+                )
+        return Response({"message": "Salary Structure created", "id": structure.id})
+
+class EmployeeSalarySetupView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    def post(self, request):
+        tenant = request.user.tenant
+        emp_id = request.data.get('employee_id')
+        struct_id = request.data.get('structure_id')
+        
+        EmployeeSalaryStructure.objects.update_or_create(
+            tenant=tenant,
+            employee_id=emp_id,
+            defaults={
+                'structure_id': struct_id,
+                'effective_from': timezone.localdate(),
+                'is_active': True
+            }
+        )
+        return Response({"message": "Employee salary structure updated"})
+
+class PayslipView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    def get(self, request, record_id):
+        try:
+            record = PayrollRecord.objects.get(tenant=request.user.tenant, id=record_id)
+            return Response({
+                "record": {
+                    "id": record.id,
+                    "employee": record.employee.name,
+                    "cycle": record.cycle_month,
+                    "net_pay": float(record.net_pay),
+                    "status": record.status,
+                    "breakdown": record.breakdown
+                }
+            })
+        except PayrollRecord.DoesNotExist:
+            return Response({"error": "Record not found"}, status=404)
 
 class LoginView(views.APIView):
     permission_classes = [AllowAny]
@@ -818,40 +1005,6 @@ class AttendanceRegularizeView(views.APIView):
         except Exception as e:
             return Response({"error": str(e)}, status=500)
 
-class PayrollProcessView(views.APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    def post(self, request):
-        tenant = request.user.tenant
-        employee_id = request.data.get('employee_id')
-        cycle = request.data.get('cycle_month')
-        
-        try:
-            employee = Employee.objects.get(tenant=tenant, id=employee_id)
-            record, created = PayrollRecord.objects.update_or_create(
-                tenant=tenant,
-                employee=employee,
-                cycle_month=cycle,
-                defaults={
-                    'base_salary': request.data.get('base_salary', 0),
-                    'allowances': request.data.get('allowances', 0),
-                    'deductions': request.data.get('deductions', 0),
-                    'status': 'Processed'
-                }
-            )
-            
-            # Create Audit Log
-            PayrollAuditLog.objects.create(
-                tenant=tenant,
-                payroll_record=record,
-                action="Payroll Processed/Updated",
-                performed_by=request.user,
-                notes=request.data.get('notes', 'Automated processing')
-            )
-
-            return Response({"message": "Payroll processed and logged successfully", "record_id": record.id})
-        except Employee.DoesNotExist:
-            return Response({"error": "Employee not found"}, status=404)
 
 
 # ─────────────────────────────────────────────
@@ -1159,6 +1312,7 @@ class ESSProfileView(views.APIView):
             "reporting_to": emp.reporting_to.name if emp.reporting_to else "",
             "joining_date": str(emp.joining_date) if emp.joining_date else "",
             "status": emp.status,
+            "salary_structure": getattr(emp.salary_structure.structure, 'name', 'Standard (Default)') if hasattr(emp, 'salary_structure') else 'Standard (Default)'
         })
 
 
@@ -1183,6 +1337,7 @@ class ESSPayslipsView(views.APIView):
                 "net_pay": float(r.net_pay),
                 "status": r.status,
                 "tax_status": r.tax_status,
+                "breakdown": r.breakdown,
             }
             for r in records
         ]

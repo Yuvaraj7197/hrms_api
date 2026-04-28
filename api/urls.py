@@ -13,7 +13,7 @@ from .views import (
     # Attendance — Admin/HR
     AttendanceDataView, AttendanceMarkView, AttendanceRegularizeView, AttendanceReportView, AttendanceStatusListView,
     # Payroll
-    PayrollDataView, PayrollProcessView,
+    PayrollDataView, PayrollProcessView, SalaryComponentView, SalaryStructureView, EmployeeSalarySetupView, PayslipView,
     # ESS — Employee Self-Service
     ESSAttendanceTodayView, ESSAttendanceHistoryView,
     ESSProfileView, ESSPayslipsView,
@@ -56,6 +56,10 @@ urlpatterns = [
     # ── Payroll ────────────────────────────────────────
     path('payroll/data/',            PayrollDataView.as_view(),             name='payroll_data'),
     path('payroll/process/',         PayrollProcessView.as_view(),          name='payroll_process'),
+    path('payroll/components/',      SalaryComponentView.as_view(),         name='salary_components'),
+    path('payroll/structures/',      SalaryStructureView.as_view(),         name='salary_structures'),
+    path('payroll/setup/',           EmployeeSalarySetupView.as_view(),      name='employee_salary_setup'),
+    path('payroll/payslip/<int:record_id>/', PayslipView.as_view(),           name='payroll_payslip_detail'),
 
     # ── ESS — Employee Self-Service ────────────────────
     path('ess/profile/',             ESSProfileView.as_view(),              name='ess_profile'),
