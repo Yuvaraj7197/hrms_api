@@ -114,12 +114,28 @@ class Employee(TenantScopedModel):
     # Personal Details
     dob = models.DateField(null=True, blank=True)
     gender = models.CharField(max_length=20, null=True, blank=True)
-    address = models.TextField(null=True, blank=True)
+    address = models.TextField(null=True, blank=True)  # Permanent address
+    current_address = models.TextField(null=True, blank=True)  # Current/correspondence address
+    father_name = models.CharField(max_length=255, null=True, blank=True)  # Required for PF
+    marital_status = models.CharField(max_length=20, null=True, blank=True)  # Single/Married/Divorced
+    blood_group = models.CharField(max_length=10, null=True, blank=True)  # A+/B-/O+ etc.
+    nationality = models.CharField(max_length=100, default='Indian', blank=True)
+    personal_email = models.EmailField(null=True, blank=True)  # For payslip delivery
+
+    # Identity & Compliance (Indian Payroll Mandatory)
+    pan_number = models.CharField(max_length=10, null=True, blank=True)   # ABCDE1234F — TDS/Form-16
+    aadhar_number = models.CharField(max_length=12, null=True, blank=True) # 12-digit — PF/ESIC (stored masked)
+    uan_number = models.CharField(max_length=12, null=True, blank=True)    # Universal Account No (PF)
+    pf_applicable = models.BooleanField(default=True)                     # Employee can opt-out
+    esi_applicable = models.BooleanField(default=False)                    # Applicable if gross < ₹21,000
+    tax_regime = models.CharField(max_length=10, default='New')            # Old/New — affects IT slabs
 
     # Bank Details
     bank_name = models.CharField(max_length=255, null=True, blank=True)
     account_number = models.CharField(max_length=50, null=True, blank=True)
     ifsc_code = models.CharField(max_length=20, null=True, blank=True)
+    account_type = models.CharField(max_length=20, default='Savings', blank=True)  # Savings/Current
+    upi_id = models.CharField(max_length=100, null=True, blank=True)       # Backup payment
 
     # Emergency Contact
     emergency_contact_name = models.CharField(max_length=255, null=True, blank=True)
@@ -235,7 +251,23 @@ class PayrollRecord(TenantScopedModel):
     tax_status = models.CharField(max_length=20, default='Pending')
     net_pay = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     status = models.CharField(max_length=20, default='Pending')
-    
+
+    # Payroll Compliance Fields (MVP+)
+    gross_pay = models.DecimalField(max_digits=12, decimal_places=2, default=0)         # base + allowances
+    employer_pf = models.DecimalField(max_digits=12, decimal_places=2, default=0)       # employer 12% PF
+    esi_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)        # ESI if applicable
+    tds_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)        # TDS deducted
+    working_days = models.IntegerField(default=30)                                      # calendar days in month
+    lop_days = models.IntegerField(default=0)                                           # Loss of Pay days
+
+    # One-Time Adjustments for this cycle only
+    # [{ "type": "bonus"|"deduction", "label": "Diwali Bonus", "amount": 5000 }]  
+    one_time_adjustments = models.JSONField(default=list, blank=True)
+
+    # Payment Tracking
+    payment_reference = models.CharField(max_length=100, null=True, blank=True)  # Bank TXN ref
+    paid_at = models.DateTimeField(null=True, blank=True)                         # Actual disbursal timestamp
+
     # Detailed breakdown for payslip
     # { "earnings": [{"name": "Basic", "amount": 25000}, ...], "deductions": [...] }
     breakdown = models.JSONField(null=True, blank=True)
@@ -254,17 +286,55 @@ class PayrollAuditLog(TenantScopedModel):
     class Meta:
         db_table = "t_payroll_audit_log"
 
+class HolidayCalendar(TenantScopedModel):
+    name = models.CharField(max_length=255)                     # e.g. "Independence Day"
+    date = models.DateField()
+    holiday_type = models.CharField(
+        max_length=20,
+        choices=[('National', 'National'), ('Optional', 'Optional'), ('Company', 'Company')],
+        default='National'
+    )
+    description = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "t_holiday_calendar"
+        unique_together = ('tenant', 'date')
+
+    def __str__(self):
+        return f"{self.name} ({self.date})"
+
+
 class LeaveType(TenantScopedModel):
     name = models.CharField(max_length=100)
+    code = models.CharField(max_length=10, default='CL')         # CL, SL, EL, ML, etc.
     days_per_year = models.IntegerField(default=12)
     is_paid = models.BooleanField(default=True)
     carry_forward = models.BooleanField(default=False)
+    max_carry_forward = models.IntegerField(default=0)           # max days carried over
 
     class Meta:
         db_table = "t_leave_type"
 
     def __str__(self):
         return f"{self.name} ({self.tenant.name})"
+
+
+class LeaveBalance(TenantScopedModel):
+    """Per-employee annual leave credit tracker."""
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='leave_balances')
+    leave_type = models.ForeignKey(LeaveType, on_delete=models.CASCADE)
+    year = models.IntegerField(default=2026)
+    allocated = models.DecimalField(max_digits=5, decimal_places=1, default=0)
+    used = models.DecimalField(max_digits=5, decimal_places=1, default=0)
+    carried_forward = models.DecimalField(max_digits=5, decimal_places=1, default=0)
+
+    class Meta:
+        db_table = "t_leave_balance"
+        unique_together = ('tenant', 'employee', 'leave_type', 'year')
+
+    @property
+    def remaining(self):
+        return self.allocated + self.carried_forward - self.used
 
 class LeaveApplication(TenantScopedModel):
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='leave_applications')

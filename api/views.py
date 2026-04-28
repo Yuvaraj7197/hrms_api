@@ -7,7 +7,8 @@ from decimal import Decimal
 from .models import (
     User, Tenant, OTP, Department, Role, Employee, AttendanceRecord, PayrollRecord, 
     PayrollAuditLog, EmployeeDocument, AttendanceStatus, SalaryComponent, 
-    SalaryStructure, SalaryStructureComponent, EmployeeSalaryStructure, PayrollSetting
+    SalaryStructure, SalaryStructureComponent, EmployeeSalaryStructure, PayrollSetting,
+    LeaveType, LeaveBalance, LeaveApplication, HolidayCalendar
 )
 from .serializers import RegisterSerializer, OTPVerifySerializer, OnboardingSerializer, UserSerializer, DepartmentSerializer, RoleSerializer, EmployeeSerializer, AttendanceRecordSerializer, EmployeeDocumentSerializer, AttendanceStatusSerializer
 from django.db import transaction
@@ -99,6 +100,12 @@ class VerifyOTPView(views.APIView):
                     }
                 )
 
+                # Seed all default master data for this new tenant
+                try:
+                    seed_tenant_defaults(tenant)
+                except Exception as seed_err:
+                    print(f'[SEED] Warning: {seed_err}')
+
                 refresh = RefreshToken.for_user(user)
                 return Response({
                     "message": "Email verified",
@@ -111,6 +118,121 @@ class VerifyOTPView(views.APIView):
                 return Response({"error": "Invalid OTP"}, status=status.HTTP_400_BAD_REQUEST)
         
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+def seed_tenant_defaults(tenant):
+    """
+    Auto-provisions all master data for a new tenant after OTP verification.
+    Seeds: AttendanceStatus, LeaveType, SalaryComponent, SalaryStructure, PayrollSetting.
+    """
+    # ── 1. Attendance Statuses ────────────────────────────────────────────
+    default_statuses = [
+        {'code': 'P',   'label': 'Present',     'color_code': '#22c55e', 'default_work_hours': 9.0},
+        {'code': 'L',   'label': 'Late',        'color_code': '#eab308', 'default_work_hours': 8.0},
+        {'code': 'A',   'label': 'Absent',      'color_code': '#ef4444', 'default_work_hours': 0.0},
+        {'code': 'LV',  'label': 'Leave',       'color_code': '#8b5cf6', 'default_work_hours': 0.0},
+        {'code': 'WO',  'label': 'Week Off',    'color_code': '#64748b', 'default_work_hours': 0.0},
+        {'code': 'WFH', 'label': 'Work From Home','color_code': '#3b82f6','default_work_hours': 9.0},
+        {'code': 'HD',  'label': 'Half Day',    'color_code': '#f97316', 'default_work_hours': 4.5},
+        {'code': 'LOP', 'label': 'Loss of Pay', 'color_code': '#dc2626', 'default_work_hours': 0.0},
+        {'code': 'H',   'label': 'Holiday',     'color_code': '#06b6d4', 'default_work_hours': 0.0},
+    ]
+    for s in default_statuses:
+        AttendanceStatus.objects.get_or_create(
+            code=s['code'],
+            defaults={
+                'label': s['label'],
+                'color_code': s['color_code'],
+                'default_work_hours': s['default_work_hours']
+            }
+        )
+
+    # ── 2. Leave Types ────────────────────────────────────────────────────
+    default_leave_types = [
+        {'name': 'Casual Leave',  'code': 'CL', 'days_per_year': 12, 'is_paid': True,  'carry_forward': False},
+        {'name': 'Sick Leave',    'code': 'SL', 'days_per_year': 12, 'is_paid': True,  'carry_forward': False},
+        {'name': 'Earned Leave',  'code': 'EL', 'days_per_year': 18, 'is_paid': True,  'carry_forward': True,  'max_carry_forward': 30},
+        {'name': 'Maternity Leave','code':'ML', 'days_per_year': 182,'is_paid': True,  'carry_forward': False},
+        {'name': 'Loss of Pay',   'code': 'LOP','days_per_year': 0,  'is_paid': False, 'carry_forward': False},
+    ]
+    for lt in default_leave_types:
+        LeaveType.objects.get_or_create(
+            tenant=tenant,
+            code=lt['code'],
+            defaults={
+                'name': lt['name'],
+                'days_per_year': lt['days_per_year'],
+                'is_paid': lt['is_paid'],
+                'carry_forward': lt['carry_forward'],
+                'max_carry_forward': lt.get('max_carry_forward', 0),
+            }
+        )
+
+    # ── 3. Salary Components ──────────────────────────────────────────────
+    default_components = [
+        {'name': 'Basic Salary',       'code': 'BASIC',     'type': 'Earning',   'statutory': False, 'taxable': True},
+        {'name': 'HRA',                'code': 'HRA',       'type': 'Earning',   'statutory': False, 'taxable': False},
+        {'name': 'Conveyance',         'code': 'CONV',      'type': 'Earning',   'statutory': False, 'taxable': False},
+        {'name': 'Special Allowance',  'code': 'SPEC_ALLOW','type': 'Earning',   'statutory': False, 'taxable': True},
+        {'name': 'Medical Allowance',  'code': 'MED_ALLOW', 'type': 'Earning',   'statutory': False, 'taxable': False},
+        {'name': 'PF - Employee',      'code': 'PF_EMP',    'type': 'Deduction', 'statutory': True,  'taxable': False},
+        {'name': 'PF - Employer',      'code': 'PF_EMPLR',  'type': 'Deduction', 'statutory': True,  'taxable': False},
+        {'name': 'ESI - Employee',     'code': 'ESI_EMP',   'type': 'Deduction', 'statutory': True,  'taxable': False},
+        {'name': 'ESI - Employer',     'code': 'ESI_EMPLR', 'type': 'Deduction', 'statutory': True,  'taxable': False},
+        {'name': 'Professional Tax',   'code': 'PTAX',      'type': 'Deduction', 'statutory': True,  'taxable': False},
+        {'name': 'TDS / Income Tax',   'code': 'TDS',       'type': 'Deduction', 'statutory': True,  'taxable': False},
+        {'name': 'Loss of Pay',        'code': 'LOP_DED',   'type': 'Deduction', 'statutory': False, 'taxable': False},
+    ]
+    component_map = {}
+    for comp in default_components:
+        obj, _ = SalaryComponent.objects.get_or_create(
+            tenant=tenant,
+            code=comp['code'],
+            defaults={
+                'name': comp['name'],
+                'component_type': comp['type'],
+                'is_statutory': comp['statutory'],
+                'is_taxable': comp['taxable'],
+            }
+        )
+        component_map[comp['code']] = obj
+
+    # ── 4. Default Salary Structure ───────────────────────────────────────
+    structure, created = SalaryStructure.objects.get_or_create(
+        tenant=tenant,
+        name='Standard Grade',
+        defaults={'description': 'Default salary structure for all employees', 'is_active': True}
+    )
+    if created and component_map:
+        structure_components = [
+            {'code': 'BASIC',     'calc': 'Fixed',      'value': Decimal('30000')},
+            {'code': 'HRA',       'calc': 'Percentage', 'value': Decimal('40')},   # 40% of basic
+            {'code': 'CONV',      'calc': 'Fixed',      'value': Decimal('1600')},
+            {'code': 'SPEC_ALLOW','calc': 'Percentage', 'value': Decimal('20')},   # 20% of basic
+            {'code': 'PF_EMP',   'calc': 'Percentage', 'value': Decimal('12')},   # 12% of basic
+            {'code': 'PTAX',     'calc': 'Fixed',       'value': Decimal('200')},
+        ]
+        for sc in structure_components:
+            comp_obj = component_map.get(sc['code'])
+            if comp_obj:
+                SalaryStructureComponent.objects.get_or_create(
+                    structure=structure,
+                    component=comp_obj,
+                    defaults={'calculation_type': sc['calc'], 'value': sc['value']}
+                )
+
+    # ── 5. Payroll Settings ───────────────────────────────────────────────
+    PayrollSetting.objects.get_or_create(
+        tenant=tenant,
+        defaults={
+            'pf_rate_employee': Decimal('12.0'),
+            'pf_rate_employer': Decimal('12.0'),
+            'esi_rate_employee': Decimal('0.75'),
+            'esi_rate_employer': Decimal('3.25'),
+            'tax_regime_default': 'New',
+        }
+    )
+
 
 class OnboardingRolesView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -752,6 +874,13 @@ class PayrollProcessView(views.APIView):
                     if ptax > 0:
                         breakdown["deductions"].append({"name": "Professional Tax", "amount": float(ptax), "code": "PTAX"})
 
+                # ESI Threshold Logic
+                # If gross pay <= 21000, apply ESI (Employee: 0.75%, Employer: 3.25%)
+                if total_earnings <= Decimal('21000'):
+                    esi_emp = (total_earnings * Decimal('0.0075')).quantize(Decimal('0.01'))
+                    total_statutory += esi_emp
+                    breakdown["deductions"].append({"name": "ESI (Employee)", "amount": float(esi_emp), "code": "ESI"})
+
                 # LOP Deduction (Always applies)
                 lop_days = attendance_report.get(str(record.employee_id), 0)
                 lop_deduction = (base_salary / Decimal('30')) * Decimal(lop_days)
@@ -765,6 +894,7 @@ class PayrollProcessView(views.APIView):
                     breakdown["deductions"].append({"name": "Loan EMI", "amount": float(record.loan_emi), "code": "EMI"})
                     breakdown["deductions"].append({"name": "Loan Interest", "amount": float(loan_interest), "code": "INT"})
 
+                record.lop_days = lop_days
                 record.allowances = total_earnings - base_salary
                 record.deductions = total_statutory
                 record.net_pay = (total_earnings - total_statutory - Decimal(record.loan_emi) - loan_interest).quantize(Decimal('0.01'))
@@ -860,14 +990,29 @@ class PayslipView(views.APIView):
     def get(self, request, record_id):
         try:
             record = PayrollRecord.objects.get(tenant=request.user.tenant, id=record_id)
+            emp = record.employee
             return Response({
                 "record": {
-                    "id": record.id,
-                    "employee": record.employee.name,
-                    "cycle": record.cycle_month,
-                    "net_pay": float(record.net_pay),
-                    "status": record.status,
-                    "breakdown": record.breakdown
+                    "id":        record.id,
+                    "employee":  emp.name,
+                    "cycle":     record.cycle_month,
+                    "net_pay":   float(record.net_pay),
+                    "gross_pay": float(getattr(record, 'gross_pay', 0)),
+                    "tds":       float(getattr(record, 'tds_amount', 0)),
+                    "employer_pf": float(getattr(record, 'employer_pf', 0)),
+                    "esi":       float(getattr(record, 'esi_amount', 0)),
+                    "status":    record.status,
+                    "breakdown": record.breakdown,
+                    "adjustments": getattr(record, 'one_time_adjustments', []),
+                    "payment_reference": getattr(record, 'payment_reference', None),
+                },
+                "employee": {
+                    "bank_name":      emp.bank_name,
+                    "account_number": emp.account_number,
+                    "ifsc_code":      emp.ifsc_code,
+                    "pan_number":     emp.pan_number      if hasattr(emp, 'pan_number')  else None,
+                    "uan_number":     emp.uan_number      if hasattr(emp, 'uan_number')  else None,
+                    "tax_regime":     emp.tax_regime      if hasattr(emp, 'tax_regime')  else 'New',
                 }
             })
         except PayrollRecord.DoesNotExist:
@@ -1075,12 +1220,27 @@ class HREmployeeListView(views.APIView):
                 dob=payload.get('dob'),
                 gender=payload.get('gender'),
                 address=payload.get('address'),
+                current_address=payload.get('current_address') or payload.get('address'),
                 bank_name=payload.get('bank_name'),
                 account_number=payload.get('account_number'),
                 ifsc_code=payload.get('ifsc_code'),
+                account_type=payload.get('account_type', 'Savings'),
+                upi_id=payload.get('upi_id'),
+                personal_email=payload.get('personal_email'),
                 emergency_contact_name=payload.get('emergency_contact_name'),
                 emergency_contact_phone=payload.get('emergency_contact_phone'),
-                onboarding_status=payload.get('onboarding_status', 'Pending')
+                onboarding_status=payload.get('onboarding_status', 'Pending'),
+                # Statutory / Compliance fields
+                father_name=payload.get('father_name'),
+                pan_number=payload.get('pan_number'),
+                aadhar_number=payload.get('aadhar_number'),
+                uan_number=payload.get('uan_number'),
+                pf_applicable=bool(payload.get('pf_applicable', True)),
+                esi_applicable=bool(payload.get('esi_applicable', False)),
+                tax_regime=payload.get('tax_regime', 'New'),
+                marital_status=payload.get('marital_status'),
+                blood_group=payload.get('blood_group'),
+                nationality=payload.get('nationality', 'Indian'),
             )
 
             # Create login account if requested
@@ -1154,12 +1314,27 @@ class HREmployeeDetailView(views.APIView):
         e.dob = p.get('dob', e.dob)
         e.gender = p.get('gender', e.gender)
         e.address = p.get('address', e.address)
+        e.current_address = p.get('current_address', e.current_address)
+        e.personal_email = p.get('personal_email', e.personal_email)
         e.bank_name = p.get('bank_name', e.bank_name)
         e.account_number = p.get('account_number', e.account_number)
         e.ifsc_code = p.get('ifsc_code', e.ifsc_code)
+        e.account_type = p.get('account_type', e.account_type)
+        e.upi_id = p.get('upi_id', e.upi_id)
         e.emergency_contact_name = p.get('emergency_contact_name', e.emergency_contact_name)
         e.emergency_contact_phone = p.get('emergency_contact_phone', e.emergency_contact_phone)
         e.onboarding_status = p.get('onboarding_status', e.onboarding_status)
+        # Statutory fields
+        e.father_name = p.get('father_name', e.father_name)
+        e.pan_number = p.get('pan_number', e.pan_number)
+        e.aadhar_number = p.get('aadhar_number', e.aadhar_number)
+        e.uan_number = p.get('uan_number', e.uan_number)
+        e.pf_applicable = p.get('pf_applicable', e.pf_applicable)
+        e.esi_applicable = p.get('esi_applicable', e.esi_applicable)
+        e.tax_regime = p.get('tax_regime', e.tax_regime)
+        e.marital_status = p.get('marital_status', e.marital_status)
+        e.blood_group = p.get('blood_group', e.blood_group)
+        e.nationality = p.get('nationality', e.nationality)
 
         if 'base_salary' in p:
             e.base_salary = p['base_salary']
@@ -1545,14 +1720,32 @@ class EmployeeOnboardingPublicView(views.APIView):
             employee.gender = data.get('gender', employee.gender)
             employee.address = data.get('address', employee.address)
             employee.phone = data.get('phone', employee.phone)
-            
+            employee.personal_email = data.get('personal_email', employee.personal_email)
+
+            # Personal Details
+            employee.father_name = data.get('father_name', employee.father_name)
+            employee.marital_status = data.get('marital_status', employee.marital_status)
+            employee.blood_group = data.get('blood_group', employee.blood_group)
+            employee.nationality = data.get('nationality', employee.nationality)
+            employee.current_address = data.get('current_address', employee.current_address)
+
+            # Identity & Compliance
+            employee.pan_number = data.get('pan_number', employee.pan_number)
+            employee.aadhar_number = data.get('aadhar_number', employee.aadhar_number)
+            employee.uan_number = data.get('uan_number', employee.uan_number)
+            employee.tax_regime = data.get('tax_regime', employee.tax_regime or 'New')
+
+            # Bank Details
             employee.bank_name = data.get('bank_name', employee.bank_name)
             employee.account_number = data.get('account_number', employee.account_number)
             employee.ifsc_code = data.get('ifsc_code', employee.ifsc_code)
-            
+            employee.account_type = data.get('account_type', employee.account_type or 'Savings')
+            employee.upi_id = data.get('upi_id', employee.upi_id)
+
+            # Emergency Contact
             employee.emergency_contact_name = data.get('emergency_contact_name', employee.emergency_contact_name)
             employee.emergency_contact_phone = data.get('emergency_contact_phone', employee.emergency_contact_phone)
-            
+
             # Documents
             docs = data.get('documents', [])
             for doc in docs:
@@ -1562,12 +1755,301 @@ class EmployeeOnboardingPublicView(views.APIView):
                     document_type=doc.get('document_type'),
                     defaults={'file_url': doc.get('file_url')}
                 )
-            
+
             employee.onboarding_status = 'Completed'
             employee.onboarding_completed_at = timezone.now()
             employee.status = 'Active'
             employee.save()
-            
+
             return Response({"message": "Onboarding completed successfully"})
         except Employee.DoesNotExist:
             return Response({"error": "Invalid token"}, status=404)
+
+
+class PayrollAdjustmentView(views.APIView):
+    """One-time bonus or deduction for a specific payroll cycle."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, record_id):
+        if request.user.role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+        try:
+            record = PayrollRecord.objects.get(tenant=request.user.tenant, id=record_id)
+            if record.status in ['Locked', 'Paid']:
+                return Response({"error": f"Cannot adjust a {record.status} payroll record."}, status=400)
+
+            adj_type  = request.data.get('type')   # 'bonus' or 'deduction'
+            label     = request.data.get('label', '').strip()
+            amount    = float(request.data.get('amount', 0))
+
+            if adj_type not in ('bonus', 'deduction'):
+                return Response({"error": "type must be 'bonus' or 'deduction'"}, status=400)
+            if not label:
+                return Response({"error": "label is required"}, status=400)
+            if amount <= 0:
+                return Response({"error": "amount must be > 0"}, status=400)
+
+            adjustments = list(record.one_time_adjustments or [])
+            adjustments.append({"type": adj_type, "label": label, "amount": amount})
+            record.one_time_adjustments = adjustments
+            record.save(update_fields=['one_time_adjustments'])
+
+            PayrollAuditLog.objects.create(
+                tenant=request.user.tenant,
+                payroll_record=record,
+                action=f"Adjustment Added: {adj_type.title()} — {label} — ₹{amount:,.2f}",
+                performed_by=request.user,
+            )
+            return Response({
+                "message": "Adjustment saved.",
+                "adjustments": record.one_time_adjustments
+            })
+        except PayrollRecord.DoesNotExist:
+            return Response({"error": "Record not found"}, status=404)
+
+    def delete(self, request, record_id):
+        """Remove an adjustment by index."""
+        try:
+            record = PayrollRecord.objects.get(tenant=request.user.tenant, id=record_id)
+            if record.status in ['Locked', 'Paid']:
+                return Response({"error": f"Cannot modify a {record.status} record."}, status=400)
+            idx = int(request.data.get('index', -1))
+            adjustments = list(record.one_time_adjustments or [])
+            if 0 <= idx < len(adjustments):
+                removed = adjustments.pop(idx)
+                record.one_time_adjustments = adjustments
+                record.save(update_fields=['one_time_adjustments'])
+                return Response({"message": f"Removed: {removed['label']}", "adjustments": adjustments})
+            return Response({"error": "Invalid index"}, status=400)
+        except PayrollRecord.DoesNotExist:
+            return Response({"error": "Record not found"}, status=404)
+
+
+# ─────────────────────────────────────────────
+# PAYROLL SETTINGS — GET/PUT
+# ─────────────────────────────────────────────
+class PayrollSettingView(views.APIView):
+    """Get or update the tenant's payroll configuration (PF%, ESI%, tax regime)."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        tenant = request.user.tenant
+        setting, _ = PayrollSetting.objects.get_or_create(
+            tenant=tenant,
+            defaults={
+                'pf_rate_employee': Decimal('12.0'),
+                'pf_rate_employer': Decimal('12.0'),
+                'esi_rate_employee': Decimal('0.75'),
+                'esi_rate_employer': Decimal('3.25'),
+                'tax_regime_default': 'New',
+            }
+        )
+        return Response({
+            "pf_rate_employee":  float(setting.pf_rate_employee),
+            "pf_rate_employer":  float(setting.pf_rate_employer),
+            "esi_rate_employee": float(setting.esi_rate_employee),
+            "esi_rate_employer": float(setting.esi_rate_employer),
+            "tax_regime_default": setting.tax_regime_default,
+        })
+
+    def put(self, request):
+        if request.user.role not in ['ADMIN', 'SUPER_ADMIN']:
+            return Response({"error": "Permission denied"}, status=403)
+        tenant = request.user.tenant
+        setting, _ = PayrollSetting.objects.get_or_create(tenant=tenant)
+        p = request.data
+        if 'pf_rate_employee' in p:
+            setting.pf_rate_employee = Decimal(str(p['pf_rate_employee']))
+        if 'pf_rate_employer' in p:
+            setting.pf_rate_employer = Decimal(str(p['pf_rate_employer']))
+        if 'esi_rate_employee' in p:
+            setting.esi_rate_employee = Decimal(str(p['esi_rate_employee']))
+        if 'esi_rate_employer' in p:
+            setting.esi_rate_employer = Decimal(str(p['esi_rate_employer']))
+        if 'tax_regime_default' in p:
+            setting.tax_regime_default = p['tax_regime_default']
+        setting.save()
+        return Response({"message": "Payroll settings updated successfully"})
+
+
+# ─────────────────────────────────────────────
+# HOLIDAY CALENDAR — CRUD
+# ─────────────────────────────────────────────
+class HolidayCalendarView(views.APIView):
+    """List, create and delete company holidays."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        tenant = request.user.tenant
+        year = request.query_params.get('year', str(timezone.localdate().year))
+        holidays = HolidayCalendar.objects.filter(
+            tenant=tenant, date__year=year
+        ).order_by('date')
+        data = [
+            {
+                "id": h.id, "name": h.name,
+                "date": h.date.isoformat(),
+                "holiday_type": h.holiday_type,
+                "description": h.description or "",
+            }
+            for h in holidays
+        ]
+        return Response({"holidays": data, "year": year, "total": len(data)})
+
+    def post(self, request):
+        if request.user.role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+        tenant = request.user.tenant
+        p = request.data
+        name = p.get('name', '').strip()
+        date_val = p.get('date')
+        if not name or not date_val:
+            return Response({"error": "name and date are required"}, status=400)
+        holiday, created = HolidayCalendar.objects.get_or_create(
+            tenant=tenant, date=date_val,
+            defaults={
+                'name': name,
+                'holiday_type': p.get('holiday_type', 'Company'),
+                'description': p.get('description', ''),
+            }
+        )
+        if not created:
+            holiday.name = name
+            holiday.holiday_type = p.get('holiday_type', holiday.holiday_type)
+            holiday.description = p.get('description', holiday.description)
+            holiday.save()
+        return Response({"message": "Holiday saved", "id": holiday.id}, status=201)
+
+    def delete(self, request):
+        if request.user.role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+        tenant = request.user.tenant
+        holiday_id = request.data.get('id') or request.query_params.get('id')
+        HolidayCalendar.objects.filter(tenant=tenant, id=holiday_id).delete()
+        return Response({"message": "Holiday deleted"})
+
+
+# ─────────────────────────────────────────────
+# LEAVE TYPES — GET/POST (settings page)
+# ─────────────────────────────────────────────
+class LeaveTypeMasterView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        tenant = request.user.tenant
+        leave_types = LeaveType.objects.filter(tenant=tenant)
+        data = [
+            {
+                "id": lt.id, "name": lt.name, "code": lt.code,
+                "days_per_year": lt.days_per_year, "is_paid": lt.is_paid,
+                "carry_forward": lt.carry_forward,
+                "max_carry_forward": lt.max_carry_forward,
+            }
+            for lt in leave_types
+        ]
+        return Response({"leave_types": data})
+
+    def post(self, request):
+        if request.user.role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+        tenant = request.user.tenant
+        p = request.data
+        lt = LeaveType.objects.create(
+            tenant=tenant,
+            name=p.get('name'),
+            code=p.get('code', 'CL').upper(),
+            days_per_year=p.get('days_per_year', 12),
+            is_paid=p.get('is_paid', True),
+            carry_forward=p.get('carry_forward', False),
+            max_carry_forward=p.get('max_carry_forward', 0),
+        )
+        return Response({"message": "Leave type created", "id": lt.id}, status=201)
+
+
+# ─────────────────────────────────────────────
+# LEAVE BALANCE — per employee
+# ─────────────────────────────────────────────
+class LeaveBalanceView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        tenant = request.user.tenant
+        employee_id = request.query_params.get('employee_id')
+        year = request.query_params.get('year', str(timezone.localdate().year))
+        qs = LeaveBalance.objects.filter(tenant=tenant, year=year).select_related('leave_type', 'employee')
+        if employee_id:
+            qs = qs.filter(employee_id=employee_id)
+        data = [
+            {
+                "id": lb.id,
+                "employee_id": str(lb.employee_id),
+                "employee_name": lb.employee.name,
+                "leave_type": lb.leave_type.name,
+                "leave_code": lb.leave_type.code,
+                "allocated": float(lb.allocated),
+                "used": float(lb.used),
+                "carried_forward": float(lb.carried_forward),
+                "remaining": float(lb.remaining),
+            }
+            for lb in qs
+        ]
+        return Response({"balances": data, "year": year})
+
+
+# ─────────────────────────────────────────────
+# SEED DEFAULTS — Manual trigger
+# ─────────────────────────────────────────────
+class SeedDefaultsView(views.APIView):
+    """Admin can manually re-seed defaults (safe: uses get_or_create)."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        if request.user.role not in ['ADMIN', 'SUPER_ADMIN']:
+            return Response({"error": "Permission denied"}, status=403)
+        try:
+            seed_tenant_defaults(request.user.tenant)
+            return Response({"message": "Master data seeded successfully for your tenant."})
+        except Exception as e:
+            return Response({"error": str(e)}, status=500)
+
+
+# ─────────────────────────────────────────────
+# ATTENDANCE CSV EXPORT
+# ─────────────────────────────────────────────
+class AttendanceExportView(views.APIView):
+    """Export attendance records as CSV for a given month."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        import csv
+        from django.http import HttpResponse
+
+        tenant = request.user.tenant
+        month = request.query_params.get('month', timezone.localdate().strftime('%Y-%m'))
+
+        records = AttendanceRecord.objects.filter(
+            tenant=tenant,
+            date__startswith=month
+        ).select_related('employee__department', 'status').order_by('employee__name', 'date')
+
+        response = HttpResponse(content_type='text/csv')
+        response['Content-Disposition'] = f'attachment; filename="attendance_{month}.csv"'
+        response['Access-Control-Expose-Headers'] = 'Content-Disposition'
+
+        writer = csv.writer(response)
+        writer.writerow([
+            'Employee Code', 'Employee Name', 'Department',
+            'Date', 'Status', 'Check In', 'Check Out', 'Work Hours'
+        ])
+        for r in records:
+            writer.writerow([
+                r.employee.employee_code or '',
+                r.employee.name,
+                r.employee.department.name if r.employee.department else '',
+                r.date.isoformat(),
+                r.status.code if r.status else r.status_str,
+                r.check_in.strftime('%H:%M') if r.check_in else '',
+                r.check_out.strftime('%H:%M') if r.check_out else '',
+                round(r.work_hours, 2),
+            ])
+        return response
