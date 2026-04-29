@@ -8,7 +8,8 @@ from .models import (
     User, Tenant, OTP, Department, Role, Employee, AttendanceRecord, PayrollRecord, 
     PayrollAuditLog, EmployeeDocument, AttendanceStatus, SalaryComponent, 
     SalaryStructure, SalaryStructureComponent, EmployeeSalaryStructure, PayrollSetting,
-    LeaveType, LeaveBalance, LeaveApplication, HolidayCalendar
+    LeaveType, LeaveBalance, LeaveApplication, HolidayCalendar,
+    IndustryMaster, DepartmentMaster, RoleMaster
 )
 from .serializers import RegisterSerializer, OTPVerifySerializer, OnboardingSerializer, UserSerializer, DepartmentSerializer, RoleSerializer, EmployeeSerializer, AttendanceRecordSerializer, EmployeeDocumentSerializer, AttendanceStatusSerializer
 from django.db import transaction
@@ -2316,3 +2317,49 @@ class AttendanceExportView(views.APIView):
                 round(r.work_hours, 2),
             ])
         return response
+
+
+# ── Master Data Views (Public — used during onboarding setup) ─────────────────
+
+class MasterIndustryView(views.APIView):
+    """GET /api/master/industries/ — Returns the full list of industry types."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        industries = IndustryMaster.objects.all().order_by('name')
+        data = [{'id': i.id, 'name': i.name} for i in industries]
+        return Response(data)
+
+
+class MasterDepartmentView(views.APIView):
+    """GET /api/master/departments/?industry_id=<id> — Departments for a given industry."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        industry_id = request.query_params.get('industry_id')
+        qs = DepartmentMaster.objects.filter(is_active=True)
+        if industry_id:
+            qs = qs.filter(industry_id=industry_id)
+        qs = qs.order_by('name')
+        data = [
+            {'id': d.id, 'name': d.name, 'code': d.code, 'industry_id': d.industry_id}
+            for d in qs
+        ]
+        return Response(data)
+
+
+class MasterRoleView(views.APIView):
+    """GET /api/master/roles/?department_id=<id> — Roles for a given department."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        department_id = request.query_params.get('department_id')
+        qs = RoleMaster.objects.filter(is_active=True)
+        if department_id:
+            qs = qs.filter(department_id=department_id)
+        qs = qs.order_by('level', 'name')
+        data = [
+            {'id': r.id, 'name': r.name, 'level': r.level, 'category': r.category, 'department_id': r.department_id}
+            for r in qs
+        ]
+        return Response(data)

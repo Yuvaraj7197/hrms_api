@@ -30,6 +30,8 @@ from .views import (
     SendOnboardingInviteView, EmployeeOnboardingPublicView,
     # Seed defaults
     SeedDefaultsView,
+    # Master Data
+    MasterIndustryView, MasterDepartmentView, MasterRoleView,
 )
 
 urlpatterns = [
@@ -98,4 +100,9 @@ urlpatterns = [
 
     # ── Admin Utilities ────────────────────────────────
     path('admin/seed-defaults/',     SeedDefaultsView.as_view(),           name='seed_defaults'),
+
+    # ── Master Data ────────────────────────────────────
+    path('master/industries/',       MasterIndustryView.as_view(),         name='master_industries'),
+    path('master/departments/',      MasterDepartmentView.as_view(),       name='master_departments'),
+    path('master/roles/',            MasterRoleView.as_view(),             name='master_roles'),
 ]

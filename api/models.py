@@ -363,3 +363,41 @@ class EmployeeDocument(TenantScopedModel):
 
     class Meta:
         db_table = "t_employee_document"
+
+# ── Master Data (Global / Not Tenant Scoped) ──────────────────────────────────
+
+class IndustryMaster(models.Model):
+    name = models.CharField(max_length=255)
+    description = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "m_industry"
+    
+    def __str__(self):
+        return self.name
+
+class DepartmentMaster(models.Model):
+    industry = models.ForeignKey(IndustryMaster, on_delete=models.CASCADE, related_name='departments', null=True, blank=True)
+    name = models.CharField(max_length=255)
+    code = models.CharField(max_length=50)
+    description = models.TextField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "m_department"
+    
+    def __str__(self):
+        return f"{self.name} ({self.industry.name if self.industry else 'Global'})"
+
+class RoleMaster(models.Model):
+    department = models.ForeignKey(DepartmentMaster, on_delete=models.CASCADE, related_name='roles')
+    name = models.CharField(max_length=255)
+    level = models.IntegerField(default=1) # 1: Junior, 2: Mid, 3: Senior
+    category = models.CharField(max_length=50, default='General') # Junior/Mid/Senior
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "m_role"
+    
+    def __str__(self):
+        return f"{self.name} ({self.department.name})"
