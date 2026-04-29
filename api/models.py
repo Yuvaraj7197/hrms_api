@@ -194,6 +194,8 @@ class PayrollSetting(TenantScopedModel):
     esi_rate_employee = models.DecimalField(max_digits=5, decimal_places=2, default=0.75)
     esi_rate_employer = models.DecimalField(max_digits=5, decimal_places=2, default=3.25)
     tax_regime_default = models.CharField(max_length=20, default='New') # Old/New
+    # Annual interest rate (%) used for loan interest computation during payroll run.
+    loan_interest_rate_annual = models.DecimalField(max_digits=5, decimal_places=2, default=8.5)
     
     class Meta:
         db_table = "t_payroll_setting"

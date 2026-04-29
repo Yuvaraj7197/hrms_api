@@ -17,6 +17,7 @@ from .views import (
     PayrollDataView, PayrollProcessView, SalaryComponentView, SalaryStructureView,
     EmployeeSalarySetupView, PayslipView, PayrollAdjustmentView,
     PayrollSettingView,
+    PayrollAuditLogsView, PayrollTaxVerifyView, PayrollForm16DownloadView,
     # ESS — Employee Self-Service
     ESSAttendanceTodayView, ESSAttendanceHistoryView,
     ESSProfileView, ESSPayslipsView,
@@ -71,6 +72,9 @@ urlpatterns = [
     path('payroll/payslip/<int:record_id>/', PayslipView.as_view(),         name='payroll_payslip_detail'),
     path('payroll/adjust/<int:record_id>/', PayrollAdjustmentView.as_view(),name='payroll_adjustment'),
     path('payroll/settings/',        PayrollSettingView.as_view(),          name='payroll_settings'),
+    path('payroll/audit-logs/',     PayrollAuditLogsView.as_view(),       name='payroll_audit_logs'),
+    path('payroll/tax/verify/<int:record_id>/', PayrollTaxVerifyView.as_view(), name='payroll_tax_verify'),
+    path('payroll/form16/download/', PayrollForm16DownloadView.as_view(), name='payroll_form16_download'),
 
     # ── ESS — Employee Self-Service ────────────────────
     path('ess/profile/',             ESSProfileView.as_view(),              name='ess_profile'),

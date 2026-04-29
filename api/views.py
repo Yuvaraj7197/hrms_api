@@ -230,6 +230,7 @@ def seed_tenant_defaults(tenant):
             'esi_rate_employee': Decimal('0.75'),
             'esi_rate_employer': Decimal('3.25'),
             'tax_regime_default': 'New',
+            'loan_interest_rate_annual': Decimal('8.5'),
         }
     )
 
@@ -739,6 +740,24 @@ class PayrollDataView(views.APIView):
         tenant = request.user.tenant
         cycle_month = request.query_params.get('cycle') or timezone.localdate().strftime('%Y-%m')
 
+        import calendar
+        try:
+            year, month = map(int, cycle_month.split('-'))
+            days_in_month = calendar.monthrange(year, month)[1]
+        except:
+            days_in_month = 30
+
+        from collections import defaultdict
+        attendance_qs = AttendanceRecord.objects.filter(tenant=tenant, date__startswith=cycle_month).select_related('status')
+        att_stats = defaultdict(lambda: {'present': 0, 'paid': 0})
+        for r in attendance_qs:
+            eid = str(r.employee_id)
+            s = (r.status.code if r.status else r.status_str or "").upper()
+            if s in ('P', 'PRESENT', 'L', 'LATE', 'WO', 'WEEKLY OFF', 'H', 'HOLIDAY', 'PL', 'PAID LEAVE'):
+                att_stats[eid]['paid'] += 1
+            if s in ('P', 'PRESENT', 'L', 'LATE'):
+                att_stats[eid]['present'] += 1
+
         # Seed payroll records for all Active employees (regardless of onboarding status)
         employees = Employee.objects.filter(
             tenant=tenant,
@@ -772,6 +791,7 @@ class PayrollDataView(views.APIView):
         response_data = [
             {
                 'id': str(record.id),
+                'employeeId': str(record.employee.id),
                 'employeeCode': record.employee.employee_code or '',
                 'name': record.employee.name,
                 'departmentName': record.employee.department.name if record.employee.department else 'N/A',
@@ -779,6 +799,14 @@ class PayrollDataView(views.APIView):
                 'allowances': float(record.allowances),
                 'deductions': float(record.deductions),
                 'loanEMI': float(record.loan_emi),
+                'employerPf': float(getattr(record, 'employer_pf', 0) or 0),
+                'esiAmount': float(getattr(record, 'esi_amount', 0) or 0),
+                'tdsAmount': float(getattr(record, 'tds_amount', 0) or 0),
+                'workingDays': days_in_month if record.status == 'Pending' else int(getattr(record, 'working_days', 30) or 30),
+                'presentDays': att_stats[str(record.employee.id)]['present'],
+                'lopDays': max(0, days_in_month - att_stats[str(record.employee.id)]['paid']) if record.status == 'Pending' else int(getattr(record, 'lop_days', 0) or 0),
+                'breakdown': record.breakdown,
+                'adjustments': record.one_time_adjustments,
                 'taxStatus': record.tax_status,
                 'netPay': float(record.net_pay),
                 'status': record.status,
@@ -801,109 +829,324 @@ class PayrollProcessView(views.APIView):
         if records.filter(status='Locked').exists():
              return Response({'error': 'This payroll cycle is locked and cannot be modified.'}, status=400)
 
+        # Payroll settings used by the engine
+        setting, _ = PayrollSetting.objects.get_or_create(
+            tenant=tenant,
+            defaults={
+                'pf_rate_employee': Decimal('12.0'),
+                'pf_rate_employer': Decimal('12.0'),
+                'esi_rate_employee': Decimal('0.75'),
+                'esi_rate_employer': Decimal('3.25'),
+                'tax_regime_default': 'New',
+                'loan_interest_rate_annual': Decimal('8.5'),
+            }
+        )
+
+        # ── Terminal state actions (create audit logs) ─────────────────────────
         if action == 'pay':
-            updated = records.filter(status='Approved').update(status='Paid')
-            return Response({'message': 'Payroll payment completed', 'updated': updated})
+            to_pay = list(records.filter(status='Approved'))
+            for rec in to_pay:
+                rec.status = 'Paid'
+                rec.paid_at = timezone.now()
+                rec.save(update_fields=['status', 'paid_at'])
+                PayrollAuditLog.objects.create(
+                    tenant=tenant,
+                    payroll_record=rec,
+                    action=f"Payroll disbursed (Paid) — {cycle_month}",
+                    performed_by=request.user,
+                )
+            return Response({'message': 'Payroll payment completed', 'updated': len(to_pay)})
         
         if action == 'approve':
-            updated = records.filter(status='Processed').update(status='Approved')
-            return Response({'message': 'Payroll batch approved', 'updated': updated})
+            to_approve = list(records.filter(status='Processed'))
+            for rec in to_approve:
+                rec.status = 'Approved'
+                rec.save(update_fields=['status'])
+                PayrollAuditLog.objects.create(
+                    tenant=tenant,
+                    payroll_record=rec,
+                    action=f"Payroll approved (Approved) — {cycle_month}",
+                    performed_by=request.user,
+                )
+            return Response({'message': 'Payroll batch approved', 'updated': len(to_approve)})
             
         if action == 'lock':
-            updated = records.update(status='Locked')
-            return Response({'message': 'Payroll cycle locked', 'updated': updated})
+            to_lock = list(records.all())
+            for rec in to_lock:
+                rec.status = 'Locked'
+                rec.save(update_fields=['status'])
+                PayrollAuditLog.objects.create(
+                    tenant=tenant,
+                    payroll_record=rec,
+                    action=f"Payroll cycle locked (Locked) — {cycle_month}",
+                    performed_by=request.user,
+                )
+            return Response({'message': 'Payroll cycle locked', 'updated': len(to_lock)})
 
-        # 1. Fetch Attendance Report for LOP calculation
-        attendance_report = {}
+        # 1. Determine calendar days in the cycle month
+        import calendar as _calendar
         try:
-            # Re-use our report logic or similar
+            _year, _month = map(int, cycle_month.split('-'))
+            days_in_month = _calendar.monthrange(_year, _month)[1]
+        except Exception:
+            days_in_month = 30
+
+        # 2. Fetch Attendance Report for LOP/present calculation
+        paid_days_report = {}    # eid -> paid count (Present, WO, Holiday)
+        present_report   = {}    # eid -> actual present count
+        try:
             from collections import defaultdict
             qs = AttendanceRecord.objects.filter(tenant=tenant, date__startswith=cycle_month)
             for r in qs.select_related('status'):
                 eid = str(r.employee_id)
-                s = r.status.code if r.status else r.status_str
-                if eid not in attendance_report: attendance_report[eid] = 0
-                if s == 'LOP' or s == 'A':
-                    attendance_report[eid] += 1
-        except:
+                s = (r.status.code if r.status else r.status_str or "").upper()
+                
+                if eid not in paid_days_report:
+                    paid_days_report[eid] = 0
+                    present_report[eid] = 0
+                
+                # These statuses are considered "Paid"
+                if s in ('P', 'PRESENT', 'L', 'LATE', 'WO', 'WEEKLY OFF', 'H', 'HOLIDAY', 'PL', 'PAID LEAVE'):
+                    paid_days_report[eid] += 1
+                    
+                # These statuses are specifically "Present" for reporting
+                if s in ('P', 'PRESENT', 'L', 'LATE'):
+                    present_report[eid] += 1
+        except Exception:
+            pass
+        except Exception:
             pass
 
+        # ── Process Pending records ────────────────────────────────────────────
         updated = 0
-        for record in records:
-            if record.status == 'Pending':
-                base_salary = Decimal(record.base_salary)
-                breakdown = {"earnings": [], "deductions": []}
-                
-                # Try to get structure-based components
-                structure_link = EmployeeSalaryStructure.objects.filter(employee=record.employee, is_active=True).first()
-                
-                total_earnings = Decimal('0')
-                total_statutory = Decimal('0')
+        statutory_skip_codes = {'PF_EMP', 'PF_EMPLR', 'ESI_EMP', 'ESI_EMPLR', 'PTAX', 'TDS'}
+        for record in records.filter(status='Pending'):
+            base_salary = Decimal(record.base_salary or 0)
+            breakdown = {"earnings": [], "deductions": []}
 
-                if structure_link and structure_link.structure:
-                    # Next-Level Calculation
-                    for sc in structure_link.structure.components.all():
-                        amount = Decimal('0')
-                        if sc.calculation_type == 'Fixed':
-                            amount = sc.value
-                        elif sc.calculation_type == 'Percentage':
-                            amount = (base_salary * sc.value / Decimal('100')).quantize(Decimal('0.01'))
+            total_earnings = Decimal('0')
+            total_deductions = Decimal('0')
+
+            employer_pf = Decimal('0')
+            esi_emp = Decimal('0')
+            tds_amount = Decimal('0')
+
+            # 1) Earnings (and non-statutory deductions) from salary structure
+            structure_link = EmployeeSalaryStructure.objects.filter(
+                employee=record.employee, is_active=True
+            ).first()
+
+            if structure_link and structure_link.structure:
+                # Always ensure Base Salary is the foundation of earnings
+                total_earnings = base_salary
+                breakdown["earnings"].append({"name": "Basic", "amount": float(base_salary), "code": "BASIC"})
+
+                for sc in structure_link.structure.components.all():
+                    # Skip if structure explicitly includes BASIC to avoid double-counting
+                    if sc.component.code == 'BASIC':
+                        continue
                         
-                        comp_data = {"name": sc.component.name, "amount": float(amount), "code": sc.component.code}
-                        if sc.component.component_type == 'Earning':
-                            total_earnings += amount
-                            breakdown["earnings"].append(comp_data)
-                        else:
-                            total_statutory += amount
-                            breakdown["deductions"].append(comp_data)
-                else:
-                    # Fallback to Basic + 20% Allowance logic
-                    allowance_amt = (base_salary * Decimal('0.2')).quantize(Decimal('0.01'))
-                    total_earnings = base_salary + allowance_amt
-                    breakdown["earnings"].append({"name": "Basic", "amount": float(base_salary), "code": "BASIC"})
-                    breakdown["earnings"].append({"name": "Standard Allowance", "amount": float(allowance_amt), "code": "SA"})
-                    
-                    # Basic tax/pf logic
-                    itax = base_salary * (Decimal('0.20') if base_salary > 100000 else (Decimal('0.10') if base_salary > 50000 else Decimal('0.05')))
-                    pf = base_salary * Decimal('0.12')
-                    ptax = Decimal('200') if base_salary > 15000 else Decimal('0')
-                    total_statutory = (itax + pf + ptax).quantize(Decimal('0.01'))
-                    
-                    breakdown["deductions"].append({"name": "Income Tax", "amount": float(itax.quantize(Decimal('0.01'))), "code": "ITAX"})
-                    breakdown["deductions"].append({"name": "Provident Fund", "amount": float(pf.quantize(Decimal('0.01'))), "code": "PF"})
-                    if ptax > 0:
-                        breakdown["deductions"].append({"name": "Professional Tax", "amount": float(ptax), "code": "PTAX"})
+                    amount = Decimal('0')
+                    if sc.calculation_type == 'Fixed':
+                        amount = sc.value
+                    elif sc.calculation_type == 'Percentage':
+                        amount = (base_salary * sc.value / Decimal('100')).quantize(Decimal('0.01'))
 
-                # ESI Threshold Logic
-                # If gross pay <= 21000, apply ESI (Employee: 0.75%, Employer: 3.25%)
-                if total_earnings <= Decimal('21000'):
-                    esi_emp = (total_earnings * Decimal('0.0075')).quantize(Decimal('0.01'))
-                    total_statutory += esi_emp
-                    breakdown["deductions"].append({"name": "ESI (Employee)", "amount": float(esi_emp), "code": "ESI"})
+                    comp_data = {"name": sc.component.name, "amount": float(amount), "code": sc.component.code}
 
-                # LOP Deduction (Always applies)
-                lop_days = attendance_report.get(str(record.employee_id), 0)
-                lop_deduction = (base_salary / Decimal('30')) * Decimal(lop_days)
-                if lop_deduction > 0:
-                    lop_ded_amt = lop_deduction.quantize(Decimal('0.01'))
-                    total_statutory += lop_ded_amt
-                    breakdown["deductions"].append({"name": "Loss of Pay", "amount": float(lop_ded_amt), "code": "LOP"})
+                    if sc.component.component_type == 'Earning':
+                        total_earnings += amount
+                        breakdown["earnings"].append(comp_data)
+                    else:
+                        # Skip statutory components; statutory deductions are computed below.
+                        if sc.component.code in statutory_skip_codes:
+                            continue
+                        total_deductions += amount
+                        breakdown["deductions"].append(comp_data)
+            else:
+                # Fallback to Basic + 20% Allowance logic
+                allowance_amt = (base_salary * Decimal('0.2')).quantize(Decimal('0.01'))
+                total_earnings = base_salary + allowance_amt
+                breakdown["earnings"].append({"name": "Basic", "amount": float(base_salary), "code": "BASIC"})
+                breakdown["earnings"].append({"name": "Standard Allowance", "amount": float(allowance_amt), "code": "SA"})
 
-                loan_interest = (Decimal(record.loan_emi) * Decimal('0.085') / Decimal('12')).quantize(Decimal('0.01'))
-                if record.loan_emi > 0:
-                    breakdown["deductions"].append({"name": "Loan EMI", "amount": float(record.loan_emi), "code": "EMI"})
-                    breakdown["deductions"].append({"name": "Loan Interest", "amount": float(loan_interest), "code": "INT"})
+            # 2) Apply one-time adjustments (bonus/deduction) from the cycle
+            adjustments = list(record.one_time_adjustments or [])
+            for adj in adjustments:
+                adj_type = adj.get('type')
+                adj_label = (adj.get('label') or '').strip() or 'Adjustment'
+                adj_amount = Decimal(str(adj.get('amount', 0) or 0))
+                if adj_amount <= 0:
+                    continue
+                if adj_type == 'bonus':
+                    total_earnings += adj_amount
+                    breakdown["earnings"].append({
+                        "name": adj_label,
+                        "amount": float(adj_amount.quantize(Decimal('0.01'))),
+                        "code": "BONUS",
+                    })
+                elif adj_type == 'deduction':
+                    total_deductions += adj_amount
+                    breakdown["deductions"].append({
+                        "name": adj_label,
+                        "amount": float(adj_amount.quantize(Decimal('0.01'))),
+                        "code": "ADJ_DED",
+                    })
 
-                record.lop_days = lop_days
-                record.allowances = total_earnings - base_salary
-                record.deductions = total_statutory
-                record.net_pay = (total_earnings - total_statutory - Decimal(record.loan_emi) - loan_interest).quantize(Decimal('0.01'))
-                record.breakdown = breakdown
-                record.status = 'Processed'
-                record.save()
-                updated += 1
+            # 3) Statutory deductions computed by engine rules
+            # PF: employee deduction affects net pay; employer contribution is stored separately for display.
+            pf_emp = (base_salary * setting.pf_rate_employee / Decimal('100')).quantize(Decimal('0.01'))
+            employer_pf = (base_salary * setting.pf_rate_employer / Decimal('100')).quantize(Decimal('0.01'))
+            total_deductions += pf_emp
+            breakdown["deductions"].append({"name": "Provident Fund", "amount": float(pf_emp), "code": "PF"})
+
+            # TDS / Income tax slab (MVP rule). If you need full regime support, extend here.
+            itax = base_salary * (
+                Decimal('0.20') if base_salary > 100000 else (Decimal('0.10') if base_salary > 50000 else Decimal('0.05'))
+            )
+            tds_amount = itax.quantize(Decimal('0.01'))
+            total_deductions += tds_amount
+            breakdown["deductions"].append({"name": "Income Tax", "amount": float(tds_amount), "code": "ITAX"})
+
+            ptax = Decimal('200') if base_salary > 15000 else Decimal('0')
+            if ptax > 0:
+                total_deductions += ptax
+                breakdown["deductions"].append({"name": "Professional Tax", "amount": float(ptax), "code": "PTAX"})
+
+            # ESI threshold logic (employee share only affects net pay)
+            # If gross pay <= 21000, apply ESI (Employee % from tenant setting)
+            if total_earnings <= Decimal('21000'):
+                esi_emp = (total_earnings * setting.esi_rate_employee / Decimal('100')).quantize(Decimal('0.01'))
+                total_deductions += esi_emp
+                breakdown["deductions"].append({"name": "ESI (Employee)", "amount": float(esi_emp), "code": "ESI"})
+
+            # LOP Deduction (Loss of Pay) — based on missing paid days
+            paid_days = paid_days_report.get(str(record.employee_id), 0)
+            lop_days = max(0, days_in_month - paid_days)
+            
+            per_day  = (base_salary / Decimal(days_in_month)).quantize(Decimal('0.01'))
+            lop_deduction = per_day * Decimal(lop_days)
+            if lop_deduction > 0:
+                lop_ded_amt = lop_deduction.quantize(Decimal('0.01'))
+                total_deductions += lop_ded_amt
+                breakdown["deductions"].append({"name": "Loss of Pay", "amount": float(lop_ded_amt), "code": "LOP"})
+
+            # Loan principal + interest
+            loan_emi = Decimal(record.loan_emi or 0)
+            loan_interest = Decimal('0.00')
+            if loan_emi > 0:
+                loan_interest = (loan_emi * setting.loan_interest_rate_annual / Decimal('100') / Decimal('12')).quantize(Decimal('0.01'))
+                breakdown["deductions"].append({"name": "Loan EMI", "amount": float(loan_emi), "code": "EMI"})
+                breakdown["deductions"].append({"name": "Loan Interest", "amount": float(loan_interest), "code": "INT"})
+
+            # 4) Persist record fields
+            record.lop_days    = int(lop_days)
+            record.working_days = days_in_month
+            record.gross_pay   = (total_earnings or Decimal('0')).quantize(Decimal('0.01'))
+            record.allowances  = (total_earnings - base_salary).quantize(Decimal('0.01'))
+            record.deductions  = total_deductions.quantize(Decimal('0.01'))
+            record.employer_pf = employer_pf
+            record.esi_amount  = esi_emp
+            record.tds_amount  = tds_amount
+            record.net_pay     = (total_earnings - total_deductions - loan_emi - loan_interest).quantize(Decimal('0.01'))
+            record.breakdown   = breakdown
+            record.status      = 'Processed'
+            record.save()
+
+            PayrollAuditLog.objects.create(
+                tenant=tenant,
+                payroll_record=record,
+                action=f"Payroll processed (Processed) — {cycle_month}",
+                performed_by=request.user,
+            )
+            updated += 1
 
         return Response({'message': 'Next-Level Payroll processing completed', 'updated': updated})
+
+
+class PayrollTaxVerifyView(views.APIView):
+    """
+    Admin/HR: mark payroll tax proofs status for a specific employee payroll record.
+    MVP: only updates PayrollRecord.tax_status (Pending/Verified/Rejected).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, record_id: int):
+        if request.user.role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+
+        tenant = request.user.tenant
+        try:
+            record = PayrollRecord.objects.get(tenant=tenant, id=record_id)
+        except PayrollRecord.DoesNotExist:
+            return Response({"error": "Record not found"}, status=404)
+
+        new_status = request.data.get('taxStatus') or request.data.get('status') or 'Verified'
+        if new_status not in ['Pending', 'Verified', 'Rejected']:
+            return Response({"error": "Invalid tax status"}, status=400)
+
+        record.tax_status = new_status
+        record.save(update_fields=['tax_status'])
+
+        PayrollAuditLog.objects.create(
+            tenant=tenant,
+            payroll_record=record,
+            action=f"Tax proofs {new_status} — {record.employee.name} ({record.employee.employee_code})",
+            performed_by=request.user,
+        )
+
+        return Response({"message": "Tax status updated", "taxStatus": record.tax_status})
+
+
+class PayrollAuditLogsView(views.APIView):
+    """Admin/HR: fetch payroll lifecycle audit logs for a given cycle."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        tenant = request.user.tenant
+        cycle_month = request.query_params.get('cycle') or timezone.localdate().strftime('%Y-%m')
+
+        records_ids = PayrollRecord.objects.filter(tenant=tenant, cycle_month=cycle_month).values_list('id', flat=True)
+        logs_qs = PayrollAuditLog.objects.filter(tenant=tenant, payroll_record_id__in=records_ids).order_by('-created_at')[:200]
+
+        # Keep formatting compatible with existing Angular AuditEngineModal parsing.
+        formatted = []
+        for log in logs_qs:
+            time_part = log.created_at.strftime('%H:%M:%S')
+            formatted.append(f'[{time_part}] {log.action}')
+
+        return Response({"cycle": cycle_month, "total": len(formatted), "logs": formatted})
+
+
+class PayrollForm16DownloadView(views.APIView):
+    """MVP: returns a downloadable text package for Form-16 generation."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        from django.http import HttpResponse
+
+        tenant = request.user.tenant
+        cycle_month = request.query_params.get('cycle') or timezone.localdate().strftime('%Y-%m')
+
+        records = PayrollRecord.objects.filter(tenant=tenant, cycle_month=cycle_month).select_related('employee').order_by('employee__name')
+
+        lines = [
+            'FORM-16 PACKAGE (MVP / SIMULATED)',
+            f'Cycle: {cycle_month}',
+            f'Generated At: {timezone.now().isoformat()}',
+            f'Records: {records.count()}',
+            '',
+            'Employee-wise Net Pay:',
+        ]
+        for r in records:
+            lines.append(f'- {r.employee.name} ({r.employee.employee_code}) => Net Pay: {r.net_pay}')
+
+        content = '\n'.join(lines)
+        resp = HttpResponse(content, content_type='text/plain')
+        resp['Content-Disposition'] = f'attachment; filename="form16_{cycle_month}.txt"'
+        resp['Access-Control-Expose-Headers'] = 'Content-Disposition'
+        return resp
+
 
 class SalaryComponentView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -992,27 +1235,43 @@ class PayslipView(views.APIView):
             record = PayrollRecord.objects.get(tenant=request.user.tenant, id=record_id)
             emp = record.employee
             return Response({
-                "record": {
-                    "id":        record.id,
-                    "employee":  emp.name,
-                    "cycle":     record.cycle_month,
-                    "net_pay":   float(record.net_pay),
-                    "gross_pay": float(getattr(record, 'gross_pay', 0)),
-                    "tds":       float(getattr(record, 'tds_amount', 0)),
-                    "employer_pf": float(getattr(record, 'employer_pf', 0)),
-                    "esi":       float(getattr(record, 'esi_amount', 0)),
-                    "status":    record.status,
-                    "breakdown": record.breakdown,
-                    "adjustments": getattr(record, 'one_time_adjustments', []),
-                    "payment_reference": getattr(record, 'payment_reference', None),
+                "company": {
+                    "name": request.user.tenant.name if hasattr(request.user, 'tenant') else "Company Name",
                 },
                 "employee": {
+                    "name":           emp.name,
+                    "code":           emp.employee_code,
+                    "department":     emp.department.name if emp.department else 'N/A',
+                    "designation":    emp.designation.name if getattr(emp, 'designation', None) else 'N/A',
+                    "joining_date":   emp.joining_date.strftime('%Y-%m-%d') if emp.joining_date else None,
                     "bank_name":      emp.bank_name,
                     "account_number": emp.account_number,
                     "ifsc_code":      emp.ifsc_code,
-                    "pan_number":     emp.pan_number      if hasattr(emp, 'pan_number')  else None,
-                    "uan_number":     emp.uan_number      if hasattr(emp, 'uan_number')  else None,
-                    "tax_regime":     emp.tax_regime      if hasattr(emp, 'tax_regime')  else 'New',
+                    "pan_number":     getattr(emp, 'pan_number', None),
+                    "uan_number":     getattr(emp, 'uan_number', None),
+                    "tax_regime":     getattr(emp, 'tax_regime', 'New'),
+                },
+                "attendance": {
+                    "working_days":   getattr(record, 'working_days', 30),
+                    "present_days":   AttendanceRecord.objects.filter(
+                        employee=emp, 
+                        date__startswith=record.cycle_month,
+                        status__code__in=['P', 'PRESENT', 'L', 'LATE']
+                    ).count(),
+                    "lop_days":       getattr(record, 'lop_days', 0),
+                    "paid_days":      getattr(record, 'working_days', 30) - getattr(record, 'lop_days', 0),
+                },
+                "salary": {
+                    "id":             record.id,
+                    "cycle":          record.cycle_month,
+                    "status":         record.status,
+                    "base_salary":    float(record.base_salary),
+                    "gross_pay":      float(getattr(record, 'gross_pay', 0)),
+                    "total_deductions": float(getattr(record, 'deductions', 0)) + float(getattr(record, 'loan_emi', 0)) + float(getattr(record, 'tds_amount', 0)) + float(getattr(record, 'esi_amount', 0)),
+                    "net_pay":        float(record.net_pay),
+                    "breakdown":      record.breakdown or {"earnings": [], "deductions": []},
+                    "adjustments":    getattr(record, 'one_time_adjustments', []),
+                    "payment_reference": getattr(record, 'payment_reference', None),
                 }
             })
         except PayrollRecord.DoesNotExist:
@@ -1842,6 +2101,7 @@ class PayrollSettingView(views.APIView):
                 'esi_rate_employee': Decimal('0.75'),
                 'esi_rate_employer': Decimal('3.25'),
                 'tax_regime_default': 'New',
+                'loan_interest_rate_annual': Decimal('8.5'),
             }
         )
         return Response({
@@ -1850,6 +2110,7 @@ class PayrollSettingView(views.APIView):
             "esi_rate_employee": float(setting.esi_rate_employee),
             "esi_rate_employer": float(setting.esi_rate_employer),
             "tax_regime_default": setting.tax_regime_default,
+            "loan_interest_rate_annual": float(getattr(setting, "loan_interest_rate_annual", Decimal("8.5"))),
         })
 
     def put(self, request):
@@ -1868,6 +2129,8 @@ class PayrollSettingView(views.APIView):
             setting.esi_rate_employer = Decimal(str(p['esi_rate_employer']))
         if 'tax_regime_default' in p:
             setting.tax_regime_default = p['tax_regime_default']
+        if 'loan_interest_rate_annual' in p:
+            setting.loan_interest_rate_annual = Decimal(str(p['loan_interest_rate_annual']))
         setting.save()
         return Response({"message": "Payroll settings updated successfully"})
 
