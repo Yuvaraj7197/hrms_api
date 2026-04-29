@@ -13,6 +13,8 @@ from .models import (
 )
 from .serializers import RegisterSerializer, OTPVerifySerializer, OnboardingSerializer, UserSerializer, DepartmentSerializer, RoleSerializer, EmployeeSerializer, AttendanceRecordSerializer, EmployeeDocumentSerializer, AttendanceStatusSerializer
 from django.db import transaction
+from django.core.mail import send_mail
+from django.conf import settings
 import random
 from rest_framework.permissions import AllowAny
 import string
@@ -265,61 +267,110 @@ class OnboardingEmployeesView(views.APIView):
     def post(self, request):
         tenant = request.user.tenant
         employees_data = request.data.get('employees', [])
-        
-        # We handle employee creation and hierarchy
-        # 1. Create employees and their User accounts first
-        for emp in employees_data:
-            dept_name = emp.get('department') or emp.get('departmentId')
-            role_name = emp.get('role') or emp.get('roleId')
-            email = emp.get('email')
-            password = emp.get('password')
-            
-            dept = Department.objects.filter(tenant=tenant, name=dept_name).first()
-            role = Role.objects.filter(tenant=tenant, name=role_name).first()
-            
-            # Create/Update User account if password is provided
-            user = None
-            if email and password:
-                username = email.split('@')[0] + "_" + str(random.randint(100, 999))
+
+        credentials_sent = 0
+        emails_sent = []
+        emails_failed = []
+
+        with transaction.atomic():
+            # 1. Create employees and user accounts first.
+            for emp in employees_data:
+                dept_name = emp.get('department') or emp.get('departmentId')
+                role_name = emp.get('role') or emp.get('roleId')
+                email = emp.get('email')
+                if not email:
+                    continue
+
+                dept = Department.objects.filter(tenant=tenant, name=dept_name).first()
+                role = Role.objects.filter(tenant=tenant, name=role_name).first()
+
+                base_username = email.split('@')[0]
+                generated_username = f"{base_username}_{random.randint(100, 999)}"
+                temp_password = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
+
                 user, created = User.objects.get_or_create(
                     email=email,
                     defaults={
-                        'username': username,
+                        'username': generated_username,
                         'tenant': tenant,
                         'role': 'EMPLOYEE',
                         'is_verified': True
                     }
                 )
-                user.set_password(password)
-                user.save()
 
-            employee, _ = Employee.objects.update_or_create(
-                tenant=tenant,
-                email=email,
-                defaults={
-                    'user': user,
-                    'name': emp.get('name'),
-                    # 'phone': emp.get('phone') or '',
-                    'employee_code': emp.get('employeeCode') or emp.get('employee_code'),
-                    'department': dept,
-                    'designation': role,
-                    'status': emp.get('status') or 'Active',
-                    'joining_date': emp.get('joiningDate') or emp.get('joining_date') or None,
-                }
-            )
-        
-        # 2. Setup Reporting Hierarchy
-        for emp in employees_data:
-            manager_email = emp.get('reportingTo') or emp.get('reporting_to')
-            if manager_email:
-                manager = Employee.objects.filter(tenant=tenant, email=manager_email).first()
-                if manager:
-                    Employee.objects.filter(tenant=tenant, email=emp.get('email')).update(reporting_to=manager)
+                # If user already exists without tenant, align it.
+                if not created and user.tenant_id != tenant.id:
+                    user.tenant = tenant
+
+                user.role = 'EMPLOYEE'
+                user.is_verified = True
+
+                # New users get generated credentials.
+                if created:
+                    user.set_password(temp_password)
+                    user.save()
+
+                    try:
+                        sent_count = send_mail(
+                            subject='Your Login Credentials',
+                            message=(
+                                f"Hello {emp.get('name') or 'Employee'},\n\n"
+                                f"Your account for {tenant.name} has been created.\n"
+                                f"Username: {user.username}\n"
+                                f"Temporary Password: {temp_password}\n\n"
+                                "Please log in and change your password immediately."
+                            ),
+                            from_email=getattr(settings, 'DEFAULT_FROM_EMAIL', 'no-reply@hrms.local'),
+                            recipient_list=[email],
+                            fail_silently=False,
+                        )
+                        if sent_count > 0:
+                            credentials_sent += 1
+                            emails_sent.append(email)
+                        else:
+                            emails_failed.append({
+                                "email": email,
+                                "reason": "Mail backend returned zero sent emails"
+                            })
+                    except Exception as exc:
+                        # Keep onboarding flow resilient if email setup is missing.
+                        emails_failed.append({
+                            "email": email,
+                            "reason": str(exc)
+                        })
+
+                employee, _ = Employee.objects.update_or_create(
+                    tenant=tenant,
+                    email=email,
+                    defaults={
+                        'user': user,
+                        'name': emp.get('name'),
+                        # 'phone': emp.get('phone') or '',
+                        'employee_code': emp.get('employeeCode') or emp.get('employee_code'),
+                        'department': dept,
+                        'designation': role,
+                        'status': emp.get('status') or 'Active',
+                        'joining_date': emp.get('joiningDate') or emp.get('joining_date') or None,
+                    }
+                )
+
+            # 2. Setup reporting hierarchy.
+            for emp in employees_data:
+                manager_email = emp.get('reportingTo') or emp.get('reporting_to')
+                if manager_email:
+                    manager = Employee.objects.filter(tenant=tenant, email=manager_email).first()
+                    if manager:
+                        Employee.objects.filter(tenant=tenant, email=emp.get('email')).update(reporting_to=manager)
 
         tenant.onboarding_step = 5
         tenant.save(update_fields=['onboarding_step'])
 
-        return Response({"message": "Employees and User accounts created successfully"})
+        return Response({
+            "message": "Employees and user accounts created successfully",
+            "credentials_sent": credentials_sent,
+            "emails_sent": emails_sent,
+            "emails_failed": emails_failed
+        })
 
 class OnboardingSetupView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]

@@ -129,6 +129,20 @@ USE_I18N = True
 USE_TZ = True
 
 
+# Email settings (read from environment)
+def _env_bool(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+EMAIL_BACKEND = os.getenv('EMAIL_BACKEND', 'django.core.mail.backends.smtp.EmailBackend')
+EMAIL_HOST = os.getenv('EMAIL_HOST', 'mail.sukritechnologies.com')
+EMAIL_PORT = int(os.getenv('EMAIL_PORT', '465'))
+EMAIL_USE_TLS = _env_bool('EMAIL_USE_TLS', False)
+EMAIL_USE_SSL = _env_bool('EMAIL_USE_SSL', True)
+EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', 'support@sukritechnologies.com')
+EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')
+DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', EMAIL_HOST_USER or 'support@sukritechnologies.com')
+
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/5.0/howto/static-files/
 
