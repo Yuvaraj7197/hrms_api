@@ -9,10 +9,10 @@ from .models import (
     PayrollAuditLog, EmployeeDocument, AttendanceStatus, SalaryComponent, 
     SalaryStructure, SalaryStructureComponent, EmployeeSalaryStructure, PayrollSetting,
     LeaveType, LeaveBalance, LeaveApplication, HolidayCalendar,
-    IndustryMaster, DepartmentMaster, RoleMaster
+    IndustryMaster, DepartmentMaster, RoleMaster, RolePermission
 )
 from .serializers import RegisterSerializer, OTPVerifySerializer, OnboardingSerializer, UserSerializer, DepartmentSerializer, RoleSerializer, EmployeeSerializer, AttendanceRecordSerializer, EmployeeDocumentSerializer, AttendanceStatusSerializer
-from django.db import transaction
+from django.db import transaction, connection
 from django.core.mail import send_mail
 from django.conf import settings
 import random
@@ -28,6 +28,185 @@ def safe_int(value):
 
 PAYROLL_PAID_STATUS_CODES = ('P', 'PRESENT', 'L', 'LATE', 'WO', 'WEEKLY OFF', 'H', 'HOLIDAY', 'PL', 'PAID LEAVE')
 PAYROLL_PRESENT_STATUS_CODES = ('P', 'PRESENT', 'L', 'LATE')
+
+
+def ensure_role_permission_table_exists():
+    """
+    Creates `t_role_permission` table if missing.
+    This repo's migrations are not aligned to current models, so we avoid migrations
+    for this table and provision it safely at runtime.
+    """
+    vendor = getattr(connection, "vendor", "")
+    with connection.cursor() as cursor:
+        if vendor == "sqlite":
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='t_role_permission'")
+            exists = cursor.fetchone()
+            if exists:
+                return
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS t_role_permission (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  role_id BIGINT NOT NULL UNIQUE,
+                  allowed_routes TEXT NOT NULL,
+                  created_at DATETIME NOT NULL,
+                  updated_at DATETIME NOT NULL,
+                  FOREIGN KEY(role_id) REFERENCES t_role(id) ON DELETE CASCADE
+                )
+                """
+            )
+            return
+
+        # Default: MySQL/MariaDB
+        cursor.execute("SHOW TABLES LIKE 't_role_permission'")
+        exists = cursor.fetchone()
+        if exists:
+            return
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_role_permission (
+              id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+              role_id BIGINT NOT NULL UNIQUE,
+              allowed_routes JSON NOT NULL,
+              created_at DATETIME(6) NOT NULL,
+              updated_at DATETIME(6) NOT NULL,
+              CONSTRAINT t_role_permission_role_fk
+                FOREIGN KEY (role_id) REFERENCES t_role(id)
+                ON DELETE CASCADE
+            )
+            """
+        )
+
+
+DEFAULT_ADMIN_ROUTE_ALLOWLIST_BY_USER_ROLE = {
+    # Fallback policy until role permissions are configured.
+    'SUPER_ADMIN': ['*'],
+    'ADMIN': ['*'],
+    'HR': [
+        'dashboard', 'pending', 'notifications',
+        'employees/new', 'attendance',
+        'leave-master', 'holiday-calendar',
+        'payroll',
+        'reports',
+        'grievance', 'asset-register', 'recruitment', 'training', 'performance'
+    ],
+    'MANAGER': [
+        'dashboard', 'pending', 'notifications',
+        'employees/new', 'attendance',
+        'reports',
+        'grievance', 'asset-register', 'recruitment', 'training', 'performance'
+    ],
+}
+
+
+ADMIN_ROUTE_KEYS = [
+    'dashboard',
+    'pending',
+    'notifications',
+    'employees/new',
+    'attendance',
+    'reports',
+    'leave-master',
+    'holiday-calendar',
+    'asset-register',
+    'recruitment',
+    'setup',
+    'role-permissions',
+    'payroll',
+    'performance',
+    'training',
+    'grievance',
+    'settings',
+]
+
+
+def default_allowed_routes_for_role_name(role_name: str):
+    """
+    Best-effort mapping from designation (`t_role.name`) -> admin portal routes.
+    Keep conservative defaults; grant broader access to managerial/executive roles.
+    """
+    name = (role_name or '').strip().lower()
+    if not name:
+        return ['dashboard', 'notifications']
+
+    # Top leadership / owners
+    if any(k in name for k in ['chief executive officer', 'ceo', 'director', 'vice president', 'vp', 'general manager']):
+        return ['*']
+
+    # C-level / architects / delivery/program/project leadership: strong visibility, no system settings
+    if any(k in name for k in [
+        'chief technology officer', 'cto',
+        'chief financial officer', 'cfo',
+        'technical architect', 'solution architect', 'architect',
+        'delivery manager', 'program manager', 'project manager',
+    ]):
+        return [
+            'dashboard', 'pending', 'notifications',
+            'employees/new', 'attendance',
+            'reports', 'performance', 'training',
+            'asset-register', 'grievance',
+            'payroll',
+        ]
+
+    # HR
+    if 'talent acquisition' in name or 'recruiter' in name:
+        return ['dashboard', 'notifications', 'recruitment', 'employees/new', 'reports']
+
+    if 'hr' in name:
+        # HR Intern -> limited
+        if 'intern' in name:
+            return ['dashboard', 'notifications', 'employees/new', 'recruitment']
+        # HR roles -> full HR ops
+        return [
+            'dashboard', 'pending', 'notifications',
+            'employees/new', 'attendance',
+            'leave-master', 'holiday-calendar',
+            'recruitment', 'training', 'performance',
+            'grievance', 'asset-register',
+            'reports', 'payroll',
+        ]
+
+    # Payroll / Finance / Accounts / Audit / Tax
+    if any(k in name for k in ['payroll', 'accounts', 'accountant', 'finance', 'auditor', 'tax']):
+        # Finance manager -> broader
+        if 'manager' in name:
+            return ['dashboard', 'pending', 'notifications', 'payroll', 'reports']
+        return ['dashboard', 'notifications', 'payroll', 'reports']
+
+    # Operations / plant / production / supply chain / quality
+    if any(k in name for k in ['operations', 'plant', 'production', 'supply chain', 'quality']):
+        if any(k in name for k in ['manager', 'plant manager']):
+            return [
+                'dashboard', 'pending', 'notifications',
+                'employees/new', 'attendance',
+                'asset-register', 'grievance',
+                'reports',
+            ]
+        return ['dashboard', 'notifications', 'attendance', 'asset-register']
+
+    # Sales / Marketing / BD
+    if any(k in name for k in ['sales', 'business development', 'marketing', 'brand', 'digital marketing']):
+        if any(k in name for k in ['manager', 'lead']):
+            return ['dashboard', 'pending', 'notifications', 'reports']
+        return ['dashboard', 'notifications', 'reports']
+
+    # Admin / office / support
+    if any(k in name for k in ['admin executive', 'office manager', 'office assistant', 'data entry', 'helpdesk', 'customer support', 'technical support']):
+        if 'manager' in name:
+            return ['dashboard', 'pending', 'notifications', 'attendance', 'reports']
+        return ['dashboard', 'notifications', 'attendance']
+
+    # Engineering / QA / Design / DevOps (typically should not be in admin portal; give minimal)
+    if any(k in name for k in [
+        'software engineer', 'developer', 'devops', 'qa', 'ui/ux', 'designer', 'full stack',
+        'intern', 'trainee'
+    ]):
+        if any(k in name for k in ['lead', 'senior', 'architect']):
+            return ['dashboard', 'pending', 'notifications', 'reports', 'attendance']
+        return ['dashboard', 'notifications', 'attendance']
+
+    # Default fallback
+    return ['dashboard', 'notifications']
 
 
 def build_payroll_record_payload(tenant, record, attendance_stats_by_employee_id=None):
@@ -299,6 +478,11 @@ class OnboardingRolesView(views.APIView):
     def post(self, request):
         tenant = request.user.tenant
         roles_data = request.data.get('roles', [])
+        if not roles_data:
+            # Do not wipe tenant designations if the UI is using DB-seeded roles.
+            tenant.onboarding_step = max(int(getattr(tenant, 'onboarding_step', 0) or 0), 4)
+            tenant.save(update_fields=['onboarding_step'])
+            return Response({"message": "No role payload provided. Existing roles preserved."})
         
         # Clear existing and save new
         Role.objects.filter(tenant=tenant).delete()
@@ -1713,7 +1897,7 @@ class ESSAttendanceTodayView(views.APIView):
                 "check_in": record.check_in.strftime('%H:%M') if record.check_in else None,
                 "check_out": record.check_out.strftime('%H:%M') if record.check_out else None,
                 "work_hours": float(record.work_hours),
-                "status": record.status,
+                "status": record.status.label if record.status else record.status_str or "Not Marked",
                 "record_id": record.id,
             })
         return Response({
@@ -1739,14 +1923,21 @@ class ESSAttendanceTodayView(views.APIView):
 
         record, _ = AttendanceRecord.objects.get_or_create(
             tenant=tenant, employee=emp, date=today,
-            defaults={'status': 'Present', 'location': request.data.get('location', 'Office')}
+            defaults={
+                'status': AttendanceStatus.objects.filter(code='P').first(),
+                'status_str': 'Present',
+                'location': request.data.get('location', 'Office')
+            }
         )
 
         if action == 'in':
             if record.check_in:
                 return Response({"error": "Already checked in"}, status=400)
             record.check_in = time_now
-            record.status = 'Present'
+            status_present = AttendanceStatus.objects.filter(code='P').first()
+            if status_present:
+                record.status = status_present
+            record.status_str = 'Present'
         else:
             if not record.check_in:
                 return Response({"error": "Must check in first"}, status=400)
@@ -1781,20 +1972,23 @@ class ESSAttendanceHistoryView(views.APIView):
         month = request.query_params.get('month')  # YYYY-MM
         qs = AttendanceRecord.objects.filter(tenant=request.user.tenant, employee=emp)
         if month:
-            qs = qs.filter(date__startswith=month)
+            # For a specific month, return chronological order.
+            qs = qs.filter(date__startswith=month).order_by('date')
         else:
-            qs = qs.order_by('-date')[:30]
+            # Latest 30 records, then present them in chronological order.
+            latest_30_ids = list(qs.order_by('-date').values_list('id', flat=True)[:30])
+            qs = AttendanceRecord.objects.filter(id__in=latest_30_ids).order_by('date')
 
         data = [
             {
                 "date": str(r.date),
                 "check_in": r.check_in.strftime('%H:%M') if r.check_in else None,
                 "check_out": r.check_out.strftime('%H:%M') if r.check_out else None,
-                "status": r.status,
+                "status": r.status.label if r.status else r.status_str or "Not Marked",
                 "work_hours": float(r.work_hours),
                 "location": r.location,
             }
-            for r in qs.order_by('date')
+            for r in qs
         ]
         return Response({"records": data})
 
@@ -1839,6 +2033,7 @@ class ESSPayslipsView(views.APIView):
         records = PayrollRecord.objects.filter(tenant=request.user.tenant, employee=emp).order_by('-cycle_month')[:12]
         data = [
             {
+                "id": r.id,
                 "cycle_month": r.cycle_month,
                 "base_salary": float(r.base_salary),
                 "allowances": float(r.allowances),
@@ -1848,6 +2043,8 @@ class ESSPayslipsView(views.APIView):
                 "status": r.status,
                 "tax_status": r.tax_status,
                 "breakdown": r.breakdown,
+                "working_days": getattr(r, 'working_days', 30),
+                "lop_days": getattr(r, 'lop_days', 0),
             }
             for r in records
         ]
@@ -2421,6 +2618,241 @@ class SeedDefaultsView(views.APIView):
             return Response({"message": "Master data seeded successfully for your tenant."})
         except Exception as e:
             return Response({"error": str(e)}, status=500)
+
+
+# ─────────────────────────────────────────────
+# ADMIN PORTAL PERMISSIONS (DB-driven via t_role)
+# ─────────────────────────────────────────────
+class AdminPermissionsView(views.APIView):
+    """
+    Returns effective admin portal permissions for current user.
+    Resolution order:
+    - SUPER_ADMIN/ADMIN => full access
+    - If user has employee_profile.designation and role permission exists => use t_role_permission.allowed_routes
+    - Else => fallback allowlist by t_user.role (DEFAULT_ADMIN_ROUTE_ALLOWLIST_BY_USER_ROLE)
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        ensure_role_permission_table_exists()
+
+        user_role = str(getattr(request.user, 'role', '') or '').upper()
+        if user_role in ('SUPER_ADMIN', 'ADMIN'):
+            return Response({
+                "full_access": True,
+                "source": "t_user.role",
+                "allowed_routes": ["*"],
+            })
+
+        employee = getattr(request.user, 'employee_profile', None)
+        designation = getattr(employee, 'designation', None) if employee else None
+
+        if designation:
+            rp = RolePermission.objects.filter(role_id=designation.id).first()
+            if rp:
+                allowed_routes = rp.allowed_routes or []
+                return Response({
+                    "full_access": False,
+                    "source": "t_role_permission",
+                    "role_id": designation.id,
+                    "role_name": designation.name,
+                    "allowed_routes": allowed_routes,
+                })
+
+        fallback = DEFAULT_ADMIN_ROUTE_ALLOWLIST_BY_USER_ROLE.get(user_role, [])
+        return Response({
+            "full_access": False,
+            "source": "fallback",
+            "allowed_routes": fallback,
+        })
+
+
+class AdminRolePermissionListView(views.APIView):
+    """List all tenant roles with their configured admin routes."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        ensure_role_permission_table_exists()
+
+        if str(request.user.role).upper() not in ('SUPER_ADMIN', 'ADMIN', 'HR'):
+            return Response({"error": "Permission denied"}, status=403)
+
+        tenant = request.user.tenant
+        roles = Role.objects.filter(tenant=tenant).order_by('level', 'name')
+
+        role_ids = [r.id for r in roles]
+        perms = {p.role_id: (p.allowed_routes or []) for p in RolePermission.objects.filter(role_id__in=role_ids)}
+
+        data = [
+            {
+                "role_id": r.id,
+                "role_name": r.name,
+                "level": r.level,
+                "allowed_routes": perms.get(r.id, []),
+            }
+            for r in roles
+        ]
+        return Response({"roles": data})
+
+
+class AdminRolePermissionUpdateView(views.APIView):
+    """Update routes for a given tenant role."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def put(self, request, role_id: int):
+        ensure_role_permission_table_exists()
+
+        if str(request.user.role).upper() not in ('SUPER_ADMIN', 'ADMIN'):
+            return Response({"error": "Permission denied"}, status=403)
+
+        tenant = request.user.tenant
+        role = Role.objects.filter(id=role_id, tenant=tenant).first()
+        if not role:
+            return Response({"error": "Role not found"}, status=404)
+
+        allowed_routes = request.data.get('allowed_routes', [])
+        if allowed_routes is None:
+            allowed_routes = []
+        if not isinstance(allowed_routes, list) or not all(isinstance(x, str) for x in allowed_routes):
+            return Response({"error": "allowed_routes must be a list of strings"}, status=400)
+
+        rp = RolePermission.objects.filter(role_id=role.id).first()
+        if rp:
+            rp.allowed_routes = allowed_routes
+            rp.save(update_fields=['allowed_routes', 'updated_at'])
+        else:
+            RolePermission.objects.create(role=role, allowed_routes=allowed_routes)
+
+        return Response({
+            "role_id": role.id,
+            "role_name": role.name,
+            "allowed_routes": allowed_routes,
+        })
+
+
+class AdminSeedRolePermissionsView(views.APIView):
+    """
+    Seeds tenant `t_role` with a role catalog and assigns default admin routes.
+
+    POST body (optional):
+      { "roles": ["HR Executive", "Payroll Executive", ...] }
+
+    If not provided, uses a built-in catalog (safe to call multiple times).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    ROLE_CATALOG = [
+        # Engineering / Tech
+        "Intern / Trainee",
+        "Junior Software Engineer",
+        "Software Engineer",
+        "Senior Software Engineer",
+        "Lead Developer",
+        "Technical Architect",
+        "Solution Architect",
+        "DevOps Engineer",
+        "QA Engineer",
+        "Senior QA Engineer",
+        "UI/UX Designer",
+        "Full Stack Developer",
+        # HR
+        "HR Intern",
+        "HR Executive",
+        "Senior HR Executive",
+        "HR Manager",
+        "Talent Acquisition Specialist",
+        "Recruiter",
+        # Admin / Office
+        "Admin Executive",
+        "Office Manager",
+        # Finance
+        "Accounts Executive",
+        "Senior Accountant",
+        "Payroll Executive",
+        "Finance Analyst",
+        "Finance Manager",
+        "Auditor",
+        "Tax Consultant",
+        # Operations / Plant / Quality
+        "Operations Executive",
+        "Operations Manager",
+        "Production Supervisor",
+        "Plant Manager",
+        "Quality Inspector",
+        "Supply Chain Executive",
+        # Sales / BD / Marketing
+        "Sales Executive",
+        "Senior Sales Executive",
+        "Business Development Executive",
+        "Business Development Manager",
+        "Marketing Executive",
+        "Digital Marketing Specialist",
+        "Brand Manager",
+        # Management
+        "Team Lead",
+        "Project Manager",
+        "Program Manager",
+        "Delivery Manager",
+        "General Manager",
+        "Director",
+        "Vice President",
+        # C-suite
+        "Chief Executive Officer",
+        "Chief Technology Officer",
+        "Chief Financial Officer",
+        # Support / backoffice
+        "Customer Support Executive",
+        "Technical Support Engineer",
+        "Helpdesk Executive",
+        "Data Entry Operator",
+        "Office Assistant",
+    ]
+
+    def post(self, request):
+        ensure_role_permission_table_exists()
+
+        if str(request.user.role).upper() not in ('SUPER_ADMIN', 'ADMIN'):
+            return Response({"error": "Permission denied"}, status=403)
+
+        tenant = request.user.tenant
+        incoming = request.data.get('roles', None)
+        role_names = incoming if isinstance(incoming, list) else self.ROLE_CATALOG
+        role_names = [str(x).strip() for x in role_names if str(x).strip()]
+
+        created_roles = 0
+        created_perms = 0
+        updated_perms = 0
+
+        for name in role_names:
+            role_obj, created = Role.objects.get_or_create(
+                tenant=tenant,
+                name=name,
+                defaults={'level': 1}
+            )
+            if created:
+                created_roles += 1
+
+            allowed = default_allowed_routes_for_role_name(name)
+
+            rp = RolePermission.objects.filter(role_id=role_obj.id).first()
+            if rp:
+                # Keep idempotent but update to latest mapping
+                rp.allowed_routes = allowed
+                rp.save(update_fields=['allowed_routes', 'updated_at'])
+                updated_perms += 1
+            else:
+                RolePermission.objects.create(role=role_obj, allowed_routes=allowed)
+                created_perms += 1
+
+        return Response({
+            "message": "Seeded roles and default admin permissions",
+            "tenant_id": str(getattr(tenant, 'id', '')),
+            "created_roles": created_roles,
+            "created_permissions": created_perms,
+            "updated_permissions": updated_perms,
+            "total_roles_processed": len(role_names),
+            "admin_route_keys": ADMIN_ROUTE_KEYS,
+        })
 
 
 # ─────────────────────────────────────────────

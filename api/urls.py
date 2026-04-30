@@ -30,6 +30,8 @@ from .views import (
     SendOnboardingInviteView, EmployeeOnboardingPublicView,
     # Seed defaults
     SeedDefaultsView,
+    # Admin portal permissions
+    AdminPermissionsView, AdminRolePermissionListView, AdminRolePermissionUpdateView, AdminSeedRolePermissionsView,
     # Master Data
     MasterIndustryView, MasterDepartmentView, MasterRoleView,
 )
@@ -100,6 +102,10 @@ urlpatterns = [
 
     # ── Admin Utilities ────────────────────────────────
     path('admin/seed-defaults/',     SeedDefaultsView.as_view(),           name='seed_defaults'),
+    path('admin/permissions/',      AdminPermissionsView.as_view(),       name='admin_permissions'),
+    path('admin/role-permissions/', AdminRolePermissionListView.as_view(), name='admin_role_permissions'),
+    path('admin/role-permissions/<int:role_id>/', AdminRolePermissionUpdateView.as_view(), name='admin_role_permission_update'),
+    path('admin/role-permissions/seed/', AdminSeedRolePermissionsView.as_view(), name='admin_role_permissions_seed'),
 
     # ── Master Data ────────────────────────────────────
     path('master/industries/',       MasterIndustryView.as_view(),         name='master_industries'),

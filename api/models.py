@@ -98,6 +98,25 @@ class Role(TenantScopedModel):
     def __str__(self):
         return f"{self.name} ({self.tenant.name})"
 
+
+class RolePermission(models.Model):
+    """
+    DB-driven portal permissions mapped to tenant `t_role` (designation roles).
+
+    NOTE: We mark this as managed=False to avoid generating migrations in this repo
+    (existing migrations are not aligned with current models). The permissions API
+    will create the table if missing.
+    """
+    role = models.OneToOneField(Role, on_delete=models.CASCADE, related_name='portal_permission')
+    # Example: ["dashboard", "attendance", "employees/new", "payroll", ...]
+    allowed_routes = models.JSONField(default=list, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        managed = False
+        db_table = "t_role_permission"
+
 class Employee(TenantScopedModel):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='employee_profile', null=True, blank=True)
     name = models.CharField(max_length=255)

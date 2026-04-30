@@ -56,19 +56,44 @@ class EmployeeDocumentSerializer(serializers.ModelSerializer):
 
 class EmployeeSerializer(serializers.ModelSerializer):
     documents = EmployeeDocumentSerializer(many=True, read_only=True)
-    
+
+    # Resolved name fields
+    department_name   = serializers.CharField(source='department.name',       read_only=True, default='')
+    designation_name  = serializers.CharField(source='designation.name',      read_only=True, default='')
+    reporting_to_name = serializers.CharField(source='reporting_to.name',     read_only=True, default='')
+    reporting_to_code = serializers.CharField(source='reporting_to.employee_code', read_only=True, default='')
+
     class Meta:
         model = Employee
         fields = [
-            'id', 'name', 'email', 'phone', 'employee_code', 
-            'department', 'designation', 'reporting_to', 'joining_date', 
-            'status', 'base_salary',
-            'dob', 'gender', 'address',
-            'bank_name', 'account_number', 'ifsc_code',
+            # Identity
+            'id', 'employee_code', 'name', 'email', 'phone', 'personal_email',
+
+            # Job Info
+            'department', 'department_name',
+            'designation', 'designation_name',
+            'reporting_to', 'reporting_to_name', 'reporting_to_code',
+            'joining_date', 'status', 'base_salary',
+
+            # Personal
+            'dob', 'gender', 'address', 'current_address',
+            'father_name', 'marital_status', 'blood_group', 'nationality',
+
+            # Bank & Compliance
+            'bank_name', 'account_number', 'account_type', 'ifsc_code', 'upi_id',
+            'pan_number', 'aadhar_number', 'uan_number',
+            'pf_applicable', 'esi_applicable', 'tax_regime',
+
+            # Emergency
             'emergency_contact_name', 'emergency_contact_phone',
+
+            # Onboarding
             'onboarding_status', 'last_invite_sent_at', 'onboarding_completed_at',
-            'documents'
+
+            # Documents
+            'documents',
         ]
+
 
 class AttendanceStatusSerializer(serializers.ModelSerializer):
     class Meta:
