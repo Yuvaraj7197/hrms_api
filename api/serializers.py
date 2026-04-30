@@ -62,6 +62,7 @@ class EmployeeSerializer(serializers.ModelSerializer):
     designation_name  = serializers.CharField(source='designation.name',      read_only=True, default='')
     reporting_to_name = serializers.CharField(source='reporting_to.name',     read_only=True, default='')
     reporting_to_code = serializers.CharField(source='reporting_to.employee_code', read_only=True, default='')
+    user_role = serializers.CharField(source='user.role', read_only=True, default='EMPLOYEE')
 
     class Meta:
         model = Employee
@@ -72,6 +73,7 @@ class EmployeeSerializer(serializers.ModelSerializer):
             # Job Info
             'department', 'department_name',
             'designation', 'designation_name',
+            'user_role',
             'reporting_to', 'reporting_to_name', 'reporting_to_code',
             'joining_date', 'status', 'base_salary',
 

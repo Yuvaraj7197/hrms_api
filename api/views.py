@@ -30,6 +30,11 @@ PAYROLL_PAID_STATUS_CODES = ('P', 'PRESENT', 'L', 'LATE', 'WO', 'WEEKLY OFF', 'H
 PAYROLL_PRESENT_STATUS_CODES = ('P', 'PRESENT', 'L', 'LATE')
 
 
+def get_allowed_user_roles():
+    role_field = User._meta.get_field('role')
+    return [str(code).upper() for code, _ in getattr(role_field, 'choices', [])]
+
+
 def ensure_role_permission_table_exists():
     """
     Creates `t_role_permission` table if missing.
@@ -765,7 +770,9 @@ class OnboardingDataView(views.APIView):
         return Response({
             'departments': response_departments,
             'roles': response_roles,
-            'employees': employees
+            'employees': employees,
+            'user_role_options': get_allowed_user_roles(),
+            'admin_route_keys': ADMIN_ROUTE_KEYS,
         })
 
 class OnboardingEmployeeCreateView(views.APIView):
@@ -1724,6 +1731,11 @@ class HREmployeeListView(views.APIView):
         manager = Employee.objects.filter(tenant=tenant, id=safe_int(payload.get('reporting_to_id'))).first()
 
         with transaction.atomic():
+            allowed_user_roles = set(get_allowed_user_roles())
+            requested_user_role = str(payload.get('user_role') or 'EMPLOYEE').upper()
+            if requested_user_role not in allowed_user_roles:
+                requested_user_role = 'EMPLOYEE'
+
             employee = Employee.objects.create(
                 tenant=tenant,
                 name=payload.get('name'),
@@ -1774,14 +1786,18 @@ class HREmployeeListView(views.APIView):
                     defaults={
                         'username': username,
                         'tenant': tenant,
-                        'role': 'EMPLOYEE',
+                        'role': requested_user_role,
                         'is_verified': True
                     }
                 )
+                if not created:
+                    user.role = requested_user_role
+                    user.tenant = tenant
+                    user.is_verified = True
                 
                 if created or password:
                     user.set_password(temp_password)
-                    user.save()
+                user.save()
                     
                 employee.user = user
                 employee.save()
@@ -1864,6 +1880,15 @@ class HREmployeeDetailView(views.APIView):
         if p.get('reporting_to_id'):
             e.reporting_to = Employee.objects.filter(tenant=tenant, id=safe_int(p['reporting_to_id'])).first()
         e.save()
+
+        # Optional: update linked login role (t_user.role)
+        if e.user and p.get('user_role') is not None:
+            allowed_user_roles = set(get_allowed_user_roles())
+            requested_user_role = str(p.get('user_role') or 'EMPLOYEE').upper()
+            if requested_user_role in allowed_user_roles:
+                e.user.role = requested_user_role
+                e.user.save(update_fields=['role'])
+
         return Response({"message": "Employee updated"})
 
     def delete(self, request, employee_id):
@@ -2667,6 +2692,19 @@ class AdminPermissionsView(views.APIView):
         })
 
 
+class MetaRolesMenusView(views.APIView):
+    """Shared metadata for admin screens: user roles and admin menu keys."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        if str(request.user.role).upper() not in ('SUPER_ADMIN', 'ADMIN', 'HR', 'MANAGER'):
+            return Response({"error": "Permission denied"}, status=403)
+        return Response({
+            "user_role_options": get_allowed_user_roles(),
+            "admin_route_keys": ADMIN_ROUTE_KEYS,
+        })
+
+
 class AdminRolePermissionListView(views.APIView):
     """List all tenant roles with their configured admin routes."""
     permission_classes = [permissions.IsAuthenticated]
@@ -2692,7 +2730,11 @@ class AdminRolePermissionListView(views.APIView):
             }
             for r in roles
         ]
-        return Response({"roles": data})
+        return Response({
+            "roles": data,
+            "admin_route_keys": ADMIN_ROUTE_KEYS,
+            "user_role_options": get_allowed_user_roles(),
+        })
 
 
 class AdminRolePermissionUpdateView(views.APIView):
