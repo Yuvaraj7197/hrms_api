@@ -66,7 +66,7 @@ class EmployeeSerializer(serializers.ModelSerializer):
             'dob', 'gender', 'address',
             'bank_name', 'account_number', 'ifsc_code',
             'emergency_contact_name', 'emergency_contact_phone',
-            'onboarding_status', 'onboarding_completed_at',
+            'onboarding_status', 'last_invite_sent_at', 'onboarding_completed_at',
             'documents'
         ]
 

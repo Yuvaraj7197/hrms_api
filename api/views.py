@@ -25,6 +25,61 @@ def safe_int(value):
     except (TypeError, ValueError):
         return None
 
+
+PAYROLL_PAID_STATUS_CODES = ('P', 'PRESENT', 'L', 'LATE', 'WO', 'WEEKLY OFF', 'H', 'HOLIDAY', 'PL', 'PAID LEAVE')
+PAYROLL_PRESENT_STATUS_CODES = ('P', 'PRESENT', 'L', 'LATE')
+
+
+def build_payroll_record_payload(tenant, record, attendance_stats_by_employee_id=None):
+    import calendar
+    try:
+        year, month = map(int, str(record.cycle_month).split('-'))
+        days_in_month = calendar.monthrange(year, month)[1]
+    except Exception:
+        days_in_month = 30
+
+    eid = str(record.employee.id)
+    if attendance_stats_by_employee_id is not None:
+        present_days = attendance_stats_by_employee_id[eid]['present']
+        paid_days = attendance_stats_by_employee_id[eid]['paid']
+    else:
+        attendance_qs = AttendanceRecord.objects.filter(
+            tenant=tenant,
+            employee=record.employee,
+            date__startswith=record.cycle_month
+        ).select_related('status')
+        present_days = 0
+        paid_days = 0
+        for row in attendance_qs:
+            status_code = (row.status.code if row.status else row.status_str or "").upper()
+            if status_code in PAYROLL_PAID_STATUS_CODES:
+                paid_days += 1
+            if status_code in PAYROLL_PRESENT_STATUS_CODES:
+                present_days += 1
+
+    return {
+        'id': str(record.id),
+        'employeeId': str(record.employee.id),
+        'employeeCode': record.employee.employee_code or '',
+        'name': record.employee.name,
+        'departmentName': record.employee.department.name if record.employee.department else 'N/A',
+        'baseSalary': float(record.base_salary),
+        'allowances': float(record.allowances),
+        'deductions': float(record.deductions),
+        'loanEMI': float(record.loan_emi),
+        'employerPf': float(getattr(record, 'employer_pf', 0) or 0),
+        'esiAmount': float(getattr(record, 'esi_amount', 0) or 0),
+        'tdsAmount': float(getattr(record, 'tds_amount', 0) or 0),
+        'workingDays': days_in_month if record.status == 'Pending' else int(getattr(record, 'working_days', 30) or 30),
+        'presentDays': present_days,
+        'lopDays': max(0, days_in_month - paid_days) if record.status == 'Pending' else int(getattr(record, 'lop_days', 0) or 0),
+        'breakdown': record.breakdown,
+        'adjustments': record.one_time_adjustments,
+        'taxStatus': record.tax_status,
+        'netPay': float(record.net_pay),
+        'status': record.status,
+    }
+
 class RegisterView(views.APIView):
     permission_classes = [permissions.AllowAny]
 
@@ -792,22 +847,15 @@ class PayrollDataView(views.APIView):
         tenant = request.user.tenant
         cycle_month = request.query_params.get('cycle') or timezone.localdate().strftime('%Y-%m')
 
-        import calendar
-        try:
-            year, month = map(int, cycle_month.split('-'))
-            days_in_month = calendar.monthrange(year, month)[1]
-        except:
-            days_in_month = 30
-
         from collections import defaultdict
         attendance_qs = AttendanceRecord.objects.filter(tenant=tenant, date__startswith=cycle_month).select_related('status')
         att_stats = defaultdict(lambda: {'present': 0, 'paid': 0})
         for r in attendance_qs:
             eid = str(r.employee_id)
             s = (r.status.code if r.status else r.status_str or "").upper()
-            if s in ('P', 'PRESENT', 'L', 'LATE', 'WO', 'WEEKLY OFF', 'H', 'HOLIDAY', 'PL', 'PAID LEAVE'):
+            if s in PAYROLL_PAID_STATUS_CODES:
                 att_stats[eid]['paid'] += 1
-            if s in ('P', 'PRESENT', 'L', 'LATE'):
+            if s in PAYROLL_PRESENT_STATUS_CODES:
                 att_stats[eid]['present'] += 1
 
         # Seed payroll records for all Active employees (regardless of onboarding status)
@@ -840,31 +888,7 @@ class PayrollDataView(views.APIView):
                 record.save(update_fields=['base_salary', 'allowances'])
 
         records = PayrollRecord.objects.filter(tenant=tenant, cycle_month=cycle_month).select_related('employee__department')
-        response_data = [
-            {
-                'id': str(record.id),
-                'employeeId': str(record.employee.id),
-                'employeeCode': record.employee.employee_code or '',
-                'name': record.employee.name,
-                'departmentName': record.employee.department.name if record.employee.department else 'N/A',
-                'baseSalary': float(record.base_salary),
-                'allowances': float(record.allowances),
-                'deductions': float(record.deductions),
-                'loanEMI': float(record.loan_emi),
-                'employerPf': float(getattr(record, 'employer_pf', 0) or 0),
-                'esiAmount': float(getattr(record, 'esi_amount', 0) or 0),
-                'tdsAmount': float(getattr(record, 'tds_amount', 0) or 0),
-                'workingDays': days_in_month if record.status == 'Pending' else int(getattr(record, 'working_days', 30) or 30),
-                'presentDays': att_stats[str(record.employee.id)]['present'],
-                'lopDays': max(0, days_in_month - att_stats[str(record.employee.id)]['paid']) if record.status == 'Pending' else int(getattr(record, 'lop_days', 0) or 0),
-                'breakdown': record.breakdown,
-                'adjustments': record.one_time_adjustments,
-                'taxStatus': record.tax_status,
-                'netPay': float(record.net_pay),
-                'status': record.status,
-            }
-            for record in records
-        ]
+        response_data = [build_payroll_record_payload(tenant, record, att_stats) for record in records]
         return Response({'records': response_data, 'cycle': cycle_month})
 
 class PayrollProcessView(views.APIView):
@@ -1989,18 +2013,84 @@ class SendOnboardingInviteView(views.APIView):
             return Response({"error": "Permission denied"}, status=403)
         
         employee_id = request.data.get('employee_id')
+        action = request.data.get('action', 'invite')
         try:
             employee = Employee.objects.get(tenant=request.user.tenant, id=employee_id)
             token = employee.generate_invite_token()
-            
-            # In a real app, send email here
-            invite_link = f"http://localhost:4200/onboarding/{token}"
-            print(f"Onboarding Invite for {employee.email}: {invite_link}")
-            
-            return Response({
-                "message": "Invite sent successfully",
-                "invite_link": invite_link
-            })
+            frontend_base = getattr(settings, 'FRONTEND_BASE_URL', 'http://localhost:4200').rstrip('/')
+            invite_link = f"{frontend_base}/onboarding/{token}"
+
+            if action == 'resend_credentials':
+                if not employee.user:
+                    return Response({"error": "Employee login account does not exist"}, status=400)
+
+                temp_password = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
+                employee.user.set_password(temp_password)
+                employee.user.save(update_fields=['password'])
+
+                try:
+                    send_mail(
+                        subject='Your Updated Login Credentials',
+                        message=(
+                            f"Hello {employee.name},\n\n"
+                            f"Your login credentials for {employee.tenant.name} have been reset.\n"
+                            f"Username: {employee.user.username}\n"
+                            f"Temporary Password: {temp_password}\n\n"
+                            "Please log in and change your password immediately.\n"
+                            f"Login URL: {frontend_base}/login\n"
+                        ),
+                        from_email=getattr(settings, 'DEFAULT_FROM_EMAIL', 'no-reply@hrms.local'),
+                        recipient_list=[employee.email],
+                        fail_silently=False,
+                    )
+                    employee.last_invite_sent_at = timezone.now()
+                    employee.save(update_fields=['last_invite_sent_at'])
+                    return Response({
+                        "message": "Credentials resent successfully",
+                        "email_sent": True,
+                        "employee_id": employee.id
+                    })
+                except Exception as exc:
+                    return Response({
+                        "message": "Credentials reset done, but email failed",
+                        "email_sent": False,
+                        "employee_id": employee.id,
+                        "reason": str(exc)
+                    }, status=502)
+
+            try:
+                send_mail(
+                    subject='Complete Your Employee Onboarding',
+                    message=(
+                        f"Hello {employee.name},\n\n"
+                        "Please complete your onboarding using the link below:\n"
+                        f"{invite_link}\n\n"
+                        "If you did not expect this email, please contact your HR/Admin."
+                    ),
+                    from_email=getattr(settings, 'DEFAULT_FROM_EMAIL', 'no-reply@hrms.local'),
+                    recipient_list=[employee.email],
+                    fail_silently=False,
+                )
+                employee.last_invite_sent_at = timezone.now()
+                if employee.onboarding_status == 'Pending':
+                    employee.onboarding_status = 'InProgress'
+                    employee.save(update_fields=['onboarding_status', 'last_invite_sent_at'])
+                else:
+                    employee.save(update_fields=['last_invite_sent_at'])
+                return Response({
+                    "message": "Invite sent successfully",
+                    "invite_link": invite_link,
+                    "email_sent": True,
+                    "employee_id": employee.id
+                })
+            except Exception as exc:
+                return Response({
+                    "message": "Invite link generated, but email failed",
+                    "invite_link": invite_link,
+                    "email_sent": False,
+                    "employee_id": employee.id,
+                    "reason": str(exc)
+                }, status=502)
         except Employee.DoesNotExist:
             return Response({"error": "Employee not found"}, status=404)
 
@@ -2113,7 +2203,8 @@ class PayrollAdjustmentView(views.APIView):
             )
             return Response({
                 "message": "Adjustment saved.",
-                "adjustments": record.one_time_adjustments
+                "adjustments": record.one_time_adjustments,
+                "updated_record": build_payroll_record_payload(request.user.tenant, record)
             })
         except PayrollRecord.DoesNotExist:
             return Response({"error": "Record not found"}, status=404)
@@ -2130,7 +2221,11 @@ class PayrollAdjustmentView(views.APIView):
                 removed = adjustments.pop(idx)
                 record.one_time_adjustments = adjustments
                 record.save(update_fields=['one_time_adjustments'])
-                return Response({"message": f"Removed: {removed['label']}", "adjustments": adjustments})
+                return Response({
+                    "message": f"Removed: {removed['label']}",
+                    "adjustments": adjustments,
+                    "updated_record": build_payroll_record_payload(request.user.tenant, record)
+                })
             return Response({"error": "Invalid index"}, status=400)
         except PayrollRecord.DoesNotExist:
             return Response({"error": "Record not found"}, status=404)

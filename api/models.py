@@ -144,6 +144,7 @@ class Employee(TenantScopedModel):
     # Onboarding Status
     onboarding_status = models.CharField(max_length=20, default='Pending') # Pending, InProgress, Completed
     invite_token = models.CharField(max_length=64, null=True, blank=True, unique=True)
+    last_invite_sent_at = models.DateTimeField(null=True, blank=True)
     onboarding_completed_at = models.DateTimeField(null=True, blank=True)
 
     def generate_invite_token(self):
