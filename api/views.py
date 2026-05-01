@@ -31,8 +31,9 @@ PAYROLL_PRESENT_STATUS_CODES = ('P', 'PRESENT', 'L', 'LATE')
 
 
 def get_allowed_user_roles():
-    role_field = User._meta.get_field('role')
-    return [str(code).upper() for code, _ in getattr(role_field, 'choices', [])]
+    role_field = Role._meta.get_field('system_role_category')
+    choices = getattr(role_field, 'choices', []) or []
+    return [str(code).upper() for code, _ in choices]
 
 
 def ensure_role_permission_table_exists():
@@ -78,6 +79,154 @@ def ensure_role_permission_table_exists():
               CONSTRAINT t_role_permission_role_fk
                 FOREIGN KEY (role_id) REFERENCES t_role(id)
                 ON DELETE CASCADE
+            )
+            """
+        )
+
+
+def ensure_master_tables_exist():
+    """
+    Creates master data tables (m_industry, m_department, m_role) if missing.
+    Useful for local dev/demo environments where migrations might be skipped.
+    """
+    vendor = getattr(connection, "vendor", "")
+    with connection.cursor() as cursor:
+        if vendor == "sqlite":
+            # Industry
+            cursor.execute("CREATE TABLE IF NOT EXISTS m_industry (id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(255) NOT NULL, description TEXT)")
+            # Department
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS m_department (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    industry_id INTEGER,
+                    name VARCHAR(255) NOT NULL,
+                    code VARCHAR(50) NOT NULL,
+                    description TEXT,
+                    is_active BOOLEAN DEFAULT 1,
+                    FOREIGN KEY(industry_id) REFERENCES m_industry(id) ON DELETE SET NULL
+                )
+                """
+            )
+            # Role
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS m_role (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    department_id INTEGER NOT NULL,
+                    name VARCHAR(255) NOT NULL,
+                    level INTEGER DEFAULT 1,
+                    category VARCHAR(50) DEFAULT 'General',
+                    is_active BOOLEAN DEFAULT 1,
+                    FOREIGN KEY(department_id) REFERENCES m_department(id) ON DELETE CASCADE
+                )
+                """
+            )
+            return
+
+        # MySQL / MariaDB
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS m_industry (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                description TEXT
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS m_department (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                industry_id BIGINT,
+                name VARCHAR(255) NOT NULL,
+                code VARCHAR(50) NOT NULL,
+                description TEXT,
+                is_active BOOLEAN DEFAULT 1,
+                CONSTRAINT m_dept_industry_fk FOREIGN KEY (industry_id) REFERENCES m_industry(id) ON DELETE SET NULL
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS m_role (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                department_id BIGINT NOT NULL,
+                name VARCHAR(255) NOT NULL,
+                level INT DEFAULT 1,
+                category VARCHAR(50) DEFAULT 'General',
+                is_active BOOLEAN DEFAULT 1,
+                CONSTRAINT m_role_dept_fk FOREIGN KEY (department_id) REFERENCES m_department(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_employee_document (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                tenant_id CHAR(32) NOT NULL,
+                employee_id BIGINT NOT NULL,
+                document_type VARCHAR(50) NOT NULL,
+                file_url TEXT NOT NULL,
+                uploaded_at DATETIME(6) NOT NULL,
+                CONSTRAINT t_emp_doc_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
+                CONSTRAINT t_emp_doc_emp_fk FOREIGN KEY (employee_id) REFERENCES t_employee(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_salary_component (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                tenant_id CHAR(32) NOT NULL,
+                name VARCHAR(100) NOT NULL,
+                code VARCHAR(20) NOT NULL,
+                component_type VARCHAR(20) NOT NULL,
+                is_statutory BOOLEAN DEFAULT 0,
+                is_taxable BOOLEAN DEFAULT 1,
+                CONSTRAINT t_sal_comp_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_salary_structure (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                tenant_id CHAR(32) NOT NULL,
+                name VARCHAR(100) NOT NULL,
+                description TEXT,
+                is_active BOOLEAN DEFAULT 1,
+                CONSTRAINT t_sal_struct_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_employee_salary_structure (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                tenant_id CHAR(32) NOT NULL,
+                employee_id BIGINT NOT NULL UNIQUE,
+                structure_id BIGINT,
+                effective_from DATE,
+                is_active BOOLEAN DEFAULT 1,
+                CONSTRAINT t_emp_sal_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
+                CONSTRAINT t_emp_sal_emp_fk FOREIGN KEY (employee_id) REFERENCES t_employee(id) ON DELETE CASCADE,
+                CONSTRAINT t_emp_sal_struct_fk FOREIGN KEY (structure_id) REFERENCES t_salary_structure(id) ON DELETE SET NULL
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_payroll_setting (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                tenant_id CHAR(32) NOT NULL,
+                pf_rate_employee DECIMAL(5, 2) DEFAULT 12.0,
+                pf_rate_employer DECIMAL(5, 2) DEFAULT 12.0,
+                esi_rate_employee DECIMAL(5, 2) DEFAULT 0.75,
+                esi_rate_employer DECIMAL(5, 2) DEFAULT 3.25,
+                tax_regime_default VARCHAR(20) DEFAULT 'New',
+                loan_interest_rate_annual DECIMAL(5, 2) DEFAULT 8.5,
+                CONSTRAINT t_pay_set_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE
             )
             """
         )
@@ -214,6 +363,28 @@ def default_allowed_routes_for_role_name(role_name: str):
     return ['dashboard', 'notifications']
 
 
+def has_route_access(user, required_route: str) -> bool:
+    """
+    Checks if a user has access to a specific portal route.
+    Resolution order:
+      1. SUPER_ADMIN / ADMIN (via system_role, which is now DB-driven) → full access
+      2. t_role_permission mapping via user.role_id → check allowed_routes
+      3. MANAGER fallback → their DEFAULT_ADMIN_ROUTE_ALLOWLIST_BY_USER_ROLE routes
+    """
+    sr = user.system_role  # reads system_role_category from DB (or fallback)
+    if sr in ('SUPER_ADMIN', 'ADMIN'):
+        return True
+
+    if user.role_id:
+        rp = RolePermission.objects.filter(role_id=user.role_id).first()
+        if rp is not None:
+            return required_route in rp.allowed_routes or '*' in rp.allowed_routes
+
+    # Fallback: check the static allowlist for this system_role category
+    fallback_routes = DEFAULT_ADMIN_ROUTE_ALLOWLIST_BY_USER_ROLE.get(sr, [])
+    return required_route in fallback_routes or '*' in fallback_routes
+
+
 def build_payroll_record_payload(tenant, record, attendance_stats_by_employee_id=None):
     import calendar
     try:
@@ -280,14 +451,30 @@ class RegisterView(views.APIView):
 
             # Create Tenant
             tenant = Tenant.objects.create(name=company_name)
-            
-            # Create User
+
+            # Auto-create an "Admin" Role for the tenant.
+            # system_role_category='ADMIN' is stored in DB — no name-pattern matching needed.
+            admin_role, _ = Role.objects.get_or_create(
+                tenant=tenant,
+                name='Admin',
+                defaults={
+                    'description': 'Tenant Administrator',
+                    'level': 10,
+                    'system_role_category': 'ADMIN',
+                }
+            )
+            # Ensure existing rows are also upgraded (idempotent)
+            if admin_role.system_role_category != 'ADMIN':
+                admin_role.system_role_category = 'ADMIN'
+                admin_role.save(update_fields=['system_role_category'])
+
+            # Create User — assign the Admin role FK so system_role → 'ADMIN'
             user = User.objects.create_user(
                 username=username,
                 email=email,
                 password=password,
                 tenant=tenant,
-                role='ADMIN'
+                role=admin_role,
             )
 
             # Generate OTP
@@ -493,11 +680,21 @@ class OnboardingRolesView(views.APIView):
         Role.objects.filter(tenant=tenant).delete()
         
         for role in roles_data:
+            name = role.get('name')
+            raw_category = str(role.get('system_role_category') or role.get('systemRoleCategory') or '').strip().upper()
+            valid_cats = {'SUPER_ADMIN', 'ADMIN', 'HR', 'MANAGER', 'EMPLOYEE'}
+            
+            if raw_category in valid_cats:
+                category = raw_category
+            else:
+                category = AdminSeedRolePermissionsView._derive_category(name)
+
             Role.objects.create(
                 tenant=tenant,
-                name=role.get('name'),
+                name=name,
                 description=role.get('description'),
-                level=role.get('level') or role.get('accessLevel') or 1
+                level=role.get('level') or role.get('accessLevel') or 1,
+                system_role_category=category,
             )
 
         tenant.onboarding_step = 4
@@ -537,7 +734,7 @@ class OnboardingEmployeesView(views.APIView):
                     defaults={
                         'username': generated_username,
                         'tenant': tenant,
-                        'role': 'EMPLOYEE',
+                        # role FK left null; system_role resolves to 'EMPLOYEE' by default
                         'is_verified': True
                     }
                 )
@@ -546,13 +743,19 @@ class OnboardingEmployeesView(views.APIView):
                 if not created and user.tenant_id != tenant.id:
                     user.tenant = tenant
 
-                user.role = 'EMPLOYEE'
+                # user.system_role assignment removed: 'EMPLOYEE'
                 user.is_verified = True
 
                 # New users get generated credentials.
                 if created:
                     user.set_password(temp_password)
+                    if role:
+                        user.role = role
                     user.save()
+                else:
+                    if role and user.role_id != role.id:
+                        user.role = role
+                        user.save(update_fields=['role_id'])
 
                     try:
                         sent_count = send_mail(
@@ -666,7 +869,7 @@ class DashboardView(views.APIView):
 
     def get(self, request):
         tenant = request.user.tenant
-        role = request.user.role
+        role = request.user.system_role
         
         data = {
             "stats": {},
@@ -720,13 +923,14 @@ class OnboardingDataView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
+        ensure_master_tables_exist()
         tenant = request.user.tenant
 
         departments = list(
             Department.objects.filter(tenant=tenant).values('id', 'name', 'head_count')
         )
         roles = list(
-            Role.objects.filter(tenant=tenant).values('id', 'name', 'description', 'level')
+            Role.objects.filter(tenant=tenant).values('id', 'name', 'description', 'level', 'system_role_category')
         )
         employees_qs = Employee.objects.filter(tenant=tenant).select_related('department', 'designation', 'reporting_to')
 
@@ -1339,7 +1543,7 @@ class PayrollTaxVerifyView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, record_id: int):
-        if request.user.role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
             return Response({"error": "Permission denied"}, status=403)
 
         tenant = request.user.tenant
@@ -1579,7 +1783,7 @@ class LoginView(views.APIView):
         if user:
             if not user.is_verified:
                 return Response({"error": "Please verify your email first", "is_verified": False, "email": user.email}, status=status.HTTP_403_FORBIDDEN)
-            if user.role not in ['SUPER_ADMIN', 'ADMIN', 'HR', 'MANAGER']:
+            if user.system_role not in ['SUPER_ADMIN', 'ADMIN', 'HR', 'MANAGER']:
                 return Response({"error": "Unauthorized role for admin portal"}, status=status.HTTP_403_FORBIDDEN)
             
             refresh = RefreshToken.for_user(user)
@@ -1704,7 +1908,7 @@ def require_roles(*allowed_roles):
     """Returns 403 if the user's role is not in allowed_roles."""
     def decorator(view_func):
         def wrapper(self, request, *args, **kwargs):
-            if request.user.role not in allowed_roles:
+            if request.user.system_role not in allowed_roles:
                 return Response({"error": "Permission denied"}, status=403)
             return view_func(self, request, *args, **kwargs)
         return wrapper
@@ -1719,13 +1923,14 @@ class HREmployeeListView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        if request.user.role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
+        ensure_master_tables_exist()
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         qs = Employee.objects.filter(tenant=tenant).select_related('department', 'designation', 'reporting_to').prefetch_related('documents')
         
         # MANAGER sees only their department
-        if request.user.role == 'MANAGER':
+        if request.user.system_role == 'MANAGER':
             try:
                 mgr_emp = request.user.employee_profile
                 qs = qs.filter(department=mgr_emp.department)
@@ -1737,7 +1942,7 @@ class HREmployeeListView(views.APIView):
 
     def post(self, request):
         """HR/Admin creates a new employee and optionally creates a User account."""
-        if request.user.role not in ['ADMIN', 'SUPER_ADMIN', 'HR','MANAGER']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR','MANAGER']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         payload = request.data
@@ -1750,11 +1955,6 @@ class HREmployeeListView(views.APIView):
         manager = Employee.objects.filter(tenant=tenant, id=safe_int(payload.get('reporting_to_id'))).first()
 
         with transaction.atomic():
-            allowed_user_roles = set(get_allowed_user_roles())
-            requested_user_role = str(payload.get('user_role') or 'EMPLOYEE').upper()
-            if requested_user_role not in allowed_user_roles:
-                requested_user_role = 'EMPLOYEE'
-
             employee = Employee.objects.create(
                 tenant=tenant,
                 name=payload.get('name'),
@@ -1805,15 +2005,16 @@ class HREmployeeListView(views.APIView):
                     defaults={
                         'username': username,
                         'tenant': tenant,
-                        'role': requested_user_role,
                         'is_verified': True
                     }
                 )
                 if not created:
-                    user.role = requested_user_role
                     user.tenant = tenant
                     user.is_verified = True
                 
+                if role and user.role_id != role.id:
+                    user.role = role
+
                 if created or password:
                     user.set_password(temp_password)
                 user.save()
@@ -1839,7 +2040,8 @@ class HREmployeeDetailView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, employee_id):
-        if request.user.role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
+        ensure_master_tables_exist()
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         try:
@@ -1851,7 +2053,7 @@ class HREmployeeDetailView(views.APIView):
         return Response(serializer.data)
 
     def put(self, request, employee_id):
-        if request.user.role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         try:
@@ -1900,18 +2102,17 @@ class HREmployeeDetailView(views.APIView):
             e.reporting_to = Employee.objects.filter(tenant=tenant, id=safe_int(p['reporting_to_id'])).first()
         e.save()
 
-        # Optional: update linked login role (t_user.role)
-        if e.user and p.get('user_role') is not None:
-            allowed_user_roles = set(get_allowed_user_roles())
-            requested_user_role = str(p.get('user_role') or 'EMPLOYEE').upper()
-            if requested_user_role in allowed_user_roles:
-                e.user.role = requested_user_role
-                e.user.save(update_fields=['role'])
+        # Optional: update linked login role designation (t_user.role FK -> t_role)
+        if e.user and p.get('designation_id') is not None:
+            role_obj = Role.objects.filter(tenant=e.tenant, id=safe_int(p.get('designation_id'))).first()
+            if role_obj:
+                e.user.role = role_obj
+                e.user.save(update_fields=['role_id'])
 
         return Response({"message": "Employee updated"})
 
     def delete(self, request, employee_id):
-        if request.user.role not in ['ADMIN', 'SUPER_ADMIN']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         Employee.objects.filter(tenant=tenant, id=employee_id).update(status='Terminated')
@@ -2111,7 +2312,7 @@ class LeaveTypeView(views.APIView):
         ]})
 
     def post(self, request):
-        if request.user.role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
             return Response({"error": "Permission denied"}, status=403)
         from .models import LeaveType
         t = LeaveType.objects.create(
@@ -2130,9 +2331,9 @@ class LeaveApplicationView(views.APIView):
     def get(self, request):
         from .models import LeaveApplication
         tenant = request.user.tenant
-        if request.user.role in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+        if request.user.system_role in ['ADMIN', 'SUPER_ADMIN', 'HR']:
             qs = LeaveApplication.objects.filter(tenant=tenant).select_related('employee', 'leave_type')
-        elif request.user.role == 'MANAGER':
+        elif request.user.system_role == 'MANAGER':
             try:
                 mgr = request.user.employee_profile
                 qs = LeaveApplication.objects.filter(tenant=tenant, employee__department=mgr.department).select_related('employee', 'leave_type')
@@ -2190,7 +2391,7 @@ class LeaveApproveView(views.APIView):
 
     def post(self, request):
         from .models import LeaveApplication
-        if request.user.role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
             return Response({"error": "Permission denied"}, status=403)
 
         app_id = request.data.get('application_id')
@@ -2250,7 +2451,7 @@ class SendOnboardingInviteView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
-        if request.user.role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
             return Response({"error": "Permission denied"}, status=403)
         
         employee_id = request.data.get('employee_id')
@@ -2413,7 +2614,7 @@ class PayrollAdjustmentView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, record_id):
-        if request.user.role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
             return Response({"error": "Permission denied"}, status=403)
         try:
             record = PayrollRecord.objects.get(tenant=request.user.tenant, id=record_id)
@@ -2480,6 +2681,7 @@ class PayrollSettingView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
+        ensure_master_tables_exist()
         tenant = request.user.tenant
         setting, _ = PayrollSetting.objects.get_or_create(
             tenant=tenant,
@@ -2502,7 +2704,7 @@ class PayrollSettingView(views.APIView):
         })
 
     def put(self, request):
-        if request.user.role not in ['ADMIN', 'SUPER_ADMIN']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         setting, _ = PayrollSetting.objects.get_or_create(tenant=tenant)
@@ -2548,7 +2750,7 @@ class HolidayCalendarView(views.APIView):
         return Response({"holidays": data, "year": year, "total": len(data)})
 
     def post(self, request):
-        if request.user.role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         p = request.data
@@ -2572,7 +2774,7 @@ class HolidayCalendarView(views.APIView):
         return Response({"message": "Holiday saved", "id": holiday.id}, status=201)
 
     def delete(self, request):
-        if request.user.role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         holiday_id = request.data.get('id') or request.query_params.get('id')
@@ -2601,7 +2803,7 @@ class LeaveTypeMasterView(views.APIView):
         return Response({"leave_types": data})
 
     def post(self, request):
-        if request.user.role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         p = request.data
@@ -2655,7 +2857,7 @@ class SeedDefaultsView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
-        if request.user.role not in ['ADMIN', 'SUPER_ADMIN']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN']:
             return Response({"error": "Permission denied"}, status=403)
         try:
             seed_tenant_defaults(request.user.tenant)
@@ -2680,14 +2882,18 @@ class AdminPermissionsView(views.APIView):
     def get(self, request):
         ensure_role_permission_table_exists()
 
-        user_role = str(getattr(request.user, 'role', '') or '').upper()
-        if user_role in ('SUPER_ADMIN', 'ADMIN'):
+        # Use the canonical system_role property (derived from t_user.role FK + is_superuser)
+        system_role = request.user.system_role  # 'SUPER_ADMIN' | 'ADMIN' | 'HR' | 'MANAGER' | 'EMPLOYEE'
+
+        if system_role in ('SUPER_ADMIN', 'ADMIN'):
             return Response({
                 "full_access": True,
-                "source": "t_user.role",
+                "source": "system_role",
+                "system_role": system_role,
                 "allowed_routes": ["*"],
             })
 
+        # Resolve DB-driven permission from employee designation -> t_role_permission
         employee = getattr(request.user, 'employee_profile', None)
         designation = getattr(employee, 'designation', None) if employee else None
 
@@ -2698,15 +2904,18 @@ class AdminPermissionsView(views.APIView):
                 return Response({
                     "full_access": False,
                     "source": "t_role_permission",
+                    "system_role": system_role,
                     "role_id": designation.id,
                     "role_name": designation.name,
                     "allowed_routes": allowed_routes,
                 })
 
-        fallback = DEFAULT_ADMIN_ROUTE_ALLOWLIST_BY_USER_ROLE.get(user_role, [])
+        # Fallback: use system_role to pick a conservative allowlist
+        fallback = DEFAULT_ADMIN_ROUTE_ALLOWLIST_BY_USER_ROLE.get(system_role, [])
         return Response({
             "full_access": False,
             "source": "fallback",
+            "system_role": system_role,
             "allowed_routes": fallback,
         })
 
@@ -2716,7 +2925,7 @@ class MetaRolesMenusView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        if str(request.user.role).upper() not in ('SUPER_ADMIN', 'ADMIN', 'HR', 'MANAGER'):
+        if str(request.user.system_role).upper() not in ('SUPER_ADMIN', 'ADMIN', 'HR', 'MANAGER'):
             return Response({"error": "Permission denied"}, status=403)
         return Response({
             "user_role_options": get_allowed_user_roles(),
@@ -2731,7 +2940,7 @@ class AdminRolePermissionListView(views.APIView):
     def get(self, request):
         ensure_role_permission_table_exists()
 
-        if str(request.user.role).upper() not in ('SUPER_ADMIN', 'ADMIN', 'HR'):
+        if str(request.user.system_role).upper() not in ('SUPER_ADMIN', 'ADMIN', 'HR'):
             return Response({"error": "Permission denied"}, status=403)
 
         tenant = request.user.tenant
@@ -2745,6 +2954,7 @@ class AdminRolePermissionListView(views.APIView):
                 "role_id": r.id,
                 "role_name": r.name,
                 "level": r.level,
+                "system_role_category": r.system_role_category or 'EMPLOYEE',
                 "allowed_routes": perms.get(r.id, []),
             }
             for r in roles
@@ -2763,7 +2973,7 @@ class AdminRolePermissionUpdateView(views.APIView):
     def put(self, request, role_id: int):
         ensure_role_permission_table_exists()
 
-        if str(request.user.role).upper() not in ('SUPER_ADMIN', 'ADMIN'):
+        if str(request.user.system_role).upper() not in ('SUPER_ADMIN', 'ADMIN'):
             return Response({"error": "Permission denied"}, status=403)
 
         tenant = request.user.tenant
@@ -2777,6 +2987,13 @@ class AdminRolePermissionUpdateView(views.APIView):
         if not isinstance(allowed_routes, list) or not all(isinstance(x, str) for x in allowed_routes):
             return Response({"error": "allowed_routes must be a list of strings"}, status=400)
 
+        # Optional: update the DB-driven system role category
+        valid_cats = {'SUPER_ADMIN', 'ADMIN', 'HR', 'MANAGER', 'EMPLOYEE'}
+        new_category = str(request.data.get('system_role_category') or '').strip().upper()
+        if new_category in valid_cats and role.system_role_category != new_category:
+            role.system_role_category = new_category
+            role.save(update_fields=['system_role_category'])
+
         rp = RolePermission.objects.filter(role_id=role.id).first()
         if rp:
             rp.allowed_routes = allowed_routes
@@ -2787,6 +3004,7 @@ class AdminRolePermissionUpdateView(views.APIView):
         return Response({
             "role_id": role.id,
             "role_name": role.name,
+            "system_role_category": role.system_role_category,
             "allowed_routes": allowed_routes,
         })
 
@@ -2872,7 +3090,7 @@ class AdminSeedRolePermissionsView(views.APIView):
     def post(self, request):
         ensure_role_permission_table_exists()
 
-        if str(request.user.role).upper() not in ('SUPER_ADMIN', 'ADMIN'):
+        if str(request.user.system_role).upper() not in ('SUPER_ADMIN', 'ADMIN'):
             return Response({"error": "Permission denied"}, status=403)
 
         tenant = request.user.tenant
@@ -2885,13 +3103,20 @@ class AdminSeedRolePermissionsView(views.APIView):
         updated_perms = 0
 
         for name in role_names:
+            # Derive system_role_category once at seed time (DB-persisted master)
+            derived_category = self._derive_category(name)
+
             role_obj, created = Role.objects.get_or_create(
                 tenant=tenant,
                 name=name,
-                defaults={'level': 1}
+                defaults={'level': 1, 'system_role_category': derived_category}
             )
             if created:
                 created_roles += 1
+            elif role_obj.system_role_category != derived_category:
+                # Backfill existing rows that predate this column
+                role_obj.system_role_category = derived_category
+                role_obj.save(update_fields=['system_role_category'])
 
             allowed = default_allowed_routes_for_role_name(name)
 
@@ -2915,6 +3140,29 @@ class AdminSeedRolePermissionsView(views.APIView):
             "admin_route_keys": ADMIN_ROUTE_KEYS,
         })
 
+    @staticmethod
+    def _derive_category(role_name: str) -> str:
+        """
+        Derives the canonical system_role_category for a given role name.
+        This runs ONCE at seed/create time and the result is stored in
+        t_role.system_role_category, making all subsequent lookups DB-driven.
+        """
+        name = (role_name or '').strip().upper()
+        if 'SUPER' in name and 'ADMIN' in name:
+            return 'SUPER_ADMIN'
+        if 'ADMIN' in name:
+            return 'ADMIN'
+        if any(k in name for k in ['HR MANAGER', 'HR EXECUTIVE', 'HR INTERN', 'TALENT ACQUISITION', 'RECRUITER', 'HR']):
+            return 'HR'
+        if any(k in name for k in [
+            'MANAGER', 'LEAD', 'DIRECTOR', 'VICE PRESIDENT', 'VP',
+            'GENERAL MANAGER', 'CEO', 'CTO', 'CFO',
+            'CHIEF EXECUTIVE', 'CHIEF TECHNOLOGY', 'CHIEF FINANCIAL',
+            'DELIVERY MANAGER', 'PROGRAM MANAGER', 'PROJECT MANAGER',
+            'TECHNICAL ARCHITECT', 'SOLUTION ARCHITECT', 'PLANT MANAGER',
+        ]):
+            return 'MANAGER'
+        return 'EMPLOYEE'
 
 # ─────────────────────────────────────────────
 # ATTENDANCE CSV EXPORT
@@ -2965,6 +3213,7 @@ class MasterIndustryView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
+        ensure_master_tables_exist()
         industries = IndustryMaster.objects.all().order_by('name')
         data = [{'id': i.id, 'name': i.name} for i in industries]
         return Response(data)
@@ -2975,6 +3224,7 @@ class MasterDepartmentView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
+        ensure_master_tables_exist()
         industry_id = request.query_params.get('industry_id')
         qs = DepartmentMaster.objects.filter(is_active=True)
         if industry_id:
@@ -2992,6 +3242,7 @@ class MasterRoleView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
+        ensure_master_tables_exist()
         department_id = request.query_params.get('department_id')
         qs = RoleMaster.objects.filter(is_active=True)
         if department_id:

@@ -40,13 +40,7 @@ class Tenant(models.Model):
 
 class User(AbstractUser):
     tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name='users', null=True)
-    role = models.CharField(max_length=50, choices=[
-        ('SUPER_ADMIN', 'Super Admin'),
-        ('ADMIN', 'Admin'),
-        ('HR', 'HR'),
-        ('MANAGER', 'Manager'),
-        ('EMPLOYEE', 'Employee')
-    ], default='EMPLOYEE')
+    role = models.ForeignKey('Role', on_delete=models.SET_NULL, null=True, blank=True, related_name='users')
     
     is_verified = models.BooleanField(default=False)
 
@@ -55,6 +49,39 @@ class User(AbstractUser):
     
     def __str__(self):
         return f"{self.username} ({self.tenant.name if self.tenant else 'No Tenant'})"
+
+    @property
+    def system_role(self):
+        """Returns the canonical system role for this user.
+
+        Resolution order (DB-first, name-pattern as legacy fallback):
+          1. is_superuser                           → SUPER_ADMIN
+          2. no role FK                             → EMPLOYEE
+          3. role.system_role_category (DB column)  → that value  ← primary / DB-driven
+          4. role.name pattern-match                → legacy fallback for unset rows
+        """
+        if self.is_superuser:
+            return 'SUPER_ADMIN'
+        if not self.role:
+            return 'EMPLOYEE'
+
+        # ── 1. DB-driven (preferred) ───────────────────────────────────────
+        db_category = (self.role.system_role_category or '').strip().upper()
+        valid_categories = {'SUPER_ADMIN', 'ADMIN', 'HR', 'MANAGER', 'EMPLOYEE'}
+        if db_category in valid_categories:
+            return db_category
+
+        # ── 2. Name-pattern fallback (for legacy / unset rows) ─────────────
+        name = self.role.name.upper()
+        if 'SUPER' in name and 'ADMIN' in name:
+            return 'SUPER_ADMIN'
+        if 'ADMIN' in name:
+            return 'ADMIN'
+        if 'HR' in name:
+            return 'HR'
+        if 'MANAGER' in name or 'LEAD' in name:
+            return 'MANAGER'
+        return 'EMPLOYEE'
 
 class OTP(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE)
@@ -88,9 +115,25 @@ class Department(TenantScopedModel):
         return f"{self.name} ({self.tenant.name})"
 
 class Role(TenantScopedModel):
+    SYSTEM_ROLE_CHOICES = [
+        ('SUPER_ADMIN', 'Super Admin'),
+        ('ADMIN',       'Admin'),
+        ('HR',          'HR'),
+        ('MANAGER',     'Manager'),
+        ('EMPLOYEE',    'Employee'),
+    ]
+
     name = models.CharField(max_length=255)
     description = models.TextField(null=True, blank=True)
     level = models.IntegerField(default=1)
+    # DB-driven master: which system role category this designation belongs to.
+    # If set, this value is used directly by User.system_role (no name-pattern matching).
+    system_role_category = models.CharField(
+        max_length=20,
+        choices=SYSTEM_ROLE_CHOICES,
+        default='EMPLOYEE',
+        blank=True,
+    )
 
     class Meta:
         db_table = "t_role"

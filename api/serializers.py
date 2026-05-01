@@ -14,7 +14,8 @@ class TenantSerializer(serializers.ModelSerializer):
 class UserSerializer(serializers.ModelSerializer):
     tenant = TenantSerializer(read_only=True)
     employee_code = serializers.CharField(source='employee_profile.employee_code', read_only=True, default='')
-    
+    role = serializers.CharField(source='system_role', read_only=True)
+
     class Meta:
         model = User
         fields = ['id', 'username', 'email', 'role', 'tenant', 'is_verified', 'employee_code']
@@ -47,7 +48,7 @@ class DepartmentSerializer(serializers.ModelSerializer):
 class RoleSerializer(serializers.ModelSerializer):
     class Meta:
         model = Role
-        fields = ['id', 'name', 'description', 'level']
+        fields = ['id', 'name', 'description', 'level', 'system_role_category']
 
 class EmployeeDocumentSerializer(serializers.ModelSerializer):
     class Meta:
@@ -61,10 +62,10 @@ class EmployeeSerializer(serializers.ModelSerializer):
     department_name   = serializers.CharField(source='department.name',       read_only=True, default='')
     designation_name  = serializers.CharField(source='designation.name',      read_only=True, default='')
     reporting_to_name = serializers.CharField(source='reporting_to.name',     read_only=True, default='')
-    reporting_to_code = serializers.CharField(source='reporting_to.employee_code', read_only=True, default='')
-    user_role = serializers.CharField(source='user.role', read_only=True, default='EMPLOYEE')
+    user_role = serializers.CharField(source='user.system_role', read_only=True, default='EMPLOYEE')
     salary_structure_name = serializers.CharField(source='salary_structure.structure.name', read_only=True, default='')
     salary_structure_id = serializers.IntegerField(source='salary_structure.structure.id', read_only=True, default=None)
+    reporting_to_code = serializers.CharField(source='reporting_to.employee_code', read_only=True, default='')
 
     class Meta:
         model = Employee
