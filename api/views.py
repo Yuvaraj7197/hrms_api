@@ -1484,6 +1484,25 @@ class EmployeeSalarySetupView(views.APIView):
         emp_id = request.data.get('employee_id')
         struct_id = request.data.get('structure_id')
         
+        # DEBUG LOG
+        print(f"DEBUG: emp_id={repr(emp_id)}, type={type(emp_id)}")
+        if emp_id is None or emp_id == '':
+            return Response({"error": f"Invalid emp_id: {repr(emp_id)}"}, status=400)
+            
+        try:
+            emp_exists = Employee.objects.filter(id=emp_id).exists()
+            if not emp_exists:
+                # FALLBACK: If id doesn't match Employee, check if it's a PayrollRecord ID
+                # This handles cases where the UI mistakenly passes the record ID instead of employee ID
+                from api.models import PayrollRecord
+                record = PayrollRecord.objects.filter(id=emp_id).select_related('employee').first()
+                if record:
+                    emp_id = record.employee.id
+                else:
+                    return Response({"error": f"Employee with id {emp_id} does not exist in DB."}, status=400)
+        except Exception as e:
+            return Response({"error": f"Exception checking emp_id {emp_id}: {str(e)}"}, status=400)
+        
         EmployeeSalaryStructure.objects.update_or_create(
             tenant=tenant,
             employee_id=emp_id,
