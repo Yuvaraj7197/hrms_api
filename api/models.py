@@ -12,14 +12,14 @@ class Tenant(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     is_active = models.BooleanField(default=True)
 
-    class Meta:
-        db_table = "t_tenant"
+    
     
     # Onboarding Progress
     onboarding_step = models.IntegerField(default=0)
     
     # Organization Details
     address = models.TextField(null=True, blank=True)
+    phone = models.CharField(max_length=20, null=True, blank=True)
     gst_number = models.CharField(max_length=15, null=True, blank=True)
     pan_number = models.CharField(max_length=10, null=True, blank=True)
     
@@ -35,6 +35,9 @@ class Tenant(models.Model):
     currency = models.CharField(max_length=10, default='INR')
     timezone = models.CharField(max_length=100, default='Asia/Kolkata')
     
+    class Meta:
+        db_table = "t_tenant"
+        
     def __str__(self):
         return self.name
 

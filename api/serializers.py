@@ -6,7 +6,7 @@ class TenantSerializer(serializers.ModelSerializer):
         model = Tenant
         fields = [
             'id', 'name', 'domain', 'onboarding_step', 
-            'address', 'gst_number', 'pan_number', 
+            'address', 'phone', 'gst_number', 'pan_number', 
             'shift_start', 'shift_end', 'auto_attendance', 
             'industry_type', 'company_size', 'country', 'currency', 'timezone'
         ]
@@ -34,7 +34,7 @@ class OnboardingSerializer(serializers.ModelSerializer):
     class Meta:
         model = Tenant
         fields = [
-            'name', 'domain', 'address', 'gst_number', 'pan_number', 
+            'name', 'domain', 'address', 'phone', 'gst_number', 'pan_number', 
             'shift_start', 'shift_end', 'auto_attendance', 
             'industry_type', 'company_size', 'country', 'currency', 'timezone',
             'onboarding_step'

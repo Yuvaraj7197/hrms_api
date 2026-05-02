@@ -855,6 +855,11 @@ class OnboardingSetupView(views.APIView):
     def post(self, request):
         tenant = request.user.tenant
         payload = request.data.copy()
+        # Accept UI camelCase keys from legacy setup screens / onboarding.
+        if 'companyName' in payload and 'name' not in payload:
+            payload['name'] = payload.get('companyName')
+        if 'phoneNumber' in payload and 'phone' not in payload:
+            payload['phone'] = payload.get('phoneNumber')
         if 'industryType' in payload and 'industry_type' not in payload:
             payload['industry_type'] = payload.get('industryType')
         if 'companySize' in payload and 'company_size' not in payload:
