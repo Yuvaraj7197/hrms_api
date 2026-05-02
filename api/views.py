@@ -13,6 +13,7 @@ from .models import (
 )
 from .serializers import RegisterSerializer, OTPVerifySerializer, OnboardingSerializer, UserSerializer, DepartmentSerializer, RoleSerializer, EmployeeSerializer, AttendanceRecordSerializer, EmployeeDocumentSerializer, AttendanceStatusSerializer
 from django.db import transaction, connection
+from django.db.models import Q
 from django.core.mail import send_mail
 from django.conf import settings
 import random
@@ -716,14 +717,43 @@ class OnboardingEmployeesView(views.APIView):
         with transaction.atomic():
             # 1. Create employees and user accounts first.
             for emp in employees_data:
-                dept_name = emp.get('department') or emp.get('departmentId')
-                role_name = emp.get('role') or emp.get('roleId')
+                dept_raw = (
+                    emp.get('department')
+                    or emp.get('departmentId')
+                    or emp.get('department_id')
+                )
+                role_raw = (
+                    emp.get('role')
+                    or emp.get('roleId')
+                    or emp.get('role_id')
+                    or emp.get('designation')
+                    or emp.get('designationId')
+                    or emp.get('designation_id')
+                )
                 email = emp.get('email')
                 if not email:
                     continue
 
-                dept = Department.objects.filter(tenant=tenant, name=dept_name).first()
-                role = Role.objects.filter(tenant=tenant, name=role_name).first()
+                dept_pk = safe_int(dept_raw)
+                role_pk = safe_int(role_raw)
+                dept = (
+                    Department.objects.filter(tenant=tenant, id=dept_pk).first()
+                    if dept_pk is not None
+                    else Department.objects.filter(
+                        tenant=tenant, name=str(dept_raw).strip()
+                    ).first()
+                    if dept_raw
+                    else None
+                )
+                role = (
+                    Role.objects.filter(tenant=tenant, id=role_pk).first()
+                    if role_pk is not None
+                    else Role.objects.filter(
+                        tenant=tenant, name=str(role_raw).strip()
+                    ).first()
+                    if role_raw
+                    else None
+                )
 
                 base_username = email.split('@')[0]
                 generated_username = f"{base_username}_{random.randint(100, 999)}"
@@ -851,18 +881,32 @@ class OnboardingDepartmentsView(views.APIView):
         
         # Clear existing and save new
         Department.objects.filter(tenant=tenant).delete()
-        
+
+        saved_departments = []
         for dept in departments_data:
-            Department.objects.create(
+            obj = Department.objects.create(
                 tenant=tenant,
                 name=dept.get('name'),
-                head_count=dept.get('headCount', 0)
+                head_count=dept.get('headCount', 0),
             )
-        
+            saved_departments.append(
+                {
+                    'id': str(obj.id),
+                    'companyId': str(tenant.id),
+                    'name': obj.name,
+                    'headCount': obj.head_count,
+                }
+            )
+
         tenant.onboarding_step = 3
         tenant.save(update_fields=['onboarding_step'])
-        
-        return Response({"message": "Departments saved successfully"})
+
+        return Response(
+            {
+                'message': 'Departments saved successfully',
+                'departments': saved_departments,
+            }
+        )
 
 class DashboardView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -932,6 +976,14 @@ class OnboardingDataView(views.APIView):
         roles = list(
             Role.objects.filter(tenant=tenant).values('id', 'name', 'description', 'level', 'system_role_category')
         )
+        # Employee / job forms need tenant designations (t_role). New tenants may be empty until seeded.
+        if not roles:
+            sr = str(getattr(request.user, 'system_role', '') or '').upper()
+            if sr in ('SUPER_ADMIN', 'ADMIN', 'HR', 'MANAGER'):
+                AdminSeedRolePermissionsView.sync_catalog_for_tenant(tenant)
+                roles = list(
+                    Role.objects.filter(tenant=tenant).values('id', 'name', 'description', 'level', 'system_role_category')
+                )
         employees_qs = Employee.objects.filter(tenant=tenant).select_related('department', 'designation', 'reporting_to')
 
         employees = []
@@ -3087,24 +3139,25 @@ class AdminSeedRolePermissionsView(views.APIView):
         "Office Assistant",
     ]
 
-    def post(self, request):
+    @classmethod
+    def sync_catalog_for_tenant(cls, tenant, incoming_role_names=None):
+        """
+        Ensures ROLE_CATALOG (or incoming list) exists in tenant t_role plus default RolePermission rows.
+        Safe and idempotent: may be called when onboarding/data finds no roles.
+        """
         ensure_role_permission_table_exists()
-
-        if str(request.user.system_role).upper() not in ('SUPER_ADMIN', 'ADMIN'):
-            return Response({"error": "Permission denied"}, status=403)
-
-        tenant = request.user.tenant
-        incoming = request.data.get('roles', None)
-        role_names = incoming if isinstance(incoming, list) else self.ROLE_CATALOG
-        role_names = [str(x).strip() for x in role_names if str(x).strip()]
+        if incoming_role_names is None:
+            role_names_src = cls.ROLE_CATALOG
+        else:
+            role_names_src = incoming_role_names
+        role_names = [str(x).strip() for x in role_names_src if str(x).strip()]
 
         created_roles = 0
         created_perms = 0
         updated_perms = 0
 
         for name in role_names:
-            # Derive system_role_category once at seed time (DB-persisted master)
-            derived_category = self._derive_category(name)
+            derived_category = cls._derive_category(name)
 
             role_obj, created = Role.objects.get_or_create(
                 tenant=tenant,
@@ -3114,7 +3167,6 @@ class AdminSeedRolePermissionsView(views.APIView):
             if created:
                 created_roles += 1
             elif role_obj.system_role_category != derived_category:
-                # Backfill existing rows that predate this column
                 role_obj.system_role_category = derived_category
                 role_obj.save(update_fields=['system_role_category'])
 
@@ -3122,7 +3174,6 @@ class AdminSeedRolePermissionsView(views.APIView):
 
             rp = RolePermission.objects.filter(role_id=role_obj.id).first()
             if rp:
-                # Keep idempotent but update to latest mapping
                 rp.allowed_routes = allowed
                 rp.save(update_fields=['allowed_routes', 'updated_at'])
                 updated_perms += 1
@@ -3130,14 +3181,27 @@ class AdminSeedRolePermissionsView(views.APIView):
                 RolePermission.objects.create(role=role_obj, allowed_routes=allowed)
                 created_perms += 1
 
-        return Response({
-            "message": "Seeded roles and default admin permissions",
+        return {
             "tenant_id": str(getattr(tenant, 'id', '')),
             "created_roles": created_roles,
             "created_permissions": created_perms,
             "updated_permissions": updated_perms,
             "total_roles_processed": len(role_names),
+        }
+
+    def post(self, request):
+        if str(request.user.system_role).upper() not in ('SUPER_ADMIN', 'ADMIN', 'HR', 'MANAGER'):
+            return Response({"error": "Permission denied"}, status=403)
+
+        tenant = request.user.tenant
+        incoming = request.data.get('roles', None)
+        role_names_payload = incoming if isinstance(incoming, list) else None
+        stats = self.sync_catalog_for_tenant(tenant, incoming_role_names=role_names_payload)
+
+        return Response({
+            "message": "Seeded roles and default admin permissions",
             "admin_route_keys": ADMIN_ROUTE_KEYS,
+            **stats,
         })
 
     @staticmethod
@@ -3227,8 +3291,9 @@ class MasterDepartmentView(views.APIView):
         ensure_master_tables_exist()
         industry_id = request.query_params.get('industry_id')
         qs = DepartmentMaster.objects.filter(is_active=True)
+        # Include shared masters (merged catalog) where industry_id is NULL.
         if industry_id:
-            qs = qs.filter(industry_id=industry_id)
+            qs = qs.filter(Q(industry_id=industry_id) | Q(industry_id__isnull=True))
         qs = qs.order_by('name')
         data = [
             {'id': d.id, 'name': d.name, 'code': d.code, 'industry_id': d.industry_id}
