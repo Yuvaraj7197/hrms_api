@@ -218,6 +218,14 @@ class Employee(TenantScopedModel):
         self.save()
         return self.invite_token
 
+    def save(self, *args, **kwargs):
+        # Auto-sync User portal role with Employee designation
+        if self.user and self.designation:
+            if self.user.role != self.designation:
+                self.user.role = self.designation
+                self.user.save(update_fields=['role'])
+        super().save(*args, **kwargs)
+
     class Meta:
         db_table = "t_employee"
 

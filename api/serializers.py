@@ -22,7 +22,6 @@ class UserSerializer(serializers.ModelSerializer):
 
 class RegisterSerializer(serializers.Serializer):
     company_name = serializers.CharField(max_length=255)
-    username = serializers.CharField(max_length=255)
     email = serializers.EmailField()
     password = serializers.CharField(write_only=True)
 
@@ -99,6 +98,18 @@ class EmployeeSerializer(serializers.ModelSerializer):
             # Documents
             'documents',
         ]
+
+    def validate_department(self, value):
+        user = self.context['request'].user
+        if value and value.tenant != user.tenant:
+            raise serializers.ValidationError("Department does not belong to your organization.")
+        return value
+
+    def validate_designation(self, value):
+        user = self.context['request'].user
+        if value and value.tenant != user.tenant:
+            raise serializers.ValidationError("Designation does not belong to your organization.")
+        return value
 
 
 class AttendanceStatusSerializer(serializers.ModelSerializer):

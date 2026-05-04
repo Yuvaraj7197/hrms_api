@@ -29,9 +29,10 @@ from .views import (
     # Onboarding Flow
     SendOnboardingInviteView, EmployeeOnboardingPublicView,
     # Seed defaults
-    SeedDefaultsView,
+    SeedDefaultsView, AdminSetupWizardView,
     # Admin portal permissions
     AdminPermissionsView, MetaRolesMenusView, AdminRolePermissionListView, AdminRolePermissionUpdateView, AdminSeedRolePermissionsView,
+    UserRoleUpdateView,
     # Master Data
     MasterIndustryView, MasterDepartmentView, MasterRoleView,
 )
@@ -102,7 +103,9 @@ urlpatterns = [
 
     # ── Admin Utilities ────────────────────────────────
     path('admin/seed-defaults/',     SeedDefaultsView.as_view(),           name='seed_defaults'),
+    path('admin/setup-wizard/',      AdminSetupWizardView.as_view(),       name='admin_setup_wizard'),
     path('admin/permissions/',      AdminPermissionsView.as_view(),       name='admin_permissions'),
+    path('admin/user-role-update/', UserRoleUpdateView.as_view(),        name='admin_user_role_update'),
     path('meta/roles-menus/',      MetaRolesMenusView.as_view(),         name='meta_roles_menus'),
     path('admin/role-permissions/', AdminRolePermissionListView.as_view(), name='admin_role_permissions'),
     path('admin/role-permissions/<int:role_id>/', AdminRolePermissionUpdateView.as_view(), name='admin_role_permission_update'),

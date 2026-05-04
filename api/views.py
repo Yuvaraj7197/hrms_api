@@ -123,6 +123,20 @@ def ensure_master_tables_exist():
                 )
                 """
             )
+            # Salary Structure Component
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS t_salary_structure_component (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    structure_id INTEGER NOT NULL,
+                    component_id INTEGER NOT NULL,
+                    calculation_type VARCHAR(20) NOT NULL,
+                    value DECIMAL(12, 2) DEFAULT 0,
+                    FOREIGN KEY(structure_id) REFERENCES t_salary_structure(id) ON DELETE CASCADE,
+                    FOREIGN KEY(component_id) REFERENCES t_salary_component(id) ON DELETE CASCADE
+                )
+                """
+            )
             return
 
         # MySQL / MariaDB
@@ -198,6 +212,19 @@ def ensure_master_tables_exist():
                 description TEXT,
                 is_active BOOLEAN DEFAULT 1,
                 CONSTRAINT t_sal_struct_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_salary_structure_component (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                structure_id BIGINT NOT NULL,
+                component_id BIGINT NOT NULL,
+                calculation_type VARCHAR(20) NOT NULL,
+                value DECIMAL(12, 2) DEFAULT 0,
+                CONSTRAINT t_sal_struct_comp_struct_fk FOREIGN KEY (structure_id) REFERENCES t_salary_structure(id) ON DELETE CASCADE,
+                CONSTRAINT t_sal_struct_comp_comp_fk FOREIGN KEY (component_id) REFERENCES t_salary_component(id) ON DELETE CASCADE
             )
             """
         )
@@ -443,7 +470,6 @@ class RegisterView(views.APIView):
         serializer = RegisterSerializer(data=request.data)
         if serializer.is_valid():
             company_name = serializer.validated_data['company_name']
-            username = serializer.validated_data['username']
             email = serializer.validated_data['email']
             password = serializer.validated_data['password']
 
@@ -454,7 +480,6 @@ class RegisterView(views.APIView):
             tenant = Tenant.objects.create(name=company_name)
 
             # Auto-create an "Admin" Role for the tenant.
-            # system_role_category='ADMIN' is stored in DB — no name-pattern matching needed.
             admin_role, _ = Role.objects.get_or_create(
                 tenant=tenant,
                 name='Admin',
@@ -464,14 +489,10 @@ class RegisterView(views.APIView):
                     'system_role_category': 'ADMIN',
                 }
             )
-            # Ensure existing rows are also upgraded (idempotent)
-            if admin_role.system_role_category != 'ADMIN':
-                admin_role.system_role_category = 'ADMIN'
-                admin_role.save(update_fields=['system_role_category'])
-
-            # Create User — assign the Admin role FK so system_role → 'ADMIN'
+            
+            # Create User using email as the username
             user = User.objects.create_user(
-                username=username,
+                username=email,
                 email=email,
                 password=password,
                 tenant=tenant,
@@ -999,7 +1020,7 @@ class OnboardingDataView(views.APIView):
                 'employeeCode': employee.employee_code,
                 'name': employee.name,
                 'email': employee.email,
-                # 'phone': employee.phone or '',
+                'phone': employee.phone or '',
                 'departmentId': str(employee.department_id) if employee.department_id else '',
                 'roleId': str(employee.designation_id) if employee.designation_id else '',
                 'reportingTo': str(employee.reporting_to_id) if employee.reporting_to_id else '',
@@ -1680,11 +1701,13 @@ class SalaryComponentView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
+        ensure_master_tables_exist()
         qs = SalaryComponent.objects.filter(tenant=request.user.tenant)
         return Response([{"id": c.id, "name": c.name, "code": c.code, "type": c.component_type, "is_statutory": c.is_statutory} for c in qs])
 
     def post(self, request):
         """Create a new salary component (e.g. Basic, HRA, PF, Conveyance)."""
+        ensure_master_tables_exist()
         tenant = request.user.tenant
         data = request.data
         name = data.get('name', '').strip()
@@ -1713,6 +1736,7 @@ class SalaryComponentView(views.APIView):
 class SalaryStructureView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
     def get(self, request):
+        ensure_master_tables_exist()
         qs = SalaryStructure.objects.filter(tenant=request.user.tenant).prefetch_related('components__component')
         data = []
         for s in qs:
@@ -1721,6 +1745,7 @@ class SalaryStructureView(views.APIView):
         return Response(data)
 
     def post(self, request):
+        ensure_master_tables_exist()
         tenant = request.user.tenant
         data = request.data
         with transaction.atomic():
@@ -1741,6 +1766,7 @@ class SalaryStructureView(views.APIView):
 class EmployeeSalarySetupView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
     def post(self, request):
+        ensure_master_tables_exist()
         tenant = request.user.tenant
         emp_id = request.data.get('employee_id')
         struct_id = request.data.get('structure_id')
@@ -2923,6 +2949,57 @@ class SeedDefaultsView(views.APIView):
             return Response({"error": str(e)}, status=500)
 
 
+class AdminSetupWizardView(views.APIView):
+    """
+    ONE-CLICK SETUP:
+    1. Provisions missing tables (t_role_permission, m_role, etc).
+    2. Seeds tenant defaults (Attendance, Leaves, Payroll).
+    3. Seeds Role Catalog & Permissions.
+    4. Ensures current user has an 'ADMIN' role link.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        tenant = request.user.tenant
+        user = request.user
+
+        try:
+            # 1. Provision Tables
+            ensure_role_permission_table_exists()
+            ensure_master_tables_exist()
+
+            # 2. Seed Tenant Defaults (Attendance/Leave/Payroll)
+            seed_tenant_defaults(tenant)
+
+            # 3. Seed Role Catalog & Route Permissions
+            # This creates 'Admin', 'HR Manager', etc. in t_role
+            role_stats = AdminSeedRolePermissionsView.sync_catalog_for_tenant(tenant)
+
+            # 4. Ensure Current User has Admin Link
+            admin_role = Role.objects.filter(tenant=tenant, system_role_category='ADMIN').first()
+            if admin_role:
+                if user.role != admin_role:
+                    user.role = admin_role
+                    user.save(update_fields=['role'])
+            
+            # 5. Mark Onboarding as complete (Optional)
+            tenant.onboarding_step = 5
+            tenant.save(update_fields=['onboarding_step'])
+
+            return Response({
+                "status": "success",
+                "message": "HRMS Setup Wizard completed successfully.",
+                "details": {
+                    "tenant": tenant.name,
+                    "user": user.username,
+                    "assigned_role": admin_role.name if admin_role else "None",
+                    "role_stats": role_stats
+                }
+            })
+        except Exception as e:
+            return Response({"status": "error", "message": str(e)}, status=500)
+
+
 # ─────────────────────────────────────────────
 # ADMIN PORTAL PERMISSIONS (DB-driven via t_role)
 # ─────────────────────────────────────────────
@@ -3323,3 +3400,41 @@ class MasterRoleView(views.APIView):
             for r in qs
         ]
         return Response(data)
+
+
+class UserRoleUpdateView(views.APIView):
+    """
+    POST /api/admin/user-role-update/
+    Allows an Admin to change another user's role.
+    Payload: { "user_id": 123, "role_id": 456 }
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        if str(request.user.system_role).upper() not in ('SUPER_ADMIN', 'ADMIN'):
+            return Response({"error": "Only Admins can change user roles"}, status=403)
+
+        user_id = request.data.get('user_id')
+        role_id = request.data.get('role_id')
+        tenant = request.user.tenant
+
+        if not user_id or not role_id:
+            return Response({"error": "user_id and role_id are required"}, status=400)
+
+        target_user = User.objects.filter(id=user_id, tenant=tenant).first()
+        if not target_user:
+            return Response({"error": "User not found in your tenant"}, status=404)
+
+        new_role = Role.objects.filter(id=role_id, tenant=tenant).first()
+        if not new_role:
+            return Response({"error": "Role not found in your tenant"}, status=404)
+
+        target_user.role = new_role
+        target_user.save(update_fields=['role'])
+
+        return Response({
+            "message": f"Updated role for {target_user.username} to {new_role.name}",
+            "username": target_user.username,
+            "new_role": new_role.name,
+            "system_role": target_user.system_role
+        })
