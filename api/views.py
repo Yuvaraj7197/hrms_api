@@ -423,13 +423,26 @@ def build_payroll_record_payload(tenant, record, attendance_stats_by_employee_id
 
     eid = str(record.employee.id)
     if attendance_stats_by_employee_id is not None:
-        present_days = attendance_stats_by_employee_id[eid]['present']
-        paid_days = attendance_stats_by_employee_id[eid]['paid']
+        # If stats were pre-calculated (recommended), use them. 
+        # Note: caller should ensure these stats are from the lookback month.
+        stats = attendance_stats_by_employee_id.get(eid, {'present': 0, 'paid': 0})
+        present_days = stats['present']
+        paid_days = stats['paid']
     else:
+        # Fallback: calculate on the fly with lookback logic
+        from datetime import datetime, timedelta
+        try:
+            _y, _m = map(int, str(record.cycle_month).split('-'))
+            _cur = datetime(_y, _m, 1)
+            _prev = _cur - timedelta(days=1)
+            _attendance_cycle = _prev.strftime('%Y-%m')
+        except Exception:
+            _attendance_cycle = record.cycle_month
+
         attendance_qs = AttendanceRecord.objects.filter(
             tenant=tenant,
             employee=record.employee,
-            date__startswith=record.cycle_month
+            date__startswith=_attendance_cycle
         ).select_related('status')
         present_days = 0
         paid_days = 0
@@ -951,7 +964,11 @@ class DashboardView(views.APIView):
             data["stats"] = {
                 "total_employees": Employee.objects.filter(tenant=tenant).count(),
                 "departments": Department.objects.filter(tenant=tenant).count(),
-                "active_payroll": PayrollRecord.objects.filter(tenant=tenant, status='Processed').count(),
+                "active_payroll": PayrollRecord.objects.filter(
+                    tenant=tenant, 
+                    status='Processed',
+                    cycle_month=timezone.localdate().strftime('%Y-%m')
+                ).count(),
                 "pending_leaves": 5 # Placeholder until Leave model is fully implemented
             }
             data["pending_tasks"] = data["stats"]["pending_leaves"]
@@ -1321,7 +1338,19 @@ class PayrollDataView(views.APIView):
         cycle_month = request.query_params.get('cycle') or timezone.localdate().strftime('%Y-%m')
 
         from collections import defaultdict
-        attendance_qs = AttendanceRecord.objects.filter(tenant=tenant, date__startswith=cycle_month).select_related('status')
+        import calendar as _calendar
+        from datetime import datetime, timedelta
+
+        # Calculate Previous Month for attendance lookback
+        try:
+            _year, _month = map(int, cycle_month.split('-'))
+            current_date = datetime(_year, _month, 1)
+            prev_month_date = current_date - timedelta(days=1)
+            attendance_cycle = prev_month_date.strftime('%Y-%m')
+        except Exception:
+            attendance_cycle = cycle_month
+
+        attendance_qs = AttendanceRecord.objects.filter(tenant=tenant, date__startswith=attendance_cycle).select_related('status')
         att_stats = defaultdict(lambda: {'present': 0, 'paid': 0})
         for r in attendance_qs:
             eid = str(r.employee_id)
@@ -1434,18 +1463,32 @@ class PayrollProcessView(views.APIView):
 
         # 1. Determine calendar days in the cycle month
         import calendar as _calendar
+        from datetime import datetime, timedelta
         try:
             _year, _month = map(int, cycle_month.split('-'))
             days_in_month = _calendar.monthrange(_year, _month)[1]
+            
+            # Calculate Previous Month for attendance lookback
+            current_date = datetime(_year, _month, 1)
+            prev_month_date = current_date - timedelta(days=1)
+            attendance_cycle = prev_month_date.strftime('%Y-%m')
         except Exception:
             days_in_month = 30
+            attendance_cycle = cycle_month # Fallback
 
-        # 2. Fetch Attendance Report for LOP/present calculation
+        # 2. Fetch Attendance Report for LOP/present calculation (Pulling from PREVIOUS MONTH)
         paid_days_report = {}    # eid -> paid count (Present, WO, Holiday)
         present_report   = {}    # eid -> actual present count
         try:
             from collections import defaultdict
-            qs = AttendanceRecord.objects.filter(tenant=tenant, date__startswith=cycle_month)
+            qs = AttendanceRecord.objects.filter(tenant=tenant, date__startswith=attendance_cycle)
+            
+            # VALIDATION: Check if attendance exists for the lookback period
+            if not qs.exists():
+                return Response({
+                    'error': f'Attendance data for {attendance_cycle} is missing. Please upload/complete attendance before processing {cycle_month} payroll.'
+                }, status=400)
+
             for r in qs.select_related('status'):
                 eid = str(r.employee_id)
                 s = (r.status.code if r.status else r.status_str or "").upper()
@@ -1807,6 +1850,22 @@ class PayslipView(views.APIView):
         try:
             record = PayrollRecord.objects.get(tenant=request.user.tenant, id=record_id)
             emp = record.employee
+            # Calculate Previous Month for attendance lookback
+            from datetime import datetime, timedelta
+            try:
+                _y, _m = map(int, str(record.cycle_month).split('-'))
+                _cur = datetime(_y, _m, 1)
+                _prev = _cur - timedelta(days=1)
+                attendance_cycle = _prev.strftime('%Y-%m')
+            except Exception:
+                attendance_cycle = record.cycle_month
+
+            present_days = AttendanceRecord.objects.filter(
+                employee=emp, 
+                date__startswith=attendance_cycle,
+                status__code__in=['P', 'PRESENT', 'L', 'LATE']
+            ).count()
+
             return Response({
                 "company": {
                     "name": request.user.tenant.name if hasattr(request.user, 'tenant') else "Company Name",
@@ -1826,13 +1885,10 @@ class PayslipView(views.APIView):
                 },
                 "attendance": {
                     "working_days":   getattr(record, 'working_days', 30),
-                    "present_days":   AttendanceRecord.objects.filter(
-                        employee=emp, 
-                        date__startswith=record.cycle_month,
-                        status__code__in=['P', 'PRESENT', 'L', 'LATE']
-                    ).count(),
+                    "present_days":   present_days,
                     "lop_days":       getattr(record, 'lop_days', 0),
                     "paid_days":      getattr(record, 'working_days', 30) - getattr(record, 'lop_days', 0),
+                    "period":         attendance_cycle
                 },
                 "salary": {
                     "id":             record.id,
