@@ -544,12 +544,13 @@ class RegisterView(views.APIView):
             company_name = serializer.validated_data['company_name']
             email = serializer.validated_data['email']
             password = serializer.validated_data['password']
+            phone = serializer.validated_data.get('phone', '')
 
             if User.objects.filter(email=email).exists():
                 return Response({"error": "Email already exists"}, status=status.HTTP_400_BAD_REQUEST)
 
             # Create Tenant
-            tenant = Tenant.objects.create(name=company_name)
+            tenant = Tenant.objects.create(name=company_name, phone=phone)
 
             # Auto-create an "Admin" Role for the tenant.
             admin_role, _ = Role.objects.get_or_create(

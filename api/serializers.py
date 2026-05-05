@@ -24,6 +24,7 @@ class RegisterSerializer(serializers.Serializer):
     company_name = serializers.CharField(max_length=255)
     email = serializers.EmailField()
     password = serializers.CharField(write_only=True)
+    phone = serializers.CharField(max_length=20, required=False, allow_blank=True)
 
 class OTPVerifySerializer(serializers.Serializer):
     email = serializers.EmailField()
