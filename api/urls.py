@@ -61,6 +61,7 @@ urlpatterns = [
 
     # ── Holiday Calendar ───────────────────────────────
     path('holidays/',                views.HolidayCalendarView.as_view(),         name='holidays'),
+    path('notifications/',           views.NotificationView.as_view(),            name='notifications'),
 
     # ── Onboarding Flow ────────────────────────────────
     path('employees/invite/',        views.SendOnboardingInviteView.as_view(),    name='hr_employee_invite'),

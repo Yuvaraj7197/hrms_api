@@ -9,7 +9,7 @@ from .models import (
     User, Tenant, OTP, Department, Role, Employee, AttendanceRecord, PayrollRecord, 
     PayrollAuditLog, EmployeeDocument, AttendanceStatus, SalaryComponent, 
     SalaryStructure, SalaryStructureComponent, EmployeeSalaryStructure, PayrollSetting,
-    LeaveType, LeaveBalance, LeaveApplication, HolidayCalendar,
+    LeaveType, LeaveBalance, LeaveApplication, HolidayCalendar, Notification,
     IndustryMaster, DepartmentMaster, RoleMaster, RolePermission
 )
 from .serializers import RegisterSerializer, OTPVerifySerializer, OnboardingSerializer, UserSerializer, DepartmentSerializer, RoleSerializer, EmployeeSerializer, AttendanceRecordSerializer, EmployeeDocumentSerializer, AttendanceStatusSerializer
@@ -143,6 +143,7 @@ def ensure_master_tables_exist():
             cursor.execute("CREATE TABLE IF NOT EXISTS t_leave_balance (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id CHAR(32) NOT NULL, employee_id INTEGER NOT NULL, leave_type_id INTEGER NOT NULL, year INTEGER DEFAULT 2026, allocated DECIMAL(5, 1) DEFAULT 0, used DECIMAL(5, 1) DEFAULT 0, carried_forward DECIMAL(5, 1) DEFAULT 0, FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE, FOREIGN KEY(employee_id) REFERENCES t_employee(id) ON DELETE CASCADE, FOREIGN KEY(leave_type_id) REFERENCES t_leave_type(id) ON DELETE CASCADE)")
             cursor.execute("CREATE TABLE IF NOT EXISTS t_leave_application (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id CHAR(32) NOT NULL, employee_id INTEGER NOT NULL, leave_type_id INTEGER NOT NULL, from_date DATE NOT NULL, to_date DATE NOT NULL, reason TEXT, status VARCHAR(20) DEFAULT 'Pending', reviewed_by_id INTEGER, reviewed_at DATETIME, created_at DATETIME NOT NULL, FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE, FOREIGN KEY(employee_id) REFERENCES t_employee(id) ON DELETE CASCADE, FOREIGN KEY(leave_type_id) REFERENCES t_leave_type(id) ON DELETE CASCADE)")
             cursor.execute("CREATE TABLE IF NOT EXISTS t_holiday_calendar (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id CHAR(32) NOT NULL, name VARCHAR(255) NOT NULL, date DATE NOT NULL, holiday_type VARCHAR(20) DEFAULT 'National', description TEXT, FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE)")
+            cursor.execute("CREATE TABLE IF NOT EXISTS t_notification (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id CHAR(32) NOT NULL, user_id INTEGER NOT NULL, title VARCHAR(255) NOT NULL, message TEXT, notify_type VARCHAR(20) DEFAULT 'info', is_read BOOLEAN DEFAULT 0, action_url VARCHAR(255), created_at DATETIME NOT NULL, FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE, FOREIGN KEY(user_id) REFERENCES t_user(id) ON DELETE CASCADE)")
             return
 
         # MySQL / MariaDB
@@ -328,6 +329,23 @@ def ensure_master_tables_exist():
                 holiday_type VARCHAR(20) DEFAULT 'National',
                 description TEXT,
                 CONSTRAINT t_holiday_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_notification (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                tenant_id CHAR(32) NOT NULL,
+                user_id BIGINT NOT NULL,
+                title VARCHAR(255) NOT NULL,
+                message TEXT,
+                notify_type VARCHAR(20) DEFAULT 'info',
+                is_read BOOLEAN DEFAULT 0,
+                action_url VARCHAR(255),
+                created_at DATETIME(6) NOT NULL,
+                CONSTRAINT t_notify_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
+                CONSTRAINT t_notify_user_fk FOREIGN KEY (user_id) REFERENCES t_user(id) ON DELETE CASCADE
             )
             """
         )
@@ -1043,7 +1061,7 @@ class DashboardView(views.APIView):
                     status='Processed',
                     cycle_month=timezone.localdate().strftime('%Y-%m')
                 ).count(),
-                "pending_leaves": 5 # Placeholder until Leave model is fully implemented
+                "pending_leaves": LeaveApplication.objects.filter(tenant=tenant, status='Pending').count()
             }
             data["pending_tasks"] = data["stats"]["pending_leaves"]
         
@@ -2698,6 +2716,19 @@ class LeaveApproveView(views.APIView):
                     balance.used = float(balance.used) + app.days_count()
                     balance.save()
 
+        # 3. Notify Employee
+        try:
+            Notification.objects.create(
+                tenant=app.tenant,
+                user=app.employee.user,
+                title=f"Leave Request {app.status}",
+                message=f"Your leave request from {app.from_date} to {app.to_date} has been {app.status.lower()}.",
+                notify_type='success' if app.status == 'Approved' else 'warning',
+                created_at=timezone.now()
+            )
+        except Exception as e:
+            print(f"[NOTIFY] Error: {e}")
+
         return Response({"message": f"Leave {app.status.lower()} successfully", "status": app.status})
 
 
@@ -3729,3 +3760,37 @@ class UserRoleUpdateView(views.APIView):
             "new_role": new_role.name,
             "system_role": target_user.system_role
         })
+class NotificationView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        ensure_master_tables_exist()
+        limit = int(request.query_params.get('limit', 10))
+        notifications = Notification.objects.filter(
+            tenant=request.user.tenant,
+            user=request.user
+        )[:limit]
+        
+        data = [
+            {
+                "id": n.id, "title": n.title, "message": n.message,
+                "type": n.notify_type, "is_read": n.is_read,
+                "url": n.action_url, "time": n.created_at.isoformat()
+            }
+            for n in notifications
+        ]
+        
+        unread_count = Notification.objects.filter(
+            tenant=request.user.tenant, user=request.user, is_read=False
+        ).count()
+        
+        return Response({"notifications": data, "unread_count": unread_count})
+
+    def post(self, request):
+        ensure_master_tables_exist()
+        notify_id = request.data.get('id')
+        if notify_id == 'all':
+            Notification.objects.filter(user=request.user, is_read=False).update(is_read=True)
+        else:
+            Notification.objects.filter(id=notify_id, user=request.user).update(is_read=True)
+        return Response({"message": "Marked as read"})
