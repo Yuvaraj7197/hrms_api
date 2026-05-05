@@ -4,6 +4,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import authenticate
 from django.utils import timezone
 from decimal import Decimal
+from datetime import timedelta
 from .models import (
     User, Tenant, OTP, Department, Role, Employee, AttendanceRecord, PayrollRecord, 
     PayrollAuditLog, EmployeeDocument, AttendanceStatus, SalaryComponent, 
@@ -137,6 +138,10 @@ def ensure_master_tables_exist():
                 )
                 """
             )
+            # Leave Tables
+            cursor.execute("CREATE TABLE IF NOT EXISTS t_leave_type (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id CHAR(32) NOT NULL, name VARCHAR(100) NOT NULL, code VARCHAR(10) DEFAULT 'CL', days_per_year INTEGER DEFAULT 12, is_paid BOOLEAN DEFAULT 1, carry_forward BOOLEAN DEFAULT 0, max_carry_forward INTEGER DEFAULT 0, FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE)")
+            cursor.execute("CREATE TABLE IF NOT EXISTS t_leave_balance (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id CHAR(32) NOT NULL, employee_id INTEGER NOT NULL, leave_type_id INTEGER NOT NULL, year INTEGER DEFAULT 2026, allocated DECIMAL(5, 1) DEFAULT 0, used DECIMAL(5, 1) DEFAULT 0, carried_forward DECIMAL(5, 1) DEFAULT 0, FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE, FOREIGN KEY(employee_id) REFERENCES t_employee(id) ON DELETE CASCADE, FOREIGN KEY(leave_type_id) REFERENCES t_leave_type(id) ON DELETE CASCADE)")
+            cursor.execute("CREATE TABLE IF NOT EXISTS t_leave_application (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id CHAR(32) NOT NULL, employee_id INTEGER NOT NULL, leave_type_id INTEGER NOT NULL, from_date DATE NOT NULL, to_date DATE NOT NULL, reason TEXT, status VARCHAR(20) DEFAULT 'Pending', reviewed_by_id INTEGER, reviewed_at DATETIME, created_at DATETIME NOT NULL, FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE, FOREIGN KEY(employee_id) REFERENCES t_employee(id) ON DELETE CASCADE, FOREIGN KEY(leave_type_id) REFERENCES t_leave_type(id) ON DELETE CASCADE)")
             return
 
         # MySQL / MariaDB
@@ -255,6 +260,60 @@ def ensure_master_tables_exist():
                 tax_regime_default VARCHAR(20) DEFAULT 'New',
                 loan_interest_rate_annual DECIMAL(5, 2) DEFAULT 8.5,
                 CONSTRAINT t_pay_set_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE
+            )
+            """
+        )
+
+        # Leave Tables
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_leave_type (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                tenant_id CHAR(32) NOT NULL,
+                name VARCHAR(100) NOT NULL,
+                code VARCHAR(10) DEFAULT 'CL',
+                days_per_year INT DEFAULT 12,
+                is_paid BOOLEAN DEFAULT 1,
+                carry_forward BOOLEAN DEFAULT 0,
+                max_carry_forward INT DEFAULT 0,
+                CONSTRAINT t_leave_type_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_leave_balance (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                tenant_id CHAR(32) NOT NULL,
+                employee_id BIGINT NOT NULL,
+                leave_type_id BIGINT NOT NULL,
+                year INT DEFAULT 2026,
+                allocated DECIMAL(5, 1) DEFAULT 0,
+                used DECIMAL(5, 1) DEFAULT 0,
+                carried_forward DECIMAL(5, 1) DEFAULT 0,
+                CONSTRAINT t_leave_bal_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
+                CONSTRAINT t_leave_bal_emp_fk FOREIGN KEY (employee_id) REFERENCES t_employee(id) ON DELETE CASCADE,
+                CONSTRAINT t_leave_bal_type_fk FOREIGN KEY (leave_type_id) REFERENCES t_leave_type(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_leave_application (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                tenant_id CHAR(32) NOT NULL,
+                employee_id BIGINT NOT NULL,
+                leave_type_id BIGINT NOT NULL,
+                from_date DATE NOT NULL,
+                to_date DATE NOT NULL,
+                reason TEXT,
+                status VARCHAR(20) DEFAULT 'Pending',
+                reviewed_by_id BIGINT,
+                reviewed_at DATETIME(6),
+                created_at DATETIME(6) NOT NULL,
+                CONSTRAINT t_leave_app_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
+                CONSTRAINT t_leave_app_emp_fk FOREIGN KEY (employee_id) REFERENCES t_employee(id) ON DELETE CASCADE,
+                CONSTRAINT t_leave_app_type_fk FOREIGN KEY (leave_type_id) REFERENCES t_leave_type(id) ON DELETE CASCADE
             )
             """
         )
@@ -2468,14 +2527,21 @@ class LeaveApplicationView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
+        ensure_master_tables_exist()
         from .models import LeaveApplication
         tenant = request.user.tenant
-        if request.user.system_role in ['ADMIN', 'SUPER_ADMIN', 'HR']:
-            qs = LeaveApplication.objects.filter(tenant=tenant).select_related('employee', 'leave_type')
-        elif request.user.system_role == 'MANAGER':
+        sr = request.user.system_role
+
+        if sr in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            qs = LeaveApplication.objects.filter(tenant=tenant).select_related('employee', 'leave_type', 'employee__department')
+        elif sr == 'MANAGER':
             try:
                 mgr = request.user.employee_profile
-                qs = LeaveApplication.objects.filter(tenant=tenant, employee__department=mgr.department).select_related('employee', 'leave_type')
+                # Managers see leaves of people who report to them
+                qs = LeaveApplication.objects.filter(
+                    tenant=tenant, 
+                    employee__reporting_to=mgr
+                ).select_related('employee', 'leave_type', 'employee__department')
             except Exception:
                 qs = LeaveApplication.objects.none()
         else:
@@ -2488,13 +2554,18 @@ class LeaveApplicationView(views.APIView):
         data = [
             {
                 "id": a.id,
-                "employee_name": a.employee.name,
-                "leave_type": a.leave_type.name,
-                "from_date": str(a.from_date),
-                "to_date": str(a.to_date),
+                "employeeId": a.employee.id,
+                "employeeName": a.employee.name,
+                "employeeCode": a.employee.employee_code,
+                "departmentName": a.employee.department.name if a.employee.department else "N/A",
+                "leaveType": a.leave_type.name,
+                "leaveTypeId": a.leave_type.id,
+                "fromDate": str(a.from_date),
+                "toDate": str(a.to_date),
+                "days": a.days_count(),
                 "reason": a.reason,
                 "status": a.status,
-                "created_at": str(a.created_at),
+                "createdAt": str(a.created_at),
             }
             for a in qs.order_by('-created_at')
         ]
@@ -2502,10 +2573,19 @@ class LeaveApplicationView(views.APIView):
 
     def post(self, request):
         """Employee submits leave application."""
-        from .models import LeaveType, LeaveApplication
-        try:
-            emp = request.user.employee_profile
-        except Exception:
+        from .models import LeaveType, LeaveApplication, Employee
+        
+        # Prioritize explicit employee_id from payload, fallback to session profile
+        emp_id = request.data.get('employee_id')
+        if emp_id:
+            emp = Employee.objects.filter(tenant=request.user.tenant, id=emp_id).first()
+        else:
+            try:
+                emp = request.user.employee_profile
+            except Exception:
+                emp = None
+                
+        if not emp:
             return Response({"error": "Employee profile not found"}, status=404)
 
         leave_type = LeaveType.objects.filter(tenant=request.user.tenant, id=request.data.get('leave_type_id')).first()
@@ -2530,24 +2610,80 @@ class LeaveApproveView(views.APIView):
 
     def post(self, request):
         from .models import LeaveApplication
-        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
+        sr = request.user.system_role
+        if sr not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
             return Response({"error": "Permission denied"}, status=403)
 
         app_id = request.data.get('application_id')
+        emp_id = request.data.get('employee_id')
         action = request.data.get('action')  # 'approve' or 'reject'
+        
         if action not in ('approve', 'reject'):
             return Response({"error": "action must be approve or reject"}, status=400)
 
         try:
-            app = LeaveApplication.objects.get(tenant=request.user.tenant, id=app_id)
+            app = LeaveApplication.objects.select_related('employee').get(tenant=request.user.tenant, id=app_id)
         except LeaveApplication.DoesNotExist:
             return Response({"error": "Application not found"}, status=404)
+
+        # Cross-validate employee_id if provided
+        if emp_id and str(app.employee_id) != str(emp_id):
+            return Response({"error": "Data mismatch: Application does not belong to the specified employee"}, status=400)
+
+        # Manager Authorization: Must be the reporting manager
+        if sr == 'MANAGER':
+            try:
+                mgr = request.user.employee_profile
+                if app.employee.reporting_to_id != mgr.id:
+                    return Response({"error": "You are not authorized to approve this leave request. Only the reporting manager can approve it."}, status=403)
+            except Exception:
+                return Response({"error": "Manager profile not found"}, status=403)
 
         app.status = 'Approved' if action == 'approve' else 'Rejected'
         app.reviewed_by = request.user
         app.reviewed_at = timezone.now()
         app.save()
-        return Response({"message": f"Leave {app.status.lower()} successfully"})
+        
+        # Sync with Attendance and Leave Balance if approved
+        if app.status == 'Approved':
+            # Use raw IDs to be absolutely sure we target the requester (subordinate)
+            target_employee_id = app.employee_id
+            target_tenant_id = app.tenant_id
+            
+            with transaction.atomic():
+                # 1. Update Attendance Records for the requester (ID: target_employee_id)
+                lv_status = AttendanceStatus.objects.filter(code='LV').first()
+                if lv_status:
+                    curr_date = app.from_date
+                    while curr_date <= app.to_date:
+                        AttendanceRecord.objects.update_or_create(
+                            tenant_id=target_tenant_id,
+                            employee_id=target_employee_id,
+                            date=curr_date,
+                            defaults={
+                                'status': lv_status,
+                                'status_str': 'Leave',
+                                'work_hours': 0,
+                                'check_in': None,
+                                'check_out': None
+                            }
+                        )
+                        curr_date += timedelta(days=1)
+
+                # 2. Update Leave Balance for the requester
+                year = app.from_date.year
+                balance = LeaveBalance.objects.filter(
+                    tenant_id=target_tenant_id,
+                    employee_id=target_employee_id,
+                    leave_type_id=app.leave_type_id,
+                    year=year
+                ).first()
+                
+                if balance:
+                    balance.used = float(balance.used) + app.days_count()
+                    balance.save()
+
+        return Response({"message": f"Leave {app.status.lower()} successfully", "status": app.status})
 
 
 # ESS Login — allows EMPLOYEE role (separate from admin LoginView)
@@ -2928,6 +3064,7 @@ class LeaveTypeMasterView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
+        ensure_master_tables_exist()
         tenant = request.user.tenant
         leave_types = LeaveType.objects.filter(tenant=tenant)
         data = [
@@ -2942,6 +3079,7 @@ class LeaveTypeMasterView(views.APIView):
         return Response({"leave_types": data})
 
     def post(self, request):
+        ensure_master_tables_exist()
         if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
@@ -2957,6 +3095,36 @@ class LeaveTypeMasterView(views.APIView):
         )
         return Response({"message": "Leave type created", "id": lt.id}, status=201)
 
+    def put(self, request):
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+        tenant = request.user.tenant
+        p = request.data
+        try:
+            lt = LeaveType.objects.get(tenant=tenant, id=p.get('id'))
+            lt.name = p.get('name', lt.name)
+            lt.code = p.get('code', lt.code).upper()
+            lt.days_per_year = p.get('days_per_year', lt.days_per_year)
+            lt.is_paid = p.get('is_paid', lt.is_paid)
+            lt.carry_forward = p.get('carry_forward', lt.carry_forward)
+            lt.max_carry_forward = p.get('max_carry_forward', lt.max_carry_forward)
+            lt.save()
+            return Response({"message": "Leave type updated"})
+        except LeaveType.DoesNotExist:
+            return Response({"error": "Leave type not found"}, status=404)
+
+    def delete(self, request):
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+        tenant = request.user.tenant
+        lt_id = request.query_params.get('id')
+        try:
+            lt = LeaveType.objects.get(tenant=tenant, id=lt_id)
+            lt.delete()
+            return Response({"message": "Leave type deleted"})
+        except LeaveType.DoesNotExist:
+            return Response({"error": "Leave type not found"}, status=404)
+
 
 # ─────────────────────────────────────────────
 # LEAVE BALANCE — per employee
@@ -2965,6 +3133,7 @@ class LeaveBalanceView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
+        ensure_master_tables_exist()
         tenant = request.user.tenant
         employee_id = request.query_params.get('employee_id')
         year = request.query_params.get('year', str(timezone.localdate().year))
@@ -2986,6 +3155,54 @@ class LeaveBalanceView(views.APIView):
             for lb in qs
         ]
         return Response({"balances": data, "year": year})
+
+
+# ─────────────────────────────────────────────
+# LEAVE BALANCE RECONCILIATION — Admin tool
+# ─────────────────────────────────────────────
+class ReconcileBalancesView(views.APIView):
+    """Admin tool to initialize or roll-over leave balances for all employees."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+        
+        tenant = request.user.tenant
+        year = request.data.get('year', str(timezone.localdate().year))
+        
+        try:
+            employees = Employee.objects.filter(tenant=tenant, status='Active')
+            leave_types = LeaveType.objects.filter(tenant=tenant)
+            
+            created_count = 0
+            updated_count = 0
+            
+            with transaction.atomic():
+                for emp in employees:
+                    for lt in leave_types:
+                        balance, created = LeaveBalance.objects.get_or_create(
+                            tenant=tenant,
+                            employee=emp,
+                            leave_type=lt,
+                            year=year,
+                            defaults={'allocated': lt.days_per_year, 'used': 0, 'carried_forward': 0}
+                        )
+                        if created:
+                            created_count += 1
+                        else:
+                            # Update allocation if it changed in master
+                            if balance.allocated != lt.days_per_year:
+                                balance.allocated = lt.days_per_year
+                                balance.save()
+                                updated_count += 1
+                                
+            return Response({
+                "message": f"Reconciliation successful for {year}.",
+                "details": f"Created {created_count} new records, updated {updated_count} existing records."
+            })
+        except Exception as e:
+            return Response({"error": str(e)}, status=500)
 
 
 # ─────────────────────────────────────────────

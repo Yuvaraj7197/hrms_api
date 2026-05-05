@@ -5,40 +5,33 @@ from urllib.parse import urlparse
 class TenantMiddleware:
 
     tenant_map = {
-           
-            'localhost:4200': 'hrms_local_v1',
-            'localhost:4211': 'hrms_local_v1',
-            'localhost': 'hrms_local_v1',
-            '127.0.0.1': 'hrms_local_v1'
-        }
+        'localhost:4200': 'hrms_local_v1',
+        'localhost:4211': 'hrms_local_v1',
+        'localhost:8000': 'hrms_local_v1',
+        'localhost': 'hrms_local_v1',
+        '127.0.0.1:8000': 'hrms_local_v1',
+        '127.0.0.1': 'hrms_local_v1'
+    }
 
     def __init__(self, get_response):
         self.get_response = get_response
 
     def __call__(self, request):
         try:
-           
-
             origin = request.META.get('HTTP_ORIGIN', '') or request.META.get('HTTP_REFERER', '')
             domain = ''
             
             log_request(request)
 
-
-            # Get the host (domain) of your server
-            if not origin :
-                print(f'orgin empty=======path={request.path}')
-                origin = request.get_host().split(':')[0]  # Get the domain without port
-                domain = get_hostname_from_referer(origin)
+            if not origin:
+                # Use host header if origin/referer missing (e.g. direct browser access)
+                domain = request.get_host()
             else:           
-                # Get the domain from the request
                 domain = get_hostname_from_referer(origin)
 
             # check for api version or static/media files
             if "api/version" in request.path or "/media/" in request.path or "/static/" in request.path:
-                # Default to hms_saas_uat for shared assets if needed, or just let it pass
                 connection.settings_dict['NAME'] = 'hms_saas_uat'
-                pass
             # Get the tenant based on the domain
             elif domain in self.tenant_map:
                 connection.settings_dict['NAME'] = self.tenant_map[domain]
@@ -47,15 +40,16 @@ class TenantMiddleware:
                 return JsonResponse({"detail":"Access denied"}, status=401)
            
         except Exception as e:
-            print(e)
+            print(f"Middleware Error: {e}")
             return JsonResponse({"detail":"Access denied"}, status=401)
         return self.get_response(request)
     
-def get_hostname_from_referer(referer_url):
-    if referer_url:
-        parsed_url = urlparse(referer_url)
-        return parsed_url.netloc  # Returns hostname (without scheme)
-    return None
+def get_hostname_from_referer(url):
+    if not url:
+        return None
+    if '://' in url:
+        return urlparse(url).netloc
+    return url
 
 def log_request(request):
     try: 
