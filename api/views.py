@@ -3242,11 +3242,26 @@ class LeaveBalanceView(views.APIView):
         tenant = request.user.tenant
         employee_id = request.query_params.get('employee_id')
         year = request.query_params.get('year', str(timezone.localdate().year))
+
+        # If no employee_id specified, auto-scope to the requesting user's own employee profile
+        if not employee_id:
+            emp_profile = getattr(request.user, 'employee_profile', None)
+            if emp_profile:
+                employee_id = str(emp_profile.id)
+
         qs = LeaveBalance.objects.filter(tenant=tenant, year=year).select_related('leave_type', 'employee')
         if employee_id:
             qs = qs.filter(employee_id=employee_id)
-        data = [
-            {
+
+        # Deduplicate: one row per leave_type per employee
+        seen = set()
+        data = []
+        for lb in qs:
+            key = (lb.employee_id, lb.leave_type_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            data.append({
                 "id": lb.id,
                 "employee_id": str(lb.employee_id),
                 "employee_name": lb.employee.name,
@@ -3256,9 +3271,7 @@ class LeaveBalanceView(views.APIView):
                 "used": float(lb.used),
                 "carried_forward": float(lb.carried_forward),
                 "remaining": float(lb.remaining),
-            }
-            for lb in qs
-        ]
+            })
         return Response({"balances": data, "year": year})
 
 
