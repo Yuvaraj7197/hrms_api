@@ -694,6 +694,10 @@ def seed_tenant_defaults(tenant):
         {'code': 'L',   'label': 'Late',        'color_code': '#eab308', 'default_work_hours': 8.0},
         {'code': 'A',   'label': 'Absent',      'color_code': '#ef4444', 'default_work_hours': 0.0},
         {'code': 'LV',  'label': 'Leave',       'color_code': '#8b5cf6', 'default_work_hours': 0.0},
+        {'code': 'CL',  'label': 'Casual Leave','color_code': '#a855f7', 'default_work_hours': 0.0},
+        {'code': 'SL',  'label': 'Sick Leave',  'color_code': '#ec4899', 'default_work_hours': 0.0},
+        {'code': 'EL',  'label': 'Earned Leave','color_code': '#3b82f6', 'default_work_hours': 0.0},
+        {'code': 'ML',  'label': 'Maternity Leave','color_code': '#db2777','default_work_hours': 0.0},
         {'code': 'WO',  'label': 'Week Off',    'color_code': '#64748b', 'default_work_hours': 0.0},
         {'code': 'WFH', 'label': 'Work From Home','color_code': '#3b82f6','default_work_hours': 9.0},
         {'code': 'HD',  'label': 'Half Day',    'color_code': '#f97316', 'default_work_hours': 4.5},
@@ -2694,8 +2698,13 @@ class LeaveApproveView(views.APIView):
             
             with transaction.atomic():
                 # 1. Update Attendance Records for the requester (ID: target_employee_id)
-                lv_status = AttendanceStatus.objects.filter(code='LV').first()
-                if lv_status:
+                # Smart Mapping: Match Attendance Status with specific Leave Type Code (CL, SL, EL, etc.)
+                leave_code = app.leave_type.code.upper()
+                status_obj = AttendanceStatus.objects.filter(code=leave_code).first()
+                if not status_obj:
+                    status_obj = AttendanceStatus.objects.filter(code='LV').first()
+
+                if status_obj:
                     curr_date = app.from_date
                     while curr_date <= app.to_date:
                         AttendanceRecord.objects.update_or_create(
@@ -2703,8 +2712,8 @@ class LeaveApproveView(views.APIView):
                             employee_id=target_employee_id,
                             date=curr_date,
                             defaults={
-                                'status': lv_status,
-                                'status_str': 'Leave',
+                                'status': status_obj,
+                                'status_str': status_obj.label,
                                 'work_hours': 0,
                                 'check_in': None,
                                 'check_out': None
