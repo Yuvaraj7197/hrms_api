@@ -2503,7 +2503,37 @@ class ESSProfileView(views.APIView):
             "reporting_to": emp.reporting_to.name if emp.reporting_to else "",
             "joining_date": str(emp.joining_date) if emp.joining_date else "",
             "status": emp.status,
-            "salary_structure": getattr(emp.salary_structure.structure, 'name', 'Standard (Default)') if hasattr(emp, 'salary_structure') else 'Standard (Default)'
+            "salary_structure": getattr(emp.salary_structure.structure, 'name', 'Standard (Default)') if hasattr(emp, 'salary_structure') else 'Standard (Default)',
+            
+            # Personal
+            "dob": str(emp.dob) if emp.dob else "",
+            "gender": emp.gender or "",
+            "father_name": emp.father_name or "",
+            "marital_status": emp.marital_status or "",
+            "blood_group": emp.blood_group or "",
+            "nationality": emp.nationality or "Indian",
+            "personal_email": emp.personal_email or "",
+            
+            # Address
+            "address": emp.address or "",
+            "current_address": emp.current_address or "",
+            
+            # Compliance
+            "pan_number": emp.pan_number or "",
+            "aadhar_number": emp.aadhar_number or "",
+            "uan_number": emp.uan_number or "",
+            "tax_regime": emp.tax_regime or "New",
+            
+            # Bank
+            "bank_name": emp.bank_name or "",
+            "account_number": emp.account_number or "",
+            "ifsc_code": emp.ifsc_code or "",
+            "account_type": emp.account_type or "Savings",
+            "upi_id": emp.upi_id or "",
+            
+            # Emergency
+            "emergency_contact_name": emp.emergency_contact_name or "",
+            "emergency_contact_phone": emp.emergency_contact_phone or ""
         })
 
 
