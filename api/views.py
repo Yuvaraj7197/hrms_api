@@ -142,6 +142,7 @@ def ensure_master_tables_exist():
             cursor.execute("CREATE TABLE IF NOT EXISTS t_leave_type (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id CHAR(32) NOT NULL, name VARCHAR(100) NOT NULL, code VARCHAR(10) DEFAULT 'CL', days_per_year INTEGER DEFAULT 12, is_paid BOOLEAN DEFAULT 1, carry_forward BOOLEAN DEFAULT 0, max_carry_forward INTEGER DEFAULT 0, FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE)")
             cursor.execute("CREATE TABLE IF NOT EXISTS t_leave_balance (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id CHAR(32) NOT NULL, employee_id INTEGER NOT NULL, leave_type_id INTEGER NOT NULL, year INTEGER DEFAULT 2026, allocated DECIMAL(5, 1) DEFAULT 0, used DECIMAL(5, 1) DEFAULT 0, carried_forward DECIMAL(5, 1) DEFAULT 0, FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE, FOREIGN KEY(employee_id) REFERENCES t_employee(id) ON DELETE CASCADE, FOREIGN KEY(leave_type_id) REFERENCES t_leave_type(id) ON DELETE CASCADE)")
             cursor.execute("CREATE TABLE IF NOT EXISTS t_leave_application (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id CHAR(32) NOT NULL, employee_id INTEGER NOT NULL, leave_type_id INTEGER NOT NULL, from_date DATE NOT NULL, to_date DATE NOT NULL, reason TEXT, status VARCHAR(20) DEFAULT 'Pending', reviewed_by_id INTEGER, reviewed_at DATETIME, created_at DATETIME NOT NULL, FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE, FOREIGN KEY(employee_id) REFERENCES t_employee(id) ON DELETE CASCADE, FOREIGN KEY(leave_type_id) REFERENCES t_leave_type(id) ON DELETE CASCADE)")
+            cursor.execute("CREATE TABLE IF NOT EXISTS t_holiday_calendar (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id CHAR(32) NOT NULL, name VARCHAR(255) NOT NULL, date DATE NOT NULL, holiday_type VARCHAR(20) DEFAULT 'National', description TEXT, FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE)")
             return
 
         # MySQL / MariaDB
@@ -314,6 +315,19 @@ def ensure_master_tables_exist():
                 CONSTRAINT t_leave_app_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
                 CONSTRAINT t_leave_app_emp_fk FOREIGN KEY (employee_id) REFERENCES t_employee(id) ON DELETE CASCADE,
                 CONSTRAINT t_leave_app_type_fk FOREIGN KEY (leave_type_id) REFERENCES t_leave_type(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_holiday_calendar (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                tenant_id CHAR(32) NOT NULL,
+                name VARCHAR(255) NOT NULL,
+                date DATE NOT NULL,
+                holiday_type VARCHAR(20) DEFAULT 'National',
+                description TEXT,
+                CONSTRAINT t_holiday_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE
             )
             """
         )
@@ -3009,6 +3023,7 @@ class HolidayCalendarView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
+        ensure_master_tables_exist()
         tenant = request.user.tenant
         year = request.query_params.get('year', str(timezone.localdate().year))
         holidays = HolidayCalendar.objects.filter(
@@ -3026,6 +3041,7 @@ class HolidayCalendarView(views.APIView):
         return Response({"holidays": data, "year": year, "total": len(data)})
 
     def post(self, request):
+        ensure_master_tables_exist()
         if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
@@ -3050,6 +3066,7 @@ class HolidayCalendarView(views.APIView):
         return Response({"message": "Holiday saved", "id": holiday.id}, status=201)
 
     def delete(self, request):
+        ensure_master_tables_exist()
         if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
