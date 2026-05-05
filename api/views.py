@@ -141,7 +141,7 @@ def ensure_master_tables_exist():
             # Leave Tables
             cursor.execute("CREATE TABLE IF NOT EXISTS t_leave_type (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id CHAR(32) NOT NULL, name VARCHAR(100) NOT NULL, code VARCHAR(10) DEFAULT 'CL', days_per_year INTEGER DEFAULT 12, is_paid BOOLEAN DEFAULT 1, carry_forward BOOLEAN DEFAULT 0, max_carry_forward INTEGER DEFAULT 0, FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE)")
             cursor.execute("CREATE TABLE IF NOT EXISTS t_leave_balance (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id CHAR(32) NOT NULL, employee_id INTEGER NOT NULL, leave_type_id INTEGER NOT NULL, year INTEGER DEFAULT 2026, allocated DECIMAL(5, 1) DEFAULT 0, used DECIMAL(5, 1) DEFAULT 0, carried_forward DECIMAL(5, 1) DEFAULT 0, FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE, FOREIGN KEY(employee_id) REFERENCES t_employee(id) ON DELETE CASCADE, FOREIGN KEY(leave_type_id) REFERENCES t_leave_type(id) ON DELETE CASCADE)")
-            cursor.execute("CREATE TABLE IF NOT EXISTS t_leave_application (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id CHAR(32) NOT NULL, employee_id INTEGER NOT NULL, leave_type_id INTEGER NOT NULL, from_date DATE NOT NULL, to_date DATE NOT NULL, reason TEXT, status VARCHAR(20) DEFAULT 'Pending', reviewed_by_id INTEGER, reviewed_at DATETIME, created_at DATETIME NOT NULL, FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE, FOREIGN KEY(employee_id) REFERENCES t_employee(id) ON DELETE CASCADE, FOREIGN KEY(leave_type_id) REFERENCES t_leave_type(id) ON DELETE CASCADE)")
+            cursor.execute("CREATE TABLE IF NOT EXISTS t_leave_application (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id CHAR(32) NOT NULL, employee_id INTEGER NOT NULL, leave_type_id INTEGER NOT NULL, from_date DATE NOT NULL, to_date DATE NOT NULL, reason TEXT, status VARCHAR(20) DEFAULT 'Pending', reviewed_by_id INTEGER, reviewed_at DATETIME, review_comment TEXT, created_at DATETIME NOT NULL, FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE, FOREIGN KEY(employee_id) REFERENCES t_employee(id) ON DELETE CASCADE, FOREIGN KEY(leave_type_id) REFERENCES t_leave_type(id) ON DELETE CASCADE)")
             cursor.execute("CREATE TABLE IF NOT EXISTS t_holiday_calendar (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id CHAR(32) NOT NULL, name VARCHAR(255) NOT NULL, date DATE NOT NULL, holiday_type VARCHAR(20) DEFAULT 'National', description TEXT, FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE)")
             cursor.execute("CREATE TABLE IF NOT EXISTS t_notification (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id CHAR(32) NOT NULL, user_id INTEGER NOT NULL, title VARCHAR(255) NOT NULL, message TEXT, notify_type VARCHAR(20) DEFAULT 'info', is_read BOOLEAN DEFAULT 0, action_url VARCHAR(255), created_at DATETIME NOT NULL, FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE, FOREIGN KEY(user_id) REFERENCES t_user(id) ON DELETE CASCADE)")
             return
@@ -312,6 +312,7 @@ def ensure_master_tables_exist():
                 status VARCHAR(20) DEFAULT 'Pending',
                 reviewed_by_id BIGINT,
                 reviewed_at DATETIME(6),
+                review_comment TEXT,
                 created_at DATETIME(6) NOT NULL,
                 CONSTRAINT t_leave_app_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
                 CONSTRAINT t_leave_app_emp_fk FOREIGN KEY (employee_id) REFERENCES t_employee(id) ON DELETE CASCADE,
@@ -319,6 +320,12 @@ def ensure_master_tables_exist():
             )
             """
         )
+
+        # ── Self-Healing Schema Updates (for existing tables) ────────────
+        try:
+            cursor.execute("SELECT review_comment FROM t_leave_application LIMIT 1")
+        except Exception:
+            cursor.execute("ALTER TABLE t_leave_application ADD COLUMN review_comment TEXT")
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS t_holiday_calendar (
@@ -2650,6 +2657,7 @@ class LeaveApproveView(views.APIView):
         app_id = request.data.get('application_id')
         emp_id = request.data.get('employee_id')
         action = request.data.get('action')  # 'approve' or 'reject'
+        comment = request.data.get('comment', '')
         
         if action not in ('approve', 'reject'):
             return Response({"error": "action must be approve or reject"}, status=400)
@@ -2675,6 +2683,7 @@ class LeaveApproveView(views.APIView):
         app.status = 'Approved' if action == 'approve' else 'Rejected'
         app.reviewed_by = request.user
         app.reviewed_at = timezone.now()
+        app.review_comment = comment
         app.save()
         
         # Sync with Attendance and Leave Balance if approved
@@ -2703,26 +2712,34 @@ class LeaveApproveView(views.APIView):
                         )
                         curr_date += timedelta(days=1)
 
-                # 2. Update Leave Balance for the requester
+                # 2. Update Leave Balance for the requester (Self-Healing)
                 year = app.from_date.year
-                balance = LeaveBalance.objects.filter(
+                balance, created = LeaveBalance.objects.get_or_create(
                     tenant_id=target_tenant_id,
                     employee_id=target_employee_id,
                     leave_type_id=app.leave_type_id,
-                    year=year
-                ).first()
+                    year=year,
+                    defaults={
+                        'allocated': app.leave_type.days_per_year,
+                        'used': 0,
+                        'carried_forward': 0
+                    }
+                )
                 
-                if balance:
-                    balance.used = float(balance.used) + app.days_count()
-                    balance.save()
+                balance.used = float(balance.used) + app.days_count()
+                balance.save()
 
         # 3. Notify Employee
         try:
+            msg = f"Your leave request from {app.from_date} to {app.to_date} has been {app.status.lower()}."
+            if comment:
+                msg += f" Note: {comment}"
+                
             Notification.objects.create(
                 tenant=app.tenant,
                 user=app.employee.user,
                 title=f"Leave Request {app.status}",
-                message=f"Your leave request from {app.from_date} to {app.to_date} has been {app.status.lower()}.",
+                message=msg,
                 notify_type='success' if app.status == 'Approved' else 'warning',
                 created_at=timezone.now()
             )
