@@ -2355,6 +2355,7 @@ class HREmployeeListView(views.APIView):
                 emergency_contact_name=payload.get('emergency_contact_name'),
                 emergency_contact_phone=payload.get('emergency_contact_phone'),
                 onboarding_status=payload.get('onboarding_status', 'Pending'),
+                onboarding_completed_at=timezone.now() if payload.get('onboarding_status') == 'Completed' else None,
                 # Statutory / Compliance fields
                 father_name=payload.get('father_name'),
                 pan_number=payload.get('pan_number'),
@@ -2459,7 +2460,13 @@ class HREmployeeDetailView(views.APIView):
         e.upi_id = p.get('upi_id', e.upi_id)
         e.emergency_contact_name = p.get('emergency_contact_name', e.emergency_contact_name)
         e.emergency_contact_phone = p.get('emergency_contact_phone', e.emergency_contact_phone)
-        e.onboarding_status = p.get('onboarding_status', e.onboarding_status)
+        
+        new_status = p.get('onboarding_status')
+        if new_status and new_status != e.onboarding_status:
+            e.onboarding_status = new_status
+            if new_status == 'Completed':
+                e.onboarding_completed_at = timezone.now()
+                
         # Statutory fields
         e.father_name = p.get('father_name', e.father_name)
         e.pan_number = p.get('pan_number', e.pan_number)
