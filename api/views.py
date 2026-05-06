@@ -390,6 +390,21 @@ def ensure_master_tables_exist():
             )
             """
         )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_master_lookup (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                tenant_id CHAR(32) NOT NULL,
+                category VARCHAR(50) NOT NULL,
+                code VARCHAR(50) NOT NULL,
+                label VARCHAR(100) NOT NULL,
+                is_active BOOLEAN DEFAULT 1,
+                sort_order INT DEFAULT 0,
+                CONSTRAINT t_lookup_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
+                UNIQUE KEY t_lookup_tenant_category_code (tenant_id, category, code)
+            )
+            """
+        )
 
 
 DEFAULT_ADMIN_ROUTE_ALLOWLIST_BY_USER_ROLE = {
@@ -4023,3 +4038,177 @@ class NotificationView(views.APIView):
         else:
             Notification.objects.filter(id=notify_id, user=request.user).update(is_read=True)
         return Response({"message": "Marked as read"})
+
+
+# ─────────────────────────────────────────────
+# MASTER LOOKUP (Dropdown Data Store)
+# ─────────────────────────────────────────────
+
+SEED_LOOKUP_DATA = {
+    'GENDER': [
+        ('Male', 'Male'), ('Female', 'Female'), ('Other', 'Other'),
+    ],
+    'BLOOD_GROUP': [
+        ('A+', 'A+'), ('A-', 'A-'), ('B+', 'B+'), ('B-', 'B-'),
+        ('O+', 'O+'), ('O-', 'O-'), ('AB+', 'AB+'), ('AB-', 'AB-'),
+    ],
+    'MARITAL_STATUS': [
+        ('Single', 'Single'), ('Married', 'Married'),
+        ('Divorced', 'Divorced'), ('Widowed', 'Widowed'),
+    ],
+    'EMPLOYEE_TYPE': [
+        ('Permanent', 'Permanent'), ('Contract', 'Contract'),
+        ('Intern', 'Intern'), ('Consultant', 'Consultant'), ('Part Time', 'Part Time'),
+    ],
+    'WORK_TYPE': [
+        ('Office', 'Office'), ('Remote', 'Remote'), ('Hybrid', 'Hybrid'),
+    ],
+    'SHIFT': [
+        ('General', 'General'), ('Morning', 'Morning'),
+        ('Afternoon', 'Afternoon'), ('Night', 'Night'),
+    ],
+    'GRADE': [
+        ('G1', 'G1'), ('G2', 'G2'), ('G3', 'G3'),
+        ('G4', 'G4'), ('G5', 'G5'), ('G6', 'G6'),
+    ],
+    'BAND': [
+        ('L1 - Entry Level', 'L1 - Entry Level'), ('L2 - Intermediate', 'L2 - Intermediate'),
+        ('L3 - Specialist', 'L3 - Specialist'), ('L4 - Lead', 'L4 - Lead'),
+        ('L5 - Manager', 'L5 - Manager'), ('L6 - Director', 'L6 - Director'),
+    ],
+    'BUSINESS_UNIT': [
+        ('Headquarters', 'Headquarters'), ('North Region', 'North Region'),
+        ('South Region', 'South Region'), ('East Region', 'East Region'), ('West Region', 'West Region'),
+    ],
+    'BANK': [
+        ('State Bank of India', 'State Bank of India'), ('HDFC Bank', 'HDFC Bank'),
+        ('ICICI Bank', 'ICICI Bank'), ('Axis Bank', 'Axis Bank'),
+        ('Kotak Mahindra Bank', 'Kotak Mahindra Bank'), ('Punjab National Bank', 'Punjab National Bank'),
+        ('Bank of Baroda', 'Bank of Baroda'), ('Canara Bank', 'Canara Bank'),
+        ('IndusInd Bank', 'IndusInd Bank'), ('Yes Bank', 'Yes Bank'),
+        ('Federal Bank', 'Federal Bank'), ('IDFC First Bank', 'IDFC First Bank'), ('Other', 'Other'),
+    ],
+    'PAYMENT_MODE': [
+        ('Bank Transfer', 'Bank Transfer'), ('Cash', 'Cash'),
+        ('Cheque', 'Cheque'), ('UPI', 'UPI'),
+    ],
+    'TAX_REGIME': [
+        ('New', 'New Tax Regime'), ('Old', 'Old Tax Regime'),
+    ],
+    'ACCOUNT_TYPE': [
+        ('Savings', 'Savings'), ('Current', 'Current'),
+    ],
+    'NATIONALITY': [
+        ('Indian', 'Indian'), ('Other', 'Other'),
+    ],
+    'EMPLOYEE_STATUS': [
+        ('Active', 'Active'), ('Inactive', 'Inactive'),
+        ('Resigned', 'Resigned'), ('Terminated', 'Terminated'),
+    ],
+}
+
+
+def seed_lookups_for_tenant(tenant_id):
+    """Insert default lookup values for a tenant if they don't already exist."""
+    with connection.cursor() as cursor:
+        for category, items in SEED_LOOKUP_DATA.items():
+            for sort_order, (code, label) in enumerate(items):
+                cursor.execute(
+                    """
+                    INSERT IGNORE INTO t_master_lookup
+                        (tenant_id, category, code, label, is_active, sort_order)
+                    VALUES (%s, %s, %s, %s, 1, %s)
+                    """,
+                    [tenant_id, category, code, label, sort_order]
+                )
+
+
+class MasterLookupView(views.APIView):
+    """
+    GET  /api/lookups/           — returns all active lookups grouped by category
+    GET  /api/lookups/?category=BANK — returns only that category
+    POST /api/lookups/           — upsert a lookup item (admin only)
+    POST /api/lookups/seed/      — seed default values for this tenant
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        ensure_master_tables_exist()
+        tenant_id = str(request.user.tenant_id)
+
+        # Auto-seed on first access if empty
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM t_master_lookup WHERE tenant_id = %s", [tenant_id]
+            )
+            count = cursor.fetchone()[0]
+        if count == 0:
+            seed_lookups_for_tenant(tenant_id)
+
+        category = request.query_params.get('category')
+        with connection.cursor() as cursor:
+            if category:
+                cursor.execute(
+                    """SELECT id, category, code, label, sort_order
+                       FROM t_master_lookup
+                       WHERE tenant_id = %s AND category = %s AND is_active = 1
+                       ORDER BY sort_order, label""",
+                    [tenant_id, category.upper()]
+                )
+            else:
+                cursor.execute(
+                    """SELECT id, category, code, label, sort_order
+                       FROM t_master_lookup
+                       WHERE tenant_id = %s AND is_active = 1
+                       ORDER BY category, sort_order, label""",
+                    [tenant_id]
+                )
+            rows = cursor.fetchall()
+
+        # Group by category
+        grouped: dict = {}
+        for row_id, cat, code, label, sort_order in rows:
+            grouped.setdefault(cat, []).append({
+                'id': row_id, 'code': code, 'label': label, 'sort_order': sort_order
+            })
+
+        if category:
+            return Response(grouped.get(category.upper(), []))
+        return Response(grouped)
+
+    def post(self, request):
+        ensure_master_tables_exist()
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+
+        action = request.data.get('action')
+        tenant_id = str(request.user.tenant_id)
+
+        if action == 'seed':
+            seed_lookups_for_tenant(tenant_id)
+            return Response({"message": "Default lookups seeded successfully"})
+
+        category = request.data.get('category', '').upper()
+        code = request.data.get('code', '').upper()
+        label = request.data.get('label', '').strip()
+        sort_order = request.data.get('sort_order', 0)
+        is_active = request.data.get('is_active', True)
+
+        if not category or not code or not label:
+            return Response({"error": "category, code and label are required"}, status=400)
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO t_master_lookup (tenant_id, category, code, label, is_active, sort_order)
+                   VALUES (%s, %s, %s, %s, %s, %s)
+                   ON DUPLICATE KEY UPDATE label = VALUES(label), is_active = VALUES(is_active),
+                   sort_order = VALUES(sort_order)""",
+                [tenant_id, category, code, label, is_active, sort_order]
+            )
+            cursor.execute(
+                "SELECT id FROM t_master_lookup WHERE tenant_id=%s AND category=%s AND code=%s",
+                [tenant_id, category, code]
+            )
+            row = cursor.fetchone()
+
+        return Response({"id": row[0], "category": category, "code": code, "label": label})

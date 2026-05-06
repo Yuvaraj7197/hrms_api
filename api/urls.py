@@ -83,4 +83,5 @@ urlpatterns = [
     path('master/industries/',       views.MasterIndustryView.as_view(),         name='master_industries'),
     path('master/departments/',      views.MasterDepartmentView.as_view(),       name='master_departments'),
     path('master/roles/',            views.MasterRoleView.as_view(),             name='master_roles'),
+    path('lookups/',                 views.MasterLookupView.as_view(),           name='master_lookups'),
 ]
