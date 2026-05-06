@@ -53,7 +53,7 @@ class RoleSerializer(serializers.ModelSerializer):
 class EmployeeDocumentSerializer(serializers.ModelSerializer):
     class Meta:
         model = EmployeeDocument
-        fields = ['id', 'document_type', 'file_url', 'uploaded_at']
+        fields = ['id', 'document_type', 'file', 'uploaded_at', 'is_verified']
 
 class EmployeeSerializer(serializers.ModelSerializer):
     documents = EmployeeDocumentSerializer(many=True, read_only=True)
@@ -98,6 +98,9 @@ class EmployeeSerializer(serializers.ModelSerializer):
 
             # Documents
             'documents',
+
+            # Extended Profile
+            'extended_profile',
         ]
 
     def validate_department(self, value):

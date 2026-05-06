@@ -24,6 +24,7 @@ urlpatterns = [
     # ── HR — Employee Management ───────────────────────
     path('employees/',               views.HREmployeeListView.as_view(),          name='hr_employees'),
     path('employees/<int:employee_id>/', views.HREmployeeDetailView.as_view(),    name='hr_employee_detail'),
+    path('employees/<int:employee_id>/upload/', views.EmployeeDocumentUploadView.as_view(), name='employee_document_upload'),
 
     # ── Attendance ──────────────────────────────────────
     path('attendance/data/',         views.AttendanceDataView.as_view(),          name='attendance_data'),

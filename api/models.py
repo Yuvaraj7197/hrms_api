@@ -212,6 +212,9 @@ class Employee(TenantScopedModel):
     last_invite_sent_at = models.DateTimeField(null=True, blank=True)
     onboarding_completed_at = models.DateTimeField(null=True, blank=True)
 
+    # Enterprise Extensions (Dynamic)
+    extended_profile = models.JSONField(default=dict, blank=True)
+
     def generate_invite_token(self):
         import secrets
         self.invite_token = secrets.token_urlsafe(32)
@@ -231,6 +234,19 @@ class Employee(TenantScopedModel):
 
     def __str__(self):
         return f"{self.name} - {self.employee_code}"
+
+class EmployeeDocument(TenantScopedModel):
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='documents')
+    document_type = models.CharField(max_length=50) # e.g. Photo, Resume, Aadhaar, PAN
+    file = models.FileField(upload_to='employee_documents/')
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+    is_verified = models.BooleanField(default=False)
+
+    class Meta:
+        db_table = "t_employee_document"
+
+    def __str__(self):
+        return f"{self.employee.name} - {self.document_type}"
 
 class AttendanceStatus(models.Model):
     code = models.CharField(max_length=10, unique=True) # P, L, A, LV, WFH, etc.
@@ -430,14 +446,7 @@ class LeaveApplication(TenantScopedModel):
     def days_count(self):
         return (self.to_date - self.from_date).days + 1
 
-class EmployeeDocument(TenantScopedModel):
-    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='documents')
-    document_type = models.CharField(max_length=50) # Aadhar, PAN, Resume, Certificate
-    file_url = models.TextField() # In real app, use FileField
-    uploaded_at = models.DateTimeField(auto_now_add=True)
 
-    class Meta:
-        db_table = "t_employee_document"
 
 # ── Master Data (Global / Not Tenant Scoped) ──────────────────────────────────
 

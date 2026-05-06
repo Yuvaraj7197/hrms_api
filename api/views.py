@@ -144,6 +144,12 @@ def ensure_master_tables_exist():
             cursor.execute("CREATE TABLE IF NOT EXISTS t_leave_application (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id CHAR(32) NOT NULL, employee_id INTEGER NOT NULL, leave_type_id INTEGER NOT NULL, from_date DATE NOT NULL, to_date DATE NOT NULL, reason TEXT, status VARCHAR(20) DEFAULT 'Pending', reviewed_by_id INTEGER, reviewed_at DATETIME, review_comment TEXT, created_at DATETIME NOT NULL, FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE, FOREIGN KEY(employee_id) REFERENCES t_employee(id) ON DELETE CASCADE, FOREIGN KEY(leave_type_id) REFERENCES t_leave_type(id) ON DELETE CASCADE)")
             cursor.execute("CREATE TABLE IF NOT EXISTS t_holiday_calendar (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id CHAR(32) NOT NULL, name VARCHAR(255) NOT NULL, date DATE NOT NULL, holiday_type VARCHAR(20) DEFAULT 'National', description TEXT, FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE)")
             cursor.execute("CREATE TABLE IF NOT EXISTS t_notification (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id CHAR(32) NOT NULL, user_id INTEGER NOT NULL, title VARCHAR(255) NOT NULL, message TEXT, notify_type VARCHAR(20) DEFAULT 'info', is_read BOOLEAN DEFAULT 0, action_url VARCHAR(255), created_at DATETIME NOT NULL, FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE, FOREIGN KEY(user_id) REFERENCES t_user(id) ON DELETE CASCADE)")
+            
+            try:
+                cursor.execute("SELECT extended_profile FROM t_employee LIMIT 1")
+            except Exception:
+                cursor.execute("ALTER TABLE t_employee ADD COLUMN extended_profile TEXT DEFAULT '{}'")
+
             return
 
         # MySQL / MariaDB
@@ -189,7 +195,7 @@ def ensure_master_tables_exist():
                 tenant_id CHAR(32) NOT NULL,
                 employee_id BIGINT NOT NULL,
                 document_type VARCHAR(50) NOT NULL,
-                file_url TEXT NOT NULL,
+                file_url TEXT NULL,
                 uploaded_at DATETIME(6) NOT NULL,
                 CONSTRAINT t_emp_doc_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
                 CONSTRAINT t_emp_doc_emp_fk FOREIGN KEY (employee_id) REFERENCES t_employee(id) ON DELETE CASCADE
@@ -326,6 +332,28 @@ def ensure_master_tables_exist():
             cursor.execute("SELECT review_comment FROM t_leave_application LIMIT 1")
         except Exception:
             cursor.execute("ALTER TABLE t_leave_application ADD COLUMN review_comment TEXT")
+            
+        try:
+            cursor.execute("SELECT extended_profile FROM t_employee LIMIT 1")
+        except Exception:
+            cursor.execute("ALTER TABLE t_employee ADD COLUMN extended_profile JSON")
+            
+        try:
+            cursor.execute("SELECT file FROM t_employee_document LIMIT 1")
+        except Exception:
+            cursor.execute("ALTER TABLE t_employee_document ADD COLUMN file VARCHAR(255)")
+
+        try:
+            cursor.execute("SELECT is_verified FROM t_employee_document LIMIT 1")
+        except Exception:
+            cursor.execute("ALTER TABLE t_employee_document ADD COLUMN is_verified BOOLEAN DEFAULT 0")
+
+        # Make file_url nullable since it was replaced by file
+        try:
+            cursor.execute("ALTER TABLE t_employee_document MODIFY COLUMN file_url TEXT NULL")
+        except Exception:
+            pass
+
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS t_holiday_calendar (
@@ -1238,13 +1266,29 @@ class OnboardingEmployeeCreateView(views.APIView):
             tenant=tenant,
             name=payload.get('name'),
             email=payload.get('email'),
-            # phone=payload.get('phone') or '',
+            phone=payload.get('phone') or '',
             employee_code=payload.get('employeeCode') or payload.get('employee_code'),
             department=department,
             designation=role,
             reporting_to=manager,
             status=payload.get('status') or 'Active',
-            joining_date=payload.get('joiningDate') or payload.get('joining_date') or None
+            joining_date=payload.get('joiningDate') or payload.get('joining_date') or None,
+            dob=payload.get('dob') or None,
+            gender=payload.get('gender') or '',
+            address=payload.get('address') or '',
+            bank_name=payload.get('bank_name') or '',
+            account_number=payload.get('account_number') or '',
+            ifsc_code=payload.get('ifsc_code') or '',
+            emergency_contact_name=payload.get('emergency_contact_name') or '',
+            emergency_contact_phone=payload.get('emergency_contact_phone') or '',
+            pan_number=payload.get('pan_number') or '',
+            aadhar_number=payload.get('aadhar_number') or '',
+            uan_number=payload.get('uan_number') or '',
+            tax_regime=payload.get('tax_regime') or 'New',
+            pf_applicable=payload.get('pf_applicable', True),
+            esi_applicable=payload.get('esi_applicable', False),
+            base_salary=payload.get('base_salary') or 0,
+            extended_profile=payload.get('extended_profile', {})
         )
 
         return Response({
@@ -1273,19 +1317,34 @@ class OnboardingEmployeeDetailView(views.APIView):
 
         employee.name = payload.get('name', employee.name)
         employee.email = payload.get('email', employee.email)
+        employee.phone = payload.get('phone', employee.phone)
         employee.employee_code = payload.get('employeeCode') or payload.get('employee_code') or employee.employee_code
         employee.status = payload.get('status', employee.status)
         employee.joining_date = payload.get('joiningDate') or payload.get('joining_date') or employee.joining_date
+        
         # Onboarding fields – optional updates
-        employee.dob = payload.get('dob') or employee.dob
-        employee.gender = payload.get('gender') or employee.gender
-        employee.address = payload.get('address') or employee.address
-        employee.bank_name = payload.get('bank_name') or employee.bank_name
-        employee.account_number = payload.get('account_number') or employee.account_number
-        employee.ifsc_code = payload.get('ifsc_code') or employee.ifsc_code
-        employee.emergency_contact_name = payload.get('emergency_contact_name') or employee.emergency_contact_name
-        employee.emergency_contact_phone = payload.get('emergency_contact_phone') or employee.emergency_contact_phone
-        employee.onboarding_status = payload.get('onboarding_status') or employee.onboarding_status
+        employee.dob = payload.get('dob', employee.dob)
+        employee.gender = payload.get('gender', employee.gender)
+        employee.address = payload.get('address', employee.address)
+        employee.bank_name = payload.get('bank_name', employee.bank_name)
+        employee.account_number = payload.get('account_number', employee.account_number)
+        employee.ifsc_code = payload.get('ifsc_code', employee.ifsc_code)
+        employee.emergency_contact_name = payload.get('emergency_contact_name', employee.emergency_contact_name)
+        employee.emergency_contact_phone = payload.get('emergency_contact_phone', employee.emergency_contact_phone)
+        employee.onboarding_status = payload.get('onboarding_status', employee.onboarding_status)
+        employee.pan_number = payload.get('pan_number', employee.pan_number)
+        employee.aadhar_number = payload.get('aadhar_number', employee.aadhar_number)
+        employee.uan_number = payload.get('uan_number', employee.uan_number)
+        employee.tax_regime = payload.get('tax_regime', employee.tax_regime)
+        employee.pf_applicable = payload.get('pf_applicable', employee.pf_applicable)
+        employee.esi_applicable = payload.get('esi_applicable', employee.esi_applicable)
+        employee.base_salary = payload.get('base_salary', employee.base_salary)
+        
+        # Extended Profile Update
+        if 'extended_profile' in payload:
+            if not isinstance(employee.extended_profile, dict):
+                employee.extended_profile = {}
+            employee.extended_profile.update(payload.get('extended_profile', {}))
 
         # Update FK relationships only when IDs are present in the request
         employee.department = get_related(Department, payload.get('departmentId') or payload.get('department_id'))
@@ -1306,6 +1365,38 @@ class OnboardingEmployeeDetailView(views.APIView):
     def patch(self, request, employee_id):
         """Partial update – delegate to the PUT logic for consistency."""
         return self.put(request, employee_id)
+
+class EmployeeDocumentUploadView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, employee_id):
+        tenant = request.user.tenant
+        employee = Employee.objects.filter(tenant=tenant, id=employee_id).first()
+        if not employee:
+            return Response({"error": "Employee not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        uploaded_file = request.FILES.get('file')
+        document_type = request.data.get('document_type')
+
+        if not uploaded_file or not document_type:
+            return Response({"error": "File and document_type are required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Basic validation
+        if uploaded_file.size > 5 * 1024 * 1024: # 5MB limit
+            return Response({"error": "File size exceeds 5MB"}, status=status.HTTP_400_BAD_REQUEST)
+
+        doc = EmployeeDocument.objects.create(
+            tenant=tenant,
+            employee=employee,
+            document_type=document_type,
+            file=uploaded_file
+        )
+
+        return Response({
+            "message": f"{document_type} uploaded successfully",
+            "document_id": doc.id,
+            "url": request.build_absolute_uri(doc.file.url) if doc.file else None
+        }, status=status.HTTP_201_CREATED)
 
 class AttendanceDataView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -2221,7 +2312,7 @@ class HREmployeeListView(views.APIView):
             except Exception:
                 qs = qs.none()
         
-        serializer = EmployeeSerializer(qs, many=True)
+        serializer = EmployeeSerializer(qs, many=True, context={'request': request})
         return Response({"employees": serializer.data, "total": qs.count()})
 
     def post(self, request):
@@ -2251,7 +2342,7 @@ class HREmployeeListView(views.APIView):
                 joining_date=payload.get('joining_date') or None,
                 status=payload.get('status', 'Active'),
                 base_salary=payload.get('base_salary', 0),
-                dob=payload.get('dob'),
+                dob=payload.get('dob') or None,
                 gender=payload.get('gender'),
                 address=payload.get('address'),
                 current_address=payload.get('current_address') or payload.get('address'),
@@ -2275,6 +2366,7 @@ class HREmployeeListView(views.APIView):
                 marital_status=payload.get('marital_status'),
                 blood_group=payload.get('blood_group'),
                 nationality=payload.get('nationality', 'Indian'),
+                extended_profile=payload.get('extended_profile', {}),
             )
 
             # Create login account if requested
@@ -2333,7 +2425,7 @@ class HREmployeeDetailView(views.APIView):
         except Employee.DoesNotExist:
             return Response({"error": "Employee not found"}, status=404)
         
-        serializer = EmployeeSerializer(e)
+        serializer = EmployeeSerializer(e, context={'request': request})
         return Response(serializer.data)
 
     def put(self, request, employee_id):
@@ -2350,8 +2442,12 @@ class HREmployeeDetailView(views.APIView):
         e.email = p.get('email', e.email)
         e.phone = p.get('phone', e.phone)
         e.status = p.get('status', e.status)
-        e.joining_date = p.get('joining_date', e.joining_date)
-        e.dob = p.get('dob', e.dob)
+        
+        if 'joining_date' in p:
+            e.joining_date = p['joining_date'] or None
+        if 'dob' in p:
+            e.dob = p['dob'] or None
+            
         e.gender = p.get('gender', e.gender)
         e.address = p.get('address', e.address)
         e.current_address = p.get('current_address', e.current_address)
@@ -2375,6 +2471,11 @@ class HREmployeeDetailView(views.APIView):
         e.marital_status = p.get('marital_status', e.marital_status)
         e.blood_group = p.get('blood_group', e.blood_group)
         e.nationality = p.get('nationality', e.nationality)
+
+        if 'extended_profile' in p:
+            if not isinstance(e.extended_profile, dict):
+                e.extended_profile = {}
+            e.extended_profile.update(p['extended_profile'])
 
         if 'base_salary' in p:
             e.base_salary = p['base_salary']
@@ -2964,7 +3065,7 @@ class EmployeeOnboardingPublicView(views.APIView):
             if employee.onboarding_status == 'Completed':
                 return Response({"error": "Onboarding already completed"}, status=400)
             
-            serializer = EmployeeSerializer(employee)
+            serializer = EmployeeSerializer(employee, context={'request': request})
             return Response(serializer.data)
         except Employee.DoesNotExist:
             return Response({"error": "Invalid token"}, status=404)
