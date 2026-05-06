@@ -5,6 +5,7 @@ urlpatterns = [
     # ── Auth ──────────────────────────────────────────
     path('register/',        views.RegisterView.as_view(),  name='register'),
     path('verify-otp/',      views.VerifyOTPView.as_view(), name='verify_otp'),
+    path('resend-otp/',      views.ResendOTPView.as_view(), name='resend_otp'),
     path('login/',           views.LoginView.as_view(),     name='login'),
     path('ess/login/',       views.ESSLoginView.as_view(),  name='ess_login'),
 

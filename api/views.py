@@ -615,8 +615,19 @@ class RegisterView(views.APIView):
             otp_code = str(random.randint(100000, 999999))
             OTP.objects.create(user=user, code=otp_code)
 
-            # In a real app, send email here
+            # Send OTP via Email
             print(f"OTP for {email}: {otp_code}")
+            try:
+                from django.conf import settings
+                send_mail(
+                    subject='Verify Your HRMS Account',
+                    message=f'Hello,\n\nYour 6-digit verification code is: {otp_code}\n\nThis code will expire in 10 minutes.\n\nRegards,\nHRMS Team',
+                    from_email=settings.DEFAULT_FROM_EMAIL,
+                    recipient_list=[email],
+                    fail_silently=False,
+                )
+            except Exception as e:
+                print(f"Failed to send OTP email: {e}")
 
             return Response({
                 "message": "Registration successful. Please verify OTP.",
@@ -638,10 +649,10 @@ class VerifyOTPView(views.APIView):
             try:
                 user = User.objects.get(email=email)
                 otp = OTP.objects.filter(user=user, code=code, is_used=False).latest('created_at')
-
+                
                 if otp.is_expired():
                     return Response({"error": "OTP expired"}, status=status.HTTP_400_BAD_REQUEST)
-
+                
                 user.is_verified = True
                 user.save()
                 
@@ -682,6 +693,37 @@ class VerifyOTPView(views.APIView):
         
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+
+class ResendOTPView(views.APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        email = request.data.get('email')
+        if not email:
+            return Response({"error": "Email is required"}, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            user = User.objects.get(email=email)
+            otp_code = str(random.randint(100000, 999999))
+            OTP.objects.create(user=user, code=otp_code)
+            
+            # Send OTP via Email
+            try:
+                from django.conf import settings
+                from django.core.mail import send_mail
+                send_mail(
+                    subject='Verify Your HRMS Account',
+                    message=f'Hello,\n\nYour new 6-digit verification code is: {otp_code}\n\nThis code will expire in 10 minutes.\n\nRegards,\nHRMS Team',
+                    from_email=settings.DEFAULT_FROM_EMAIL,
+                    recipient_list=[email],
+                    fail_silently=False,
+                )
+            except Exception as e:
+                print(f"Failed to resend OTP email: {e}")
+                
+            return Response({"message": "OTP resent successfully"})
+        except User.DoesNotExist:
+            return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
 
 def seed_tenant_defaults(tenant):
     """
