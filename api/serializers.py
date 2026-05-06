@@ -66,6 +66,8 @@ class EmployeeSerializer(serializers.ModelSerializer):
     salary_structure_name = serializers.CharField(source='salary_structure.structure.name', read_only=True, default='')
     salary_structure_id = serializers.IntegerField(source='salary_structure.structure.id', read_only=True, default=None)
     reporting_to_code = serializers.CharField(source='reporting_to.employee_code', read_only=True, default='')
+    reporting_hr_name = serializers.CharField(source='reporting_hr.name',     read_only=True, default='')
+    reporting_hr_code = serializers.CharField(source='reporting_hr.employee_code', read_only=True, default='')
 
     class Meta:
         model = Employee
@@ -78,6 +80,7 @@ class EmployeeSerializer(serializers.ModelSerializer):
             'designation', 'designation_name',
             'user_role',
             'reporting_to', 'reporting_to_name', 'reporting_to_code',
+            'reporting_hr', 'reporting_hr_name', 'reporting_hr_code',
             'joining_date', 'status', 'base_salary',
             'salary_structure_name', 'salary_structure_id',
 

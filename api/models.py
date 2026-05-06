@@ -172,6 +172,7 @@ class Employee(TenantScopedModel):
     department = models.ForeignKey(Department, on_delete=models.SET_NULL, null=True, related_name='employees')
     designation = models.ForeignKey(Role, on_delete=models.SET_NULL, null=True, related_name='employees')
     reporting_to = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='subordinates')
+    reporting_hr = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='hr_subordinates')
     joining_date = models.DateField(null=True, blank=True)
     status = models.CharField(max_length=50, default='Active')
     base_salary = models.DecimalField(max_digits=12, decimal_places=2, default=0)

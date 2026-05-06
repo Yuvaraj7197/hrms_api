@@ -337,6 +337,12 @@ def ensure_master_tables_exist():
             cursor.execute("SELECT extended_profile FROM t_employee LIMIT 1")
         except Exception:
             cursor.execute("ALTER TABLE t_employee ADD COLUMN extended_profile JSON")
+
+        try:
+            cursor.execute("SELECT reporting_hr_id FROM t_employee LIMIT 1")
+        except Exception:
+            cursor.execute("ALTER TABLE t_employee ADD COLUMN reporting_hr_id BIGINT NULL")
+            cursor.execute("ALTER TABLE t_employee ADD CONSTRAINT t_employee_hr_fk FOREIGN KEY (reporting_hr_id) REFERENCES t_employee(id) ON DELETE SET NULL")
             
         try:
             cursor.execute("SELECT file FROM t_employee_document LIMIT 1")
@@ -2328,6 +2334,7 @@ class HREmployeeListView(views.APIView):
         dept = Department.objects.filter(tenant=tenant, id=safe_int(payload.get('department_id'))).first()
         role = Role.objects.filter(tenant=tenant, id=safe_int(payload.get('designation_id'))).first()
         manager = Employee.objects.filter(tenant=tenant, id=safe_int(payload.get('reporting_to_id'))).first()
+        hr_manager = Employee.objects.filter(tenant=tenant, id=safe_int(payload.get('reporting_hr_id'))).first()
 
         with transaction.atomic():
             employee = Employee.objects.create(
@@ -2339,6 +2346,7 @@ class HREmployeeListView(views.APIView):
                 department=dept,
                 designation=role,
                 reporting_to=manager,
+                reporting_hr=hr_manager,
                 joining_date=payload.get('joining_date') or None,
                 status=payload.get('status', 'Active'),
                 base_salary=payload.get('base_salary', 0),
@@ -2492,6 +2500,8 @@ class HREmployeeDetailView(views.APIView):
             e.designation = Role.objects.filter(tenant=tenant, id=safe_int(p['designation_id'])).first()
         if p.get('reporting_to_id'):
             e.reporting_to = Employee.objects.filter(tenant=tenant, id=safe_int(p['reporting_to_id'])).first()
+        if p.get('reporting_hr_id'):
+            e.reporting_hr = Employee.objects.filter(tenant=tenant, id=safe_int(p['reporting_hr_id'])).first()
         e.save()
 
         # Optional: update linked login role designation (t_user.role FK -> t_role)
