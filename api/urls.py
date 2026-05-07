@@ -26,6 +26,16 @@ urlpatterns = [
     path('employees/<int:employee_id>/', views.HREmployeeDetailView.as_view(),    name='hr_employee_detail'),
     path('employees/<int:employee_id>/upload/', views.EmployeeDocumentUploadView.as_view(), name='employee_document_upload'),
     path('employees/<int:employee_id>/documents/<int:document_id>/verify/', views.EmployeeDocumentVerifyView.as_view(), name='employee_document_verify'),
+    path('employees/<int:employee_id>/lifecycle/', views.EmployeeLifecycleView.as_view(), name='employee_lifecycle'),
+    path('employees/<int:employee_id>/transfer/', views.EmployeeTransferView.as_view(), name='employee_transfer'),
+    path('employees/<int:employee_id>/salary-revision/', views.EmployeeSalaryRevisionView.as_view(), name='employee_salary_revision'),
+    path('employees/<int:employee_id>/exit/', views.EmployeeExitView.as_view(), name='employee_exit'),
+    path('employees/<int:employee_id>/reinstate/', views.EmployeeReinstateView.as_view(), name='employee_reinstate'),
+
+    # ── HR Lifecycle (tenant-wide reporting) ──────────────────────────────
+    path('lifecycle/transfers/', views.LifecycleTransfersListView.as_view(), name='lifecycle_transfers'),
+    path('lifecycle/salary-revisions/', views.LifecycleSalaryRevisionsListView.as_view(), name='lifecycle_salary_revisions'),
+    path('lifecycle/exits/', views.LifecycleExitsListView.as_view(), name='lifecycle_exits'),
 
     # ── Attendance ──────────────────────────────────────
     path('attendance/data/',         views.AttendanceDataView.as_view(),          name='attendance_data'),

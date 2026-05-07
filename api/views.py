@@ -303,6 +303,182 @@ def ensure_master_tables_exist():
         )
 
 
+def ensure_hr_lifecycle_tables_exist():
+    """
+    Create employee lifecycle workflow tables if missing.
+    - transfer / promotion movements
+    - salary revision history
+    - exit/termination records
+    - generic lifecycle event audit trail
+    """
+    vendor = getattr(connection, "vendor", "")
+    with connection.cursor() as cursor:
+        if vendor == "sqlite":
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS t_employee_lifecycle_event (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id CHAR(32) NOT NULL,
+                    employee_id INTEGER NOT NULL,
+                    event_type VARCHAR(50) NOT NULL,
+                    effective_from DATE,
+                    meta TEXT,
+                    created_by_id INTEGER,
+                    created_at DATETIME NOT NULL,
+                    FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
+                    FOREIGN KEY(employee_id) REFERENCES t_employee(id) ON DELETE CASCADE,
+                    FOREIGN KEY(created_by_id) REFERENCES t_user(id) ON DELETE SET NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS t_employee_transfer (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id CHAR(32) NOT NULL,
+                    employee_id INTEGER NOT NULL,
+                    from_department_id INTEGER,
+                    to_department_id INTEGER,
+                    from_designation_id INTEGER,
+                    to_designation_id INTEGER,
+                    from_manager_id INTEGER,
+                    to_manager_id INTEGER,
+                    effective_from DATE NOT NULL,
+                    reason TEXT,
+                    status VARCHAR(20) DEFAULT 'Approved',
+                    created_by_id INTEGER,
+                    created_at DATETIME NOT NULL,
+                    FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
+                    FOREIGN KEY(employee_id) REFERENCES t_employee(id) ON DELETE CASCADE
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS t_employee_salary_revision (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id CHAR(32) NOT NULL,
+                    employee_id INTEGER NOT NULL,
+                    old_ctc DECIMAL(12,2) DEFAULT 0,
+                    new_ctc DECIMAL(12,2) DEFAULT 0,
+                    old_base_salary DECIMAL(12,2) DEFAULT 0,
+                    new_base_salary DECIMAL(12,2) DEFAULT 0,
+                    effective_from DATE NOT NULL,
+                    reason TEXT,
+                    status VARCHAR(20) DEFAULT 'Approved',
+                    created_by_id INTEGER,
+                    created_at DATETIME NOT NULL,
+                    FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
+                    FOREIGN KEY(employee_id) REFERENCES t_employee(id) ON DELETE CASCADE
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS t_employee_exit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id CHAR(32) NOT NULL,
+                    employee_id INTEGER NOT NULL,
+                    exit_type VARCHAR(30) DEFAULT 'Termination',
+                    last_working_day DATE,
+                    resignation_date DATE,
+                    reason TEXT,
+                    status VARCHAR(20) DEFAULT 'Open',
+                    settlement_status VARCHAR(20) DEFAULT 'Pending',
+                    created_by_id INTEGER,
+                    created_at DATETIME NOT NULL,
+                    FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
+                    FOREIGN KEY(employee_id) REFERENCES t_employee(id) ON DELETE CASCADE
+                )
+                """
+            )
+            return
+
+        # MySQL / MariaDB
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_employee_lifecycle_event (
+                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                tenant_id CHAR(32) NOT NULL,
+                employee_id BIGINT NOT NULL,
+                event_type VARCHAR(50) NOT NULL,
+                effective_from DATE NULL,
+                meta JSON NULL,
+                created_by_id BIGINT NULL,
+                created_at DATETIME(6) NOT NULL,
+                INDEX t_emp_event_tenant_emp_idx (tenant_id, employee_id),
+                CONSTRAINT t_emp_event_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
+                CONSTRAINT t_emp_event_emp_fk FOREIGN KEY (employee_id) REFERENCES t_employee(id) ON DELETE CASCADE,
+                CONSTRAINT t_emp_event_user_fk FOREIGN KEY (created_by_id) REFERENCES t_user(id) ON DELETE SET NULL
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_employee_transfer (
+                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                tenant_id CHAR(32) NOT NULL,
+                employee_id BIGINT NOT NULL,
+                from_department_id BIGINT NULL,
+                to_department_id BIGINT NULL,
+                from_designation_id BIGINT NULL,
+                to_designation_id BIGINT NULL,
+                from_manager_id BIGINT NULL,
+                to_manager_id BIGINT NULL,
+                effective_from DATE NOT NULL,
+                reason TEXT NULL,
+                status VARCHAR(20) DEFAULT 'Approved',
+                created_by_id BIGINT NULL,
+                created_at DATETIME(6) NOT NULL,
+                INDEX t_emp_transfer_tenant_emp_idx (tenant_id, employee_id),
+                CONSTRAINT t_emp_transfer_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
+                CONSTRAINT t_emp_transfer_emp_fk FOREIGN KEY (employee_id) REFERENCES t_employee(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_employee_salary_revision (
+                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                tenant_id CHAR(32) NOT NULL,
+                employee_id BIGINT NOT NULL,
+                old_ctc DECIMAL(12,2) DEFAULT 0,
+                new_ctc DECIMAL(12,2) DEFAULT 0,
+                old_base_salary DECIMAL(12,2) DEFAULT 0,
+                new_base_salary DECIMAL(12,2) DEFAULT 0,
+                effective_from DATE NOT NULL,
+                reason TEXT NULL,
+                status VARCHAR(20) DEFAULT 'Approved',
+                created_by_id BIGINT NULL,
+                created_at DATETIME(6) NOT NULL,
+                INDEX t_emp_salrev_tenant_emp_idx (tenant_id, employee_id),
+                CONSTRAINT t_emp_salrev_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
+                CONSTRAINT t_emp_salrev_emp_fk FOREIGN KEY (employee_id) REFERENCES t_employee(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_employee_exit (
+                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                tenant_id CHAR(32) NOT NULL,
+                employee_id BIGINT NOT NULL,
+                exit_type VARCHAR(30) DEFAULT 'Termination',
+                last_working_day DATE NULL,
+                resignation_date DATE NULL,
+                reason TEXT NULL,
+                status VARCHAR(20) DEFAULT 'Open',
+                settlement_status VARCHAR(20) DEFAULT 'Pending',
+                created_by_id BIGINT NULL,
+                created_at DATETIME(6) NOT NULL,
+                INDEX t_emp_exit_tenant_emp_idx (tenant_id, employee_id),
+                CONSTRAINT t_emp_exit_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
+                CONSTRAINT t_emp_exit_emp_fk FOREIGN KEY (employee_id) REFERENCES t_employee(id) ON DELETE CASCADE
+            )
+            """
+        )
+
+
 def ensure_payroll_workflow_tables_exist():
     """
     Creates payroll workflow tables if missing (to keep environments working even
@@ -3534,6 +3710,7 @@ class HREmployeeDetailView(views.APIView):
 
     def get(self, request, employee_id):
         ensure_master_tables_exist()
+        ensure_hr_lifecycle_tables_exist()
         if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
@@ -3546,6 +3723,7 @@ class HREmployeeDetailView(views.APIView):
         return Response(serializer.data)
 
     def put(self, request, employee_id):
+        ensure_hr_lifecycle_tables_exist()
         if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
@@ -3648,11 +3826,456 @@ class HREmployeeDetailView(views.APIView):
         return Response({"message": "Employee updated"})
 
     def delete(self, request, employee_id):
+        ensure_hr_lifecycle_tables_exist()
         if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         Employee.objects.filter(tenant=tenant, id=employee_id).update(status='Terminated')
         return Response({"message": "Employee deactivated"})
+
+
+class EmployeeLifecycleView(views.APIView):
+    """HR/Admin: fetch employee lifecycle timeline (transfer/salary/exit events)."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, employee_id):
+        ensure_hr_lifecycle_tables_exist()
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
+            return Response({"error": "Permission denied"}, status=403)
+        tenant = request.user.tenant
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, event_type, effective_from, meta, created_at
+                FROM t_employee_lifecycle_event
+                WHERE tenant_id = %s AND employee_id = %s
+                ORDER BY created_at DESC
+                LIMIT 200
+                """,
+                [tenant.id, employee_id],
+            )
+            rows = cursor.fetchall()
+        events = []
+        for r in rows:
+            events.append({
+                "id": r[0],
+                "event_type": r[1],
+                "effective_from": str(r[2]) if r[2] else None,
+                "meta": r[3],
+                "created_at": str(r[4]) if r[4] else None,
+            })
+        return Response({"events": events})
+
+
+def _insert_lifecycle_event(tenant_id, employee_id, event_type, effective_from, meta, created_by_id):
+    with connection.cursor() as cursor:
+        vendor = getattr(connection, "vendor", "")
+        if vendor == "sqlite":
+            cursor.execute(
+                "INSERT INTO t_employee_lifecycle_event (tenant_id, employee_id, event_type, effective_from, meta, created_by_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [tenant_id, employee_id, event_type, effective_from, json.dumps(meta or {}), created_by_id, timezone.now()],
+            )
+        else:
+            cursor.execute(
+                "INSERT INTO t_employee_lifecycle_event (tenant_id, employee_id, event_type, effective_from, meta, created_by_id, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                [tenant_id, employee_id, event_type, effective_from, json.dumps(meta or {}), created_by_id, timezone.now()],
+            )
+
+
+class EmployeeTransferView(views.APIView):
+    """HR/Admin: transfer/promotion with effective date (writes audit event)."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, employee_id):
+        ensure_hr_lifecycle_tables_exist()
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+        tenant = request.user.tenant
+        e = Employee.objects.filter(tenant=tenant, id=employee_id).first()
+        if not e:
+            return Response({"error": "Employee not found"}, status=404)
+
+        p = request.data or {}
+        effective_from = p.get('effective_from') or timezone.localdate()
+        reason = p.get('reason') or ''
+
+        from_dept = e.department_id
+        from_desg = e.designation_id
+        from_mgr = e.reporting_to_id
+
+        to_dept = safe_int(p.get('to_department_id')) if p.get('to_department_id') else from_dept
+        to_desg = safe_int(p.get('to_designation_id')) if p.get('to_designation_id') else from_desg
+        to_mgr = safe_int(p.get('to_manager_id')) if p.get('to_manager_id') else from_mgr
+
+        if to_dept:
+            e.department = Department.objects.filter(tenant=tenant, id=to_dept).first()
+        if to_desg:
+            e.designation = Role.objects.filter(tenant=tenant, id=to_desg).first()
+        if to_mgr:
+            e.reporting_to = Employee.objects.filter(tenant=tenant, id=to_mgr).first()
+        e.save()
+
+        with connection.cursor() as cursor:
+            vendor = getattr(connection, "vendor", "")
+            if vendor == "sqlite":
+                cursor.execute(
+                    """
+                    INSERT INTO t_employee_transfer
+                    (tenant_id, employee_id, from_department_id, to_department_id, from_designation_id, to_designation_id, from_manager_id, to_manager_id, effective_from, reason, status, created_by_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Approved', ?, ?)
+                    """,
+                    [tenant.id, employee_id, from_dept, to_dept, from_desg, to_desg, from_mgr, to_mgr, effective_from, reason, request.user.id, timezone.now()],
+                )
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO t_employee_transfer
+                    (tenant_id, employee_id, from_department_id, to_department_id, from_designation_id, to_designation_id, from_manager_id, to_manager_id, effective_from, reason, status, created_by_id, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Approved', %s, %s)
+                    """,
+                    [tenant.id, employee_id, from_dept, to_dept, from_desg, to_desg, from_mgr, to_mgr, effective_from, reason, request.user.id, timezone.now()],
+                )
+
+        _insert_lifecycle_event(
+            tenant.id, employee_id, "TRANSFER", effective_from,
+            {"from_department_id": from_dept, "to_department_id": to_dept, "from_designation_id": from_desg, "to_designation_id": to_desg, "from_manager_id": from_mgr, "to_manager_id": to_mgr, "reason": reason},
+            request.user.id
+        )
+        return Response({"message": "Employee transfer saved"})
+
+
+class EmployeeSalaryRevisionView(views.APIView):
+    """HR/Admin: salary revision with effective date + reason (writes audit event)."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, employee_id):
+        ensure_hr_lifecycle_tables_exist()
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+        tenant = request.user.tenant
+        e = Employee.objects.filter(tenant=tenant, id=employee_id).first()
+        if not e:
+            return Response({"error": "Employee not found"}, status=404)
+
+        p = request.data or {}
+        effective_from = p.get('effective_from') or timezone.localdate()
+        reason = p.get('reason') or ''
+
+        old_base = Decimal(e.base_salary or 0)
+        new_base = Decimal(str(p.get('new_base_salary') or old_base))
+        ext = e.extended_profile or {}
+        old_ctc = Decimal(str(ext.get('ctc', 0) or 0))
+        new_ctc = Decimal(str(p.get('new_ctc') or old_ctc))
+
+        # Persist: update employee base + ext profile (ctc)
+        e.base_salary = new_base
+        ext['ctc'] = float(new_ctc)
+        e.extended_profile = ext
+        e.save(update_fields=['base_salary', 'extended_profile'])
+
+        with connection.cursor() as cursor:
+            vendor = getattr(connection, "vendor", "")
+            if vendor == "sqlite":
+                cursor.execute(
+                    """
+                    INSERT INTO t_employee_salary_revision
+                    (tenant_id, employee_id, old_ctc, new_ctc, old_base_salary, new_base_salary, effective_from, reason, status, created_by_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Approved', ?, ?)
+                    """,
+                    [tenant.id, employee_id, old_ctc, new_ctc, old_base, new_base, effective_from, reason, request.user.id, timezone.now()],
+                )
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO t_employee_salary_revision
+                    (tenant_id, employee_id, old_ctc, new_ctc, old_base_salary, new_base_salary, effective_from, reason, status, created_by_id, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Approved', %s, %s)
+                    """,
+                    [tenant.id, employee_id, old_ctc, new_ctc, old_base, new_base, effective_from, reason, request.user.id, timezone.now()],
+                )
+
+        _insert_lifecycle_event(
+            tenant.id, employee_id, "SALARY_REVISION", effective_from,
+            {"old_ctc": float(old_ctc), "new_ctc": float(new_ctc), "old_base_salary": float(old_base), "new_base_salary": float(new_base), "reason": reason},
+            request.user.id
+        )
+        return Response({"message": "Salary revision saved"})
+
+
+class EmployeeExitView(views.APIView):
+    """HR/Admin: create/close an exit case (writes audit event)."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, employee_id):
+        ensure_hr_lifecycle_tables_exist()
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+        tenant = request.user.tenant
+        e = Employee.objects.filter(tenant=tenant, id=employee_id).first()
+        if not e:
+            return Response({"error": "Employee not found"}, status=404)
+
+        p = request.data or {}
+        exit_type = p.get('exit_type') or 'Termination'
+        last_working_day = p.get('last_working_day')
+        resignation_date = p.get('resignation_date')
+        reason = p.get('reason') or ''
+
+        with connection.cursor() as cursor:
+            vendor = getattr(connection, "vendor", "")
+            if vendor == "sqlite":
+                cursor.execute(
+                    """
+                    INSERT INTO t_employee_exit
+                    (tenant_id, employee_id, exit_type, last_working_day, resignation_date, reason, status, settlement_status, created_by_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'Open', 'Pending', ?, ?)
+                    """,
+                    [tenant.id, employee_id, exit_type, last_working_day, resignation_date, reason, request.user.id, timezone.now()],
+                )
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO t_employee_exit
+                    (tenant_id, employee_id, exit_type, last_working_day, resignation_date, reason, status, settlement_status, created_by_id, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, 'Open', 'Pending', %s, %s)
+                    """,
+                    [tenant.id, employee_id, exit_type, last_working_day, resignation_date, reason, request.user.id, timezone.now()],
+                )
+
+        _insert_lifecycle_event(
+            tenant.id, employee_id, "EXIT_INITIATED", last_working_day,
+            {"exit_type": exit_type, "last_working_day": last_working_day, "resignation_date": resignation_date, "reason": reason},
+            request.user.id
+        )
+        return Response({"message": "Exit case created"})
+
+
+class EmployeeReinstateView(views.APIView):
+    """Admin/HR: reinstate a terminated employee (writes audit event)."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, employee_id):
+        ensure_hr_lifecycle_tables_exist()
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+        tenant = request.user.tenant
+        e = Employee.objects.filter(tenant=tenant, id=employee_id).first()
+        if not e:
+            return Response({"error": "Employee not found"}, status=404)
+
+        prev = e.status
+        e.status = 'Active'
+        e.save(update_fields=['status'])
+        _insert_lifecycle_event(
+            tenant.id, employee_id, "REINSTATED", timezone.localdate(),
+            {"from_status": prev, "to_status": "Active"},
+            request.user.id
+        )
+        return Response({"message": "Employee reinstated"})
+
+
+class LifecycleTransfersListView(views.APIView):
+    """HR/Admin: tenant-wide transfers list for reporting/export."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        ensure_hr_lifecycle_tables_exist()
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+        tenant = request.user.tenant
+        month = request.query_params.get('month')  # YYYY-MM
+        fmt = (request.query_params.get('format') or '').lower()
+
+        where = "t.tenant_id = %s"
+        params = [tenant.id]
+        if month:
+            where += " AND substr(CAST(t.effective_from AS CHAR), 1, 7) = %s"
+            params.append(month)
+
+        # SQLite uses substr(date,1,7) too; MySQL supports substr(CAST(date as char),1,7)
+        sql = f"""
+            SELECT
+              t.id,
+              t.effective_from,
+              e.id as employee_id,
+              e.employee_code,
+              e.name as employee_name,
+              fd.name as from_department,
+              td.name as to_department,
+              fr.name as from_role,
+              tr.name as to_role,
+              fm.name as from_manager,
+              tm.name as to_manager,
+              t.reason,
+              t.created_at
+            FROM t_employee_transfer t
+            LEFT JOIN t_employee e ON e.id = t.employee_id
+            LEFT JOIN t_department fd ON fd.id = t.from_department_id
+            LEFT JOIN t_department td ON td.id = t.to_department_id
+            LEFT JOIN t_role fr ON fr.id = t.from_designation_id
+            LEFT JOIN t_role tr ON tr.id = t.to_designation_id
+            LEFT JOIN t_employee fm ON fm.id = t.from_manager_id
+            LEFT JOIN t_employee tm ON tm.id = t.to_manager_id
+            WHERE {where}
+            ORDER BY t.effective_from DESC, t.created_at DESC
+            LIMIT 2000
+        """
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+
+        cols = [
+            "id", "effective_from", "employee_id", "employee_code", "employee_name",
+            "from_department", "to_department", "from_role", "to_role",
+            "from_manager", "to_manager", "reason", "created_at"
+        ]
+        data = [dict(zip(cols, r)) for r in rows]
+
+        if fmt == 'csv':
+            import csv
+            from io import StringIO
+            buf = StringIO()
+            w = csv.DictWriter(buf, fieldnames=cols)
+            w.writeheader()
+            for d in data:
+                w.writerow({k: (d.get(k) if d.get(k) is not None else '') for k in cols})
+            resp = Response(buf.getvalue())
+            resp['Content-Type'] = 'text/csv'
+            resp['Content-Disposition'] = 'attachment; filename="transfers.csv"'
+            return resp
+
+        return Response({"transfers": data, "count": len(data)})
+
+
+class LifecycleSalaryRevisionsListView(views.APIView):
+    """HR/Admin: tenant-wide salary revision list for reporting/export."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        ensure_hr_lifecycle_tables_exist()
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+        tenant = request.user.tenant
+        month = request.query_params.get('month')  # YYYY-MM
+        fmt = (request.query_params.get('format') or '').lower()
+
+        where = "s.tenant_id = %s"
+        params = [tenant.id]
+        if month:
+            where += " AND substr(CAST(s.effective_from AS CHAR), 1, 7) = %s"
+            params.append(month)
+
+        sql = f"""
+            SELECT
+              s.id,
+              s.effective_from,
+              e.id as employee_id,
+              e.employee_code,
+              e.name as employee_name,
+              s.old_ctc,
+              s.new_ctc,
+              s.old_base_salary,
+              s.new_base_salary,
+              s.reason,
+              s.created_at
+            FROM t_employee_salary_revision s
+            LEFT JOIN t_employee e ON e.id = s.employee_id
+            WHERE {where}
+            ORDER BY s.effective_from DESC, s.created_at DESC
+            LIMIT 2000
+        """
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+
+        cols = [
+            "id", "effective_from", "employee_id", "employee_code", "employee_name",
+            "old_ctc", "new_ctc", "old_base_salary", "new_base_salary", "reason", "created_at"
+        ]
+        data = [dict(zip(cols, r)) for r in rows]
+
+        if fmt == 'csv':
+            import csv
+            from io import StringIO
+            buf = StringIO()
+            w = csv.DictWriter(buf, fieldnames=cols)
+            w.writeheader()
+            for d in data:
+                w.writerow({k: (d.get(k) if d.get(k) is not None else '') for k in cols})
+            resp = Response(buf.getvalue())
+            resp['Content-Type'] = 'text/csv'
+            resp['Content-Disposition'] = 'attachment; filename="salary-revisions.csv"'
+            return resp
+
+        return Response({"revisions": data, "count": len(data)})
+
+
+class LifecycleExitsListView(views.APIView):
+    """HR/Admin: tenant-wide exits list for reporting/export."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        ensure_hr_lifecycle_tables_exist()
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+        tenant = request.user.tenant
+        status_q = request.query_params.get('status')  # Open/Closed
+        month = request.query_params.get('month')      # YYYY-MM (by created_at)
+        fmt = (request.query_params.get('format') or '').lower()
+
+        where = "x.tenant_id = %s"
+        params = [tenant.id]
+        if status_q:
+            where += " AND x.status = %s"
+            params.append(status_q)
+        if month:
+            where += " AND substr(CAST(x.created_at AS CHAR), 1, 7) = %s"
+            params.append(month)
+
+        sql = f"""
+            SELECT
+              x.id,
+              e.id as employee_id,
+              e.employee_code,
+              e.name as employee_name,
+              x.exit_type,
+              x.resignation_date,
+              x.last_working_day,
+              x.status,
+              x.settlement_status,
+              x.reason,
+              x.created_at
+            FROM t_employee_exit x
+            LEFT JOIN t_employee e ON e.id = x.employee_id
+            WHERE {where}
+            ORDER BY x.created_at DESC
+            LIMIT 2000
+        """
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+
+        cols = [
+            "id", "employee_id", "employee_code", "employee_name",
+            "exit_type", "resignation_date", "last_working_day",
+            "status", "settlement_status", "reason", "created_at"
+        ]
+        data = [dict(zip(cols, r)) for r in rows]
+
+        if fmt == 'csv':
+            import csv
+            from io import StringIO
+            buf = StringIO()
+            w = csv.DictWriter(buf, fieldnames=cols)
+            w.writeheader()
+            for d in data:
+                w.writerow({k: (d.get(k) if d.get(k) is not None else '') for k in cols})
+            resp = Response(buf.getvalue())
+            resp['Content-Type'] = 'text/csv'
+            resp['Content-Disposition'] = 'attachment; filename="exits.csv"'
+            return resp
+
+        return Response({"exits": data, "count": len(data)})
 
 
 # ─────────────────────────────────────────────
