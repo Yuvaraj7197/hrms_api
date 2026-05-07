@@ -43,9 +43,18 @@ urlpatterns = [
     path('payroll/payslip/<int:record_id>/', views.PayslipView.as_view(),         name='payroll_payslip_detail'),
     path('payroll/adjust/<int:record_id>/', views.PayrollAdjustmentView.as_view(),name='payroll_adjustment'),
     path('payroll/settings/',        views.PayrollSettingView.as_view(),          name='payroll_settings'),
+    path('payroll/cycle-lock/',      views.PayrollCycleLockView.as_view(),        name='payroll_cycle_lock'),
+    path('payroll/variable-inputs/', views.PayrollVariableInputView.as_view(),    name='payroll_variable_inputs'),
+    path('payroll/loans/',           views.EmployeeLoanView.as_view(),            name='payroll_employee_loans'),
+    path('payroll/loan-ledger/',     views.EmployeeLoanLedgerView.as_view(),      name='payroll_employee_loan_ledger'),
+    path('payroll/reimbursement/categories/', views.ReimbursementCategoryView.as_view(), name='payroll_reimbursement_categories'),
+    path('payroll/reimbursement/claims/',     views.ReimbursementClaimView.as_view(),    name='payroll_reimbursement_claims'),
+    path('payroll/arrears/',         views.PayrollArrearView.as_view(),           name='payroll_arrears'),
     path('payroll/audit-logs/',     views.PayrollAuditLogsView.as_view(),       name='payroll_audit_logs'),
     path('payroll/tax/verify/<int:record_id>/', views.PayrollTaxVerifyView.as_view(), name='payroll_tax_verify'),
     path('payroll/form16/download/', views.PayrollForm16DownloadView.as_view(), name='payroll_form16_download'),
+    path('payroll/bank-advice/', views.PayrollBankAdviceExportView.as_view(), name='payroll_bank_advice_export'),
+    path('payroll/payslips/download/', views.PayrollPayslipsDownloadView.as_view(), name='payroll_payslips_download'),
 
     # ── ESS — Employee Self-Service ────────────────────
     path('ess/profile/',             views.ESSProfileView.as_view(),              name='ess_profile'),

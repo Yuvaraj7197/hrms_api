@@ -20,6 +20,36 @@ from django.conf import settings
 import random
 from rest_framework.permissions import AllowAny
 import string
+import io
+import csv
+import json
+import zipfile
+from django.http import HttpResponse
+from django.utils.text import slugify
+
+try:
+    from reportlab.pdfgen import canvas as rl_canvas
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.units import mm
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+except Exception:
+    rl_canvas = None
+    A4 = None
+    colors = None
+    mm = None
+    getSampleStyleSheet = None
+    SimpleDocTemplate = None
+    Table = None
+    TableStyle = None
+    Paragraph = None
+    Spacer = None
+
+try:
+    from openpyxl import Workbook
+except Exception:
+    Workbook = None
 
 def safe_int(value):
     try:
@@ -268,6 +298,287 @@ def ensure_master_tables_exist():
                 tax_regime_default VARCHAR(20) DEFAULT 'New',
                 loan_interest_rate_annual DECIMAL(5, 2) DEFAULT 8.5,
                 CONSTRAINT t_pay_set_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE
+            )
+            """
+        )
+
+
+def ensure_payroll_workflow_tables_exist():
+    """
+    Creates payroll workflow tables if missing (to keep environments working even
+    when migrations are not applied).
+    """
+    vendor = getattr(connection, "vendor", "")
+    with connection.cursor() as cursor:
+        if vendor == "sqlite":
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS t_payroll_cycle_lock (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  tenant_id CHAR(32) NOT NULL,
+                  cycle_month VARCHAR(7) NOT NULL,
+                  attendance_locked BOOLEAN DEFAULT 0,
+                  leave_locked BOOLEAN DEFAULT 0,
+                  payroll_locked BOOLEAN DEFAULT 0,
+                  locked_by_id INTEGER,
+                  locked_at DATETIME,
+                  UNIQUE(tenant_id, cycle_month)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS t_payroll_variable_input (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  tenant_id CHAR(32) NOT NULL,
+                  employee_id INTEGER NOT NULL,
+                  cycle_month VARCHAR(7) NOT NULL,
+                  input_type VARCHAR(20) NOT NULL,
+                  label VARCHAR(255) NOT NULL,
+                  amount DECIMAL(12,2) DEFAULT 0,
+                  meta TEXT DEFAULT '{}',
+                  status VARCHAR(20) DEFAULT 'Draft',
+                  created_by_id INTEGER,
+                  approved_by_id INTEGER,
+                  created_at DATETIME NOT NULL,
+                  updated_at DATETIME NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS t_employee_loan (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  tenant_id CHAR(32) NOT NULL,
+                  employee_id INTEGER NOT NULL,
+                  loan_code VARCHAR(30),
+                  principal_amount DECIMAL(12,2) NOT NULL,
+                  annual_interest_rate DECIMAL(5,2) DEFAULT 0,
+                  tenure_months INTEGER DEFAULT 12,
+                  emi_amount DECIMAL(12,2) DEFAULT 0,
+                  start_cycle_month VARCHAR(7),
+                  status VARCHAR(20) DEFAULT 'Requested',
+                  remarks TEXT,
+                  approved_by_id INTEGER,
+                  approved_at DATETIME,
+                  created_at DATETIME NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS t_employee_loan_ledger (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  tenant_id CHAR(32) NOT NULL,
+                  loan_id INTEGER NOT NULL,
+                  cycle_month VARCHAR(7) NOT NULL,
+                  opening_balance DECIMAL(12,2) DEFAULT 0,
+                  emi_due DECIMAL(12,2) DEFAULT 0,
+                  interest_due DECIMAL(12,2) DEFAULT 0,
+                  amount_paid DECIMAL(12,2) DEFAULT 0,
+                  closing_balance DECIMAL(12,2) DEFAULT 0,
+                  status VARCHAR(20) DEFAULT 'Due',
+                  created_at DATETIME NOT NULL,
+                  UNIQUE(tenant_id, loan_id, cycle_month)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS t_reimbursement_category (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  tenant_id CHAR(32) NOT NULL,
+                  code VARCHAR(30) NOT NULL,
+                  name VARCHAR(100) NOT NULL,
+                  is_active BOOLEAN DEFAULT 1,
+                  taxable BOOLEAN DEFAULT 0,
+                  max_amount_per_month DECIMAL(12,2) DEFAULT 0,
+                  UNIQUE(tenant_id, code)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS t_reimbursement_claim (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  tenant_id CHAR(32) NOT NULL,
+                  employee_id INTEGER NOT NULL,
+                  category_id INTEGER NOT NULL,
+                  cycle_month VARCHAR(7) NOT NULL,
+                  claim_amount DECIMAL(12,2) DEFAULT 0,
+                  description TEXT,
+                  attachments TEXT DEFAULT '[]',
+                  status VARCHAR(20) DEFAULT 'Draft',
+                  submitted_at DATETIME,
+                  hr_approved_by_id INTEGER,
+                  finance_approved_by_id INTEGER,
+                  approved_at DATETIME,
+                  paid_at DATETIME,
+                  payout_reference VARCHAR(100),
+                  created_at DATETIME NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS t_payroll_arrear (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  tenant_id CHAR(32) NOT NULL,
+                  employee_id INTEGER NOT NULL,
+                  from_cycle_month VARCHAR(7) NOT NULL,
+                  to_cycle_month VARCHAR(7) NOT NULL,
+                  arrear_amount DECIMAL(12,2) DEFAULT 0,
+                  reason VARCHAR(255) DEFAULT '',
+                  status VARCHAR(20) DEFAULT 'Open',
+                  created_at DATETIME NOT NULL
+                )
+                """
+            )
+            return
+
+        # MySQL / MariaDB
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_payroll_cycle_lock (
+              id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+              tenant_id CHAR(32) NOT NULL,
+              cycle_month VARCHAR(7) NOT NULL,
+              attendance_locked BOOLEAN DEFAULT 0,
+              leave_locked BOOLEAN DEFAULT 0,
+              payroll_locked BOOLEAN DEFAULT 0,
+              locked_by_id BIGINT NULL,
+              locked_at DATETIME NULL,
+              UNIQUE KEY uq_payroll_cycle_lock (tenant_id, cycle_month),
+              INDEX idx_payroll_cycle_lock_tenant (tenant_id),
+              CONSTRAINT fk_payroll_cycle_lock_tenant FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_payroll_variable_input (
+              id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+              tenant_id CHAR(32) NOT NULL,
+              employee_id BIGINT NOT NULL,
+              cycle_month VARCHAR(7) NOT NULL,
+              input_type VARCHAR(20) NOT NULL,
+              label VARCHAR(255) NOT NULL,
+              amount DECIMAL(12,2) DEFAULT 0,
+              meta JSON NULL,
+              status VARCHAR(20) DEFAULT 'Draft',
+              created_by_id BIGINT NULL,
+              approved_by_id BIGINT NULL,
+              created_at DATETIME(6) NOT NULL,
+              updated_at DATETIME(6) NOT NULL,
+              INDEX idx_payroll_var_cycle (tenant_id, cycle_month, input_type),
+              INDEX idx_payroll_var_emp (tenant_id, employee_id, cycle_month),
+              CONSTRAINT fk_payroll_var_tenant FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
+              CONSTRAINT fk_payroll_var_emp FOREIGN KEY (employee_id) REFERENCES t_employee(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_employee_loan (
+              id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+              tenant_id CHAR(32) NOT NULL,
+              employee_id BIGINT NOT NULL,
+              loan_code VARCHAR(30) NULL,
+              principal_amount DECIMAL(12,2) NOT NULL,
+              annual_interest_rate DECIMAL(5,2) DEFAULT 0,
+              tenure_months INT DEFAULT 12,
+              emi_amount DECIMAL(12,2) DEFAULT 0,
+              start_cycle_month VARCHAR(7) NULL,
+              status VARCHAR(20) DEFAULT 'Requested',
+              remarks TEXT NULL,
+              approved_by_id BIGINT NULL,
+              approved_at DATETIME NULL,
+              created_at DATETIME(6) NOT NULL,
+              INDEX idx_loan_emp (tenant_id, employee_id),
+              INDEX idx_loan_status (tenant_id, status),
+              CONSTRAINT fk_loan_tenant FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
+              CONSTRAINT fk_loan_emp FOREIGN KEY (employee_id) REFERENCES t_employee(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_employee_loan_ledger (
+              id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+              tenant_id CHAR(32) NOT NULL,
+              loan_id BIGINT NOT NULL,
+              cycle_month VARCHAR(7) NOT NULL,
+              opening_balance DECIMAL(12,2) DEFAULT 0,
+              emi_due DECIMAL(12,2) DEFAULT 0,
+              interest_due DECIMAL(12,2) DEFAULT 0,
+              amount_paid DECIMAL(12,2) DEFAULT 0,
+              closing_balance DECIMAL(12,2) DEFAULT 0,
+              status VARCHAR(20) DEFAULT 'Due',
+              created_at DATETIME(6) NOT NULL,
+              UNIQUE KEY uq_loan_ledger (tenant_id, loan_id, cycle_month),
+              CONSTRAINT fk_loan_ledger_tenant FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
+              CONSTRAINT fk_loan_ledger_loan FOREIGN KEY (loan_id) REFERENCES t_employee_loan(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_reimbursement_category (
+              id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+              tenant_id CHAR(32) NOT NULL,
+              code VARCHAR(30) NOT NULL,
+              name VARCHAR(100) NOT NULL,
+              is_active BOOLEAN DEFAULT 1,
+              taxable BOOLEAN DEFAULT 0,
+              max_amount_per_month DECIMAL(12,2) DEFAULT 0,
+              UNIQUE KEY uq_reimb_cat (tenant_id, code),
+              CONSTRAINT fk_reimb_cat_tenant FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_reimbursement_claim (
+              id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+              tenant_id CHAR(32) NOT NULL,
+              employee_id BIGINT NOT NULL,
+              category_id BIGINT NOT NULL,
+              cycle_month VARCHAR(7) NOT NULL,
+              claim_amount DECIMAL(12,2) DEFAULT 0,
+              description TEXT NULL,
+              attachments JSON NULL,
+              status VARCHAR(20) DEFAULT 'Draft',
+              submitted_at DATETIME NULL,
+              hr_approved_by_id BIGINT NULL,
+              finance_approved_by_id BIGINT NULL,
+              approved_at DATETIME NULL,
+              paid_at DATETIME NULL,
+              payout_reference VARCHAR(100) NULL,
+              created_at DATETIME(6) NOT NULL,
+              INDEX idx_claim_cycle (tenant_id, cycle_month, status),
+              INDEX idx_claim_emp (tenant_id, employee_id, cycle_month),
+              CONSTRAINT fk_claim_tenant FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
+              CONSTRAINT fk_claim_emp FOREIGN KEY (employee_id) REFERENCES t_employee(id) ON DELETE CASCADE,
+              CONSTRAINT fk_claim_cat FOREIGN KEY (category_id) REFERENCES t_reimbursement_category(id) ON DELETE RESTRICT
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_payroll_arrear (
+              id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+              tenant_id CHAR(32) NOT NULL,
+              employee_id BIGINT NOT NULL,
+              from_cycle_month VARCHAR(7) NOT NULL,
+              to_cycle_month VARCHAR(7) NOT NULL,
+              arrear_amount DECIMAL(12,2) DEFAULT 0,
+              reason VARCHAR(255) DEFAULT '',
+              status VARCHAR(20) DEFAULT 'Open',
+              created_at DATETIME(6) NOT NULL,
+              INDEX idx_arrear_emp (tenant_id, employee_id),
+              INDEX idx_arrear_status (tenant_id, status),
+              CONSTRAINT fk_arrear_tenant FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
+              CONSTRAINT fk_arrear_emp FOREIGN KEY (employee_id) REFERENCES t_employee(id) ON DELETE CASCADE
             )
             """
         )
@@ -1658,6 +1969,9 @@ class PayrollProcessView(views.APIView):
         action = request.data.get('action', 'process')
         cycle_month = request.data.get('cycle') or timezone.localdate().strftime('%Y-%m')
 
+        # Ensure workflow tables exist (inputs/loans/reimbursements/arrears/locks)
+        ensure_payroll_workflow_tables_exist()
+
         records = PayrollRecord.objects.filter(tenant=tenant, cycle_month=cycle_month)
         
         # Check if cycle is locked
@@ -1769,6 +2083,61 @@ class PayrollProcessView(views.APIView):
         # ── Process Pending records ────────────────────────────────────────────
         updated = 0
         statutory_skip_codes = {'PF_EMP', 'PF_EMPLR', 'ESI_EMP', 'ESI_EMPLR', 'PTAX', 'TDS'}
+
+        # Pre-fetch workflow data for this cycle to avoid N+1 queries
+        variable_inputs_by_emp: dict[str, list] = {}
+        reimb_by_emp: dict[str, list] = {}
+        arrears_by_emp: dict[str, list] = {}
+        loans_by_emp: dict[str, list] = {}
+
+        try:
+            inputs_qs = PayrollVariableInput.objects.filter(
+                tenant=tenant,
+                cycle_month=cycle_month,
+                status='Approved',
+            ).select_related('employee')
+            for it in inputs_qs:
+                eid = str(it.employee_id)
+                variable_inputs_by_emp.setdefault(eid, []).append(it)
+        except Exception:
+            pass
+
+        try:
+            claims_qs = ReimbursementClaim.objects.filter(
+                tenant=tenant,
+                cycle_month=cycle_month,
+                status__in=['Finance Approved', 'Paid'],
+            ).select_related('employee', 'category')
+            for c in claims_qs:
+                eid = str(c.employee_id)
+                reimb_by_emp.setdefault(eid, []).append(c)
+        except Exception:
+            pass
+
+        try:
+            arrear_qs = PayrollArrear.objects.filter(
+                tenant=tenant,
+                status='Open',
+            ).select_related('employee')
+            # Apply arrears if the cycle falls within the arrear range.
+            for a in arrear_qs:
+                if str(a.from_cycle_month) <= str(cycle_month) <= str(a.to_cycle_month):
+                    eid = str(a.employee_id)
+                    arrears_by_emp.setdefault(eid, []).append(a)
+        except Exception:
+            pass
+
+        try:
+            loan_qs = EmployeeLoan.objects.filter(
+                tenant=tenant,
+                status__in=['Active', 'Approved'],
+            ).select_related('employee')
+            for ln in loan_qs:
+                eid = str(ln.employee_id)
+                loans_by_emp.setdefault(eid, []).append(ln)
+        except Exception:
+            pass
+
         for record in records.filter(status='Pending'):
             base_salary = Decimal(record.base_salary or 0)
             breakdown = {"earnings": [], "deductions": []}
@@ -1842,6 +2211,48 @@ class PayrollProcessView(views.APIView):
                         "code": "ADJ_DED",
                     })
 
+            # 2.1) Apply approved variable inputs (OT/Incentives/One-time items)
+            for it in variable_inputs_by_emp.get(str(record.employee_id), []) or []:
+                amt = Decimal(it.amount or 0).quantize(Decimal('0.01'))
+                if amt == 0:
+                    continue
+                label = (getattr(it, 'label', None) or '').strip() or getattr(it, 'input_type', 'INPUT')
+                itype = str(getattr(it, 'input_type', '') or '').upper()
+                code = f"VAR_{itype[:10]}"
+
+                # Map to earning vs deduction
+                as_deduction = itype in ('DEDUCTION',)
+                if itype == 'ADJUSTMENT':
+                    # Allow negative adjustments (treated as deduction)
+                    if amt < 0:
+                        as_deduction = True
+                        amt = abs(amt)
+
+                if as_deduction:
+                    total_deductions += amt
+                    breakdown["deductions"].append({"name": label, "amount": float(amt), "code": code})
+                else:
+                    total_earnings += amt
+                    breakdown["earnings"].append({"name": label, "amount": float(amt), "code": code})
+
+            # 2.2) Apply open arrears for this cycle range
+            for a in arrears_by_emp.get(str(record.employee_id), []) or []:
+                amt = Decimal(a.arrear_amount or 0).quantize(Decimal('0.01'))
+                if amt <= 0:
+                    continue
+                label = (getattr(a, 'reason', None) or '').strip() or 'Salary Arrear'
+                total_earnings += amt
+                breakdown["earnings"].append({"name": label, "amount": float(amt), "code": "ARREAR"})
+
+            # 2.3) Apply approved reimbursements (treated as earning payout)
+            for c in reimb_by_emp.get(str(record.employee_id), []) or []:
+                amt = Decimal(c.claim_amount or 0).quantize(Decimal('0.01'))
+                if amt <= 0:
+                    continue
+                cat_name = getattr(getattr(c, 'category', None), 'name', None) or 'Reimbursement'
+                total_earnings += amt
+                breakdown["earnings"].append({"name": f"{cat_name} Reimbursement", "amount": float(amt), "code": "REIMB"})
+
             # 3) Statutory deductions computed by engine rules
             # PF: employee deduction affects net pay; employer contribution is stored separately for display.
             pf_emp = (base_salary * setting.pf_rate_employee / Decimal('100')).quantize(Decimal('0.01'))
@@ -1881,12 +2292,41 @@ class PayrollProcessView(views.APIView):
                 breakdown["deductions"].append({"name": "Loss of Pay", "amount": float(lop_ded_amt), "code": "LOP"})
 
             # Loan principal + interest
-            loan_emi = Decimal(record.loan_emi or 0)
+            # Prefer workflow loans if present; otherwise fallback to record.loan_emi
+            loan_emi = Decimal('0.00')
+            employee_loans = loans_by_emp.get(str(record.employee_id), []) or []
+            if employee_loans:
+                for ln in employee_loans:
+                    # Apply only if started
+                    start_cycle = str(getattr(ln, 'start_cycle_month', '') or '')
+                    if start_cycle and str(cycle_month) < start_cycle:
+                        continue
+
+                    # If ledger has a due line for this month, prefer it
+                    try:
+                        led = EmployeeLoanLedger.objects.filter(
+                            tenant=tenant,
+                            loan_id=ln.id,
+                            cycle_month=cycle_month,
+                        ).first()
+                    except Exception:
+                        led = None
+                    if led:
+                        loan_emi += Decimal(led.emi_due or 0)
+                        loan_emi += Decimal(led.interest_due or 0)  # interest in deductions too
+                    else:
+                        loan_emi += Decimal(getattr(ln, 'emi_amount', 0) or 0)
+            else:
+                loan_emi = Decimal(record.loan_emi or 0)
+
             loan_interest = Decimal('0.00')
             if loan_emi > 0:
-                loan_interest = (loan_emi * setting.loan_interest_rate_annual / Decimal('100') / Decimal('12')).quantize(Decimal('0.01'))
-                breakdown["deductions"].append({"name": "Loan EMI", "amount": float(loan_emi), "code": "EMI"})
-                breakdown["deductions"].append({"name": "Loan Interest", "amount": float(loan_interest), "code": "INT"})
+                # If we already included interest via ledger, keep engine interest minimal
+                # (fallback interest only when ledger isn't used)
+                if not employee_loans:
+                    loan_interest = (loan_emi * setting.loan_interest_rate_annual / Decimal('100') / Decimal('12')).quantize(Decimal('0.01'))
+                    breakdown["deductions"].append({"name": "Loan Interest", "amount": float(loan_interest), "code": "INT"})
+                breakdown["deductions"].append({"name": "Loan EMI", "amount": float(loan_emi.quantize(Decimal('0.01'))), "code": "EMI"})
 
             # 4) Persist record fields
             record.lop_days    = int(lop_days)
@@ -1897,6 +2337,7 @@ class PayrollProcessView(views.APIView):
             record.employer_pf = employer_pf
             record.esi_amount  = esi_emp
             record.tds_amount  = tds_amount
+            record.loan_emi    = loan_emi.quantize(Decimal('0.01'))
             record.net_pay     = (total_earnings - total_deductions - loan_emi - loan_interest).quantize(Decimal('0.01'))
             record.breakdown   = breakdown
             record.status      = 'Processed'
@@ -1905,7 +2346,7 @@ class PayrollProcessView(views.APIView):
             PayrollAuditLog.objects.create(
                 tenant=tenant,
                 payroll_record=record,
-                action=f"Payroll processed (Processed) — {cycle_month}",
+                action=f"Payroll processed (Processed) — {cycle_month} (inputs/reimb/arrears/loans applied)",
                 performed_by=request.user,
             )
             updated += 1
@@ -2162,6 +2603,383 @@ class PayslipView(views.APIView):
             })
         except PayrollRecord.DoesNotExist:
             return Response({"error": "Record not found"}, status=404)
+
+
+def _build_payslip_payload_for_record(record: PayrollRecord, tenant_name: str):
+    """
+    Build a single payslip payload (JSON) for exports.
+    Note: This is intentionally aligned with PayslipView output.
+    """
+    emp = record.employee
+
+    from datetime import datetime, timedelta
+    try:
+        _y, _m = map(int, str(record.cycle_month).split('-'))
+        _cur = datetime(_y, _m, 1)
+        _prev = _cur - timedelta(days=1)
+        attendance_cycle = _prev.strftime('%Y-%m')
+    except Exception:
+        attendance_cycle = record.cycle_month
+
+    present_days = AttendanceRecord.objects.filter(
+        employee=emp,
+        date__startswith=attendance_cycle,
+        status__code__in=['P', 'PRESENT', 'L', 'LATE']
+    ).count()
+
+    return {
+        "company": {"name": tenant_name},
+        "employee": {
+            "name": emp.name,
+            "code": emp.employee_code,
+            "department": emp.department.name if emp.department else 'N/A',
+            "designation": emp.designation.name if getattr(emp, 'designation', None) else 'N/A',
+            "joining_date": emp.joining_date.strftime('%Y-%m-%d') if emp.joining_date else None,
+            "bank_name": emp.bank_name,
+            "account_number": emp.account_number,
+            "ifsc_code": emp.ifsc_code,
+            "pan_number": getattr(emp, 'pan_number', None),
+            "uan_number": getattr(emp, 'uan_number', None),
+            "tax_regime": getattr(emp, 'tax_regime', 'New'),
+        },
+        "attendance": {
+            "working_days": getattr(record, 'working_days', 30),
+            "present_days": present_days,
+            "lop_days": getattr(record, 'lop_days', 0),
+            "paid_days": getattr(record, 'working_days', 30) - getattr(record, 'lop_days', 0),
+            "period": attendance_cycle
+        },
+        "salary": {
+            "id": record.id,
+            "cycle": record.cycle_month,
+            "status": record.status,
+            "base_salary": float(record.base_salary),
+            "gross_pay": float(getattr(record, 'gross_pay', 0)),
+            "total_deductions": float(getattr(record, 'deductions', 0)) + float(getattr(record, 'loan_emi', 0)) + float(getattr(record, 'tds_amount', 0)) + float(getattr(record, 'esi_amount', 0)),
+            "net_pay": float(record.net_pay),
+            "breakdown": record.breakdown or {"earnings": [], "deductions": []},
+            "adjustments": getattr(record, 'one_time_adjustments', []),
+            "payment_reference": getattr(record, 'payment_reference', None),
+        }
+    }
+
+
+def _render_payslip_pdf_bytes(payload: dict, tenant: Tenant) -> bytes:
+    """
+    Render a clean, single-page payslip PDF (ReportLab Platypus).
+    """
+    if SimpleDocTemplate is None or Table is None or colors is None:
+        raise RuntimeError("ReportLab Platypus is unavailable")
+
+    tenant_name = getattr(tenant, "name", "Company") or "Company"
+    tenant_addr = (getattr(tenant, "address", None) or "").strip()
+    tenant_phone = (getattr(tenant, "phone", None) or "").strip()
+    tenant_gst = (getattr(tenant, "gst_number", None) or "").strip()
+    tenant_pan = (getattr(tenant, "pan_number", None) or "").strip()
+
+    bio = io.BytesIO()
+    doc = SimpleDocTemplate(
+        bio,
+        pagesize=A4,
+        leftMargin=18 * mm,
+        rightMargin=18 * mm,
+        topMargin=16 * mm,
+        bottomMargin=14 * mm,
+        title=f"Payslip {payload.get('salary', {}).get('cycle', '')}",
+    )
+    styles = getSampleStyleSheet()
+
+    elems = []
+
+    # Header
+    header_left = f"<b>{tenant_name}</b><br/>"
+    if tenant_addr:
+        header_left += f"{tenant_addr}<br/>"
+    meta_bits = []
+    if tenant_phone:
+        meta_bits.append(f"Phone: {tenant_phone}")
+    if tenant_gst:
+        meta_bits.append(f"GST: {tenant_gst}")
+    if tenant_pan:
+        meta_bits.append(f"PAN: {tenant_pan}")
+    if meta_bits:
+        header_left += " | ".join(meta_bits)
+
+    cycle = payload["salary"]["cycle"]
+    status = payload["salary"]["status"]
+    header_right = f"<b>Payslip</b><br/>Cycle: {cycle}<br/>Status: {status}"
+
+    header_tbl = Table(
+        [[Paragraph(header_left, styles["Normal"]), Paragraph(header_right, styles["Normal"])]],
+        colWidths=[doc.width * 0.68, doc.width * 0.32],
+    )
+    header_tbl.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
+    elems.append(header_tbl)
+    elems.append(Spacer(1, 6))
+
+    # Employee + summary block
+    emp = payload["employee"]
+    attendance = payload.get("attendance", {})
+    summary_tbl = Table(
+        [
+            ["Employee", f"{emp.get('name', '')} ({emp.get('code', '')})", "Net Pay", f"₹ {payload['salary']['net_pay']:.2f}"],
+            ["Department", emp.get("department", "—"), "Paid Days", f"{attendance.get('paid_days', '—')}"],
+            ["Designation", emp.get("designation", "—"), "LOP Days", f"{attendance.get('lop_days', '—')}"],
+            ["Bank", emp.get("bank_name") or "—", "A/C / IFSC", f"{emp.get('account_number') or '—'} / {emp.get('ifsc_code') or '—'}"],
+        ],
+        colWidths=[doc.width * 0.16, doc.width * 0.44, doc.width * 0.16, doc.width * 0.24],
+    )
+    summary_tbl.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+                ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
+                ("FONTNAME", (3, 0), (3, 0), "Helvetica-Bold"),
+                ("BACKGROUND", (2, 0), (3, 0), colors.HexColor("#EEF2FF")),
+                ("TEXTCOLOR", (2, 0), (3, 0), colors.HexColor("#3730A3")),
+                ("PADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
+    elems.append(summary_tbl)
+    elems.append(Spacer(1, 10))
+
+    # Earnings & Deductions table
+    earnings = payload["salary"]["breakdown"].get("earnings", []) or []
+    deductions = payload["salary"]["breakdown"].get("deductions", []) or []
+    max_len = max(len(earnings), len(deductions), 1)
+
+    rows = [["Earnings", "Amount", "Deductions", "Amount"]]
+    for i in range(max_len):
+        e = earnings[i] if i < len(earnings) else {}
+        d = deductions[i] if i < len(deductions) else {}
+        rows.append(
+            [
+                str(e.get("name", "")) if e else "",
+                f"{float(e.get('amount', 0) or 0):.2f}" if e else "",
+                str(d.get("name", "")) if d else "",
+                f"{float(d.get('amount', 0) or 0):.2f}" if d else "",
+            ]
+        )
+
+    pay_tbl = Table(rows, colWidths=[doc.width * 0.38, doc.width * 0.12, doc.width * 0.38, doc.width * 0.12])
+    pay_tbl.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F172A")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
+                ("ALIGN", (1, 1), (1, -1), "RIGHT"),
+                ("ALIGN", (3, 1), (3, -1), "RIGHT"),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("PADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
+    elems.append(pay_tbl)
+    elems.append(Spacer(1, 10))
+
+    # Totals row
+    totals_tbl = Table(
+        [
+            ["Gross Pay", f"{payload['salary']['gross_pay']:.2f}", "Total Deductions", f"{payload['salary']['total_deductions']:.2f}"],
+            ["Net Pay", f"{payload['salary']['net_pay']:.2f}", "", ""],
+        ],
+        colWidths=[doc.width * 0.25, doc.width * 0.25, doc.width * 0.25, doc.width * 0.25],
+    )
+    totals_tbl.setStyle(
+        TableStyle(
+            [
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
+                ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                ("FONTNAME", (2, 0), (2, 0), "Helvetica-Bold"),
+                ("FONTNAME", (0, 1), (0, 1), "Helvetica-Bold"),
+                ("BACKGROUND", (0, 1), (1, 1), colors.HexColor("#ECFDF5")),
+                ("TEXTCOLOR", (0, 1), (1, 1), colors.HexColor("#065F46")),
+                ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+                ("ALIGN", (3, 0), (3, -1), "RIGHT"),
+                ("PADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
+    elems.append(totals_tbl)
+    elems.append(Spacer(1, 12))
+
+    # Footer
+    footer_tbl = Table(
+        [
+            ["Prepared by", "", "Approved by", ""],
+            ["", "", "", ""],
+            ["This is a system generated payslip and does not require a signature.", "", "", ""],
+        ],
+        colWidths=[doc.width * 0.18, doc.width * 0.32, doc.width * 0.18, doc.width * 0.32],
+    )
+    footer_tbl.setStyle(
+        TableStyle(
+            [
+                ("LINEABOVE", (1, 1), (1, 1), 0.5, colors.grey),
+                ("LINEABOVE", (3, 1), (3, 1), 0.5, colors.grey),
+                ("SPAN", (0, 2), (3, 2)),
+                ("TEXTCOLOR", (0, 2), (3, 2), colors.grey),
+                ("FONTSIZE", (0, 2), (3, 2), 8),
+                ("PADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
+    elems.append(footer_tbl)
+
+    doc.build(elems)
+    return bio.getvalue()
+
+
+class PayrollBankAdviceExportView(views.APIView):
+    """
+    GET /api/payroll/bank-advice/?cycle=YYYY-MM
+    Returns a CSV suitable for bank NEFT upload templates (base fields only).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        cycle = request.query_params.get('cycle')
+        out_format = (request.query_params.get('format') or 'xlsx').lower().strip()
+        if not cycle:
+            return Response({"error": "cycle query param is required (YYYY-MM)"}, status=400)
+
+        tenant = request.user.tenant
+        qs = PayrollRecord.objects.filter(tenant=tenant, cycle_month=cycle).select_related('employee').order_by('employee__employee_code')
+
+        if out_format == 'xlsx':
+            if Workbook is None:
+                return Response({"error": "XLSX export unavailable (openpyxl not installed)"}, status=501)
+
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Bank Advice"
+            ws.append([
+                "cycle_month",
+                "employee_code",
+                "employee_name",
+                "bank_name",
+                "account_number",
+                "ifsc_code",
+                "net_pay",
+                "payment_reference",
+            ])
+            for r in qs:
+                e = r.employee
+                ws.append([
+                    r.cycle_month,
+                    getattr(e, 'employee_code', '') or '',
+                    getattr(e, 'name', '') or '',
+                    getattr(e, 'bank_name', '') or '',
+                    getattr(e, 'account_number', '') or '',
+                    getattr(e, 'ifsc_code', '') or '',
+                    float(getattr(r, 'net_pay', 0) or 0),
+                    getattr(r, 'payment_reference', '') or '',
+                ])
+
+            bio = io.BytesIO()
+            wb.save(bio)
+            resp = HttpResponse(
+                bio.getvalue(),
+                content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            resp["Content-Disposition"] = f'attachment; filename="bank_advice_{cycle}.xlsx"'
+            return resp
+
+        buff = io.StringIO()
+        writer = csv.writer(buff)
+        writer.writerow([
+            "cycle_month",
+            "employee_code",
+            "employee_name",
+            "bank_name",
+            "account_number",
+            "ifsc_code",
+            "net_pay",
+            "payment_reference",
+        ])
+
+        for r in qs:
+            e = r.employee
+            writer.writerow([
+                r.cycle_month,
+                getattr(e, 'employee_code', '') or '',
+                getattr(e, 'name', '') or '',
+                getattr(e, 'bank_name', '') or '',
+                getattr(e, 'account_number', '') or '',
+                getattr(e, 'ifsc_code', '') or '',
+                float(getattr(r, 'net_pay', 0) or 0),
+                getattr(r, 'payment_reference', '') or '',
+            ])
+
+        resp = HttpResponse(buff.getvalue(), content_type="text/csv; charset=utf-8")
+        resp["Content-Disposition"] = f'attachment; filename="bank_advice_{cycle}.csv"'
+        return resp
+
+
+class PayrollPayslipsDownloadView(views.APIView):
+    """
+    GET /api/payroll/payslips/download/?cycle=YYYY-MM
+    Returns a ZIP of per-employee payslip JSON payloads.
+
+    (PDF generation is intentionally not included because no PDF library is pinned in this repo.
+     When you standardize PDF generation, we can switch files to .pdf without changing the UI.)
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        cycle = request.query_params.get('cycle')
+        out_format = (request.query_params.get('format') or 'pdf').lower().strip()
+        if not cycle:
+            return Response({"error": "cycle query param is required (YYYY-MM)"}, status=400)
+
+        tenant = request.user.tenant
+        tenant_name = getattr(tenant, 'name', 'Company')
+        qs = PayrollRecord.objects.filter(tenant=tenant, cycle_month=cycle).select_related('employee').order_by('employee__employee_code')
+
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            manifest = {"cycle": cycle, "count": qs.count(), "generated_at": timezone.now().isoformat()}
+            zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+
+            for r in qs:
+                e = r.employee
+                code = (getattr(e, 'employee_code', '') or 'EMP').strip() or 'EMP'
+                safe_code = slugify(code).upper().replace('-', '_')[:40] or "EMP"
+                payload = _build_payslip_payload_for_record(r, tenant_name)
+
+                if out_format == 'json':
+                    zf.writestr(f"payslips/{safe_code}_{cycle}.json", json.dumps(payload, indent=2))
+                    continue
+
+                if out_format != 'pdf':
+                    return Response({"error": "Invalid format. Use format=pdf or format=json"}, status=400)
+                if rl_canvas is None or A4 is None:
+                    return Response({"error": "PDF export unavailable (reportlab not installed)"}, status=501)
+
+                try:
+                    pdf_bytes = _render_payslip_pdf_bytes(payload, tenant)
+                except Exception as e:
+                    return Response({"error": f"Failed to render PDF: {str(e)}"}, status=500)
+                zf.writestr(f"payslips/{safe_code}_{cycle}.pdf", pdf_bytes)
+
+        resp = HttpResponse(out.getvalue(), content_type="application/zip")
+        suffix = "pdf" if out_format == "pdf" else "json"
+        resp["Content-Disposition"] = f'attachment; filename="payslips_{cycle}_{suffix}.zip"'
+        return resp
 
 class LoginView(views.APIView):
     permission_classes = [AllowAny]
@@ -3275,6 +4093,301 @@ class PayrollSettingView(views.APIView):
             setting.loan_interest_rate_annual = Decimal(str(p['loan_interest_rate_annual']))
         setting.save()
         return Response({"message": "Payroll settings updated successfully"})
+
+
+# ─────────────────────────────────────────────
+# PAYROLL WORKFLOWS — INPUTS / LOANS / REIMBURSEMENTS / ARREARS / LOCKS
+# ─────────────────────────────────────────────
+from .models import (
+    PayrollCycleLock, PayrollVariableInput, EmployeeLoan, EmployeeLoanLedger,
+    ReimbursementCategory, ReimbursementClaim, PayrollArrear
+)
+from .serializers import (
+    PayrollCycleLockSerializer, PayrollVariableInputSerializer, EmployeeLoanSerializer, EmployeeLoanLedgerSerializer,
+    ReimbursementCategorySerializer, ReimbursementClaimSerializer, PayrollArrearSerializer
+)
+
+
+class PayrollCycleLockView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    @require_roles('SUPER_ADMIN', 'ADMIN', 'HR')
+    def get(self, request):
+        ensure_payroll_workflow_tables_exist()
+        tenant = request.user.tenant
+        cycle = request.query_params.get('cycle') or timezone.localdate().strftime('%Y-%m')
+        obj, _ = PayrollCycleLock.objects.get_or_create(tenant=tenant, cycle_month=cycle)
+        return Response(PayrollCycleLockSerializer(obj).data)
+
+    @require_roles('SUPER_ADMIN', 'ADMIN', 'HR')
+    def put(self, request):
+        ensure_payroll_workflow_tables_exist()
+        tenant = request.user.tenant
+        cycle = request.data.get('cycle_month') or request.data.get('cycle') or timezone.localdate().strftime('%Y-%m')
+        obj, _ = PayrollCycleLock.objects.get_or_create(tenant=tenant, cycle_month=cycle)
+
+        for k in ('attendance_locked', 'leave_locked', 'payroll_locked'):
+            if k in request.data:
+                setattr(obj, k, bool(request.data.get(k)))
+
+        obj.locked_by = request.user
+        obj.locked_at = timezone.now()
+        obj.save()
+        return Response({"message": "Cycle locks updated", **PayrollCycleLockSerializer(obj).data})
+
+
+class PayrollVariableInputView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    @require_roles('SUPER_ADMIN', 'ADMIN', 'HR')
+    def get(self, request):
+        ensure_payroll_workflow_tables_exist()
+        tenant = request.user.tenant
+        cycle = request.query_params.get('cycle') or timezone.localdate().strftime('%Y-%m')
+        employee_id = request.query_params.get('employee_id')
+        input_type = request.query_params.get('input_type')
+
+        qs = PayrollVariableInput.objects.filter(tenant=tenant, cycle_month=cycle).select_related('employee').order_by('-updated_at')
+        if employee_id:
+            qs = qs.filter(employee_id=employee_id)
+        if input_type:
+            qs = qs.filter(input_type=input_type)
+        return Response({"cycle": cycle, "items": PayrollVariableInputSerializer(qs, many=True).data})
+
+    @require_roles('SUPER_ADMIN', 'ADMIN', 'HR')
+    def post(self, request):
+        ensure_payroll_workflow_tables_exist()
+        tenant = request.user.tenant
+        payload = request.data.copy()
+        payload['created_by'] = request.user.id
+        ser = PayrollVariableInputSerializer(data=payload, context={'request': request})
+        if not ser.is_valid():
+            return Response({"error": "Validation failed", "details": ser.errors}, status=400)
+        obj: PayrollVariableInput = ser.save(tenant=tenant)
+        return Response(PayrollVariableInputSerializer(obj).data, status=201)
+
+    @require_roles('SUPER_ADMIN', 'ADMIN', 'HR')
+    def put(self, request):
+        ensure_payroll_workflow_tables_exist()
+        tenant = request.user.tenant
+        item_id = request.data.get('id')
+        if not item_id:
+            return Response({"error": "id is required"}, status=400)
+        try:
+            obj = PayrollVariableInput.objects.get(tenant=tenant, id=item_id)
+        except PayrollVariableInput.DoesNotExist:
+            return Response({"error": "Not found"}, status=404)
+
+        ser = PayrollVariableInputSerializer(obj, data=request.data, partial=True, context={'request': request})
+        if not ser.is_valid():
+            return Response({"error": "Validation failed", "details": ser.errors}, status=400)
+        ser.save()
+        return Response(PayrollVariableInputSerializer(obj).data)
+
+    @require_roles('SUPER_ADMIN', 'ADMIN', 'HR')
+    def delete(self, request):
+        ensure_payroll_workflow_tables_exist()
+        tenant = request.user.tenant
+        item_id = request.data.get('id') or request.query_params.get('id')
+        if not item_id:
+            return Response({"error": "id is required"}, status=400)
+        PayrollVariableInput.objects.filter(tenant=tenant, id=item_id).delete()
+        return Response({"message": "Deleted"})
+
+
+class EmployeeLoanView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    @require_roles('SUPER_ADMIN', 'ADMIN', 'HR')
+    def get(self, request):
+        ensure_payroll_workflow_tables_exist()
+        tenant = request.user.tenant
+        employee_id = request.query_params.get('employee_id')
+        status_val = request.query_params.get('status')
+        qs = EmployeeLoan.objects.filter(tenant=tenant).select_related('employee').order_by('-created_at')
+        if employee_id:
+            qs = qs.filter(employee_id=employee_id)
+        if status_val:
+            qs = qs.filter(status=status_val)
+        return Response({"items": EmployeeLoanSerializer(qs, many=True).data})
+
+    @require_roles('SUPER_ADMIN', 'ADMIN', 'HR')
+    def post(self, request):
+        ensure_payroll_workflow_tables_exist()
+        tenant = request.user.tenant
+        ser = EmployeeLoanSerializer(data=request.data, context={'request': request})
+        if not ser.is_valid():
+            return Response({"error": "Validation failed", "details": ser.errors}, status=400)
+        obj: EmployeeLoan = ser.save(tenant=tenant)
+        return Response(EmployeeLoanSerializer(obj).data, status=201)
+
+    @require_roles('SUPER_ADMIN', 'ADMIN', 'HR')
+    def put(self, request):
+        ensure_payroll_workflow_tables_exist()
+        tenant = request.user.tenant
+        loan_id = request.data.get('id')
+        if not loan_id:
+            return Response({"error": "id is required"}, status=400)
+        try:
+            obj = EmployeeLoan.objects.get(tenant=tenant, id=loan_id)
+        except EmployeeLoan.DoesNotExist:
+            return Response({"error": "Not found"}, status=404)
+        ser = EmployeeLoanSerializer(obj, data=request.data, partial=True, context={'request': request})
+        if not ser.is_valid():
+            return Response({"error": "Validation failed", "details": ser.errors}, status=400)
+        ser.save()
+        return Response(EmployeeLoanSerializer(obj).data)
+
+
+class EmployeeLoanLedgerView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    @require_roles('SUPER_ADMIN', 'ADMIN', 'HR')
+    def get(self, request):
+        ensure_payroll_workflow_tables_exist()
+        tenant = request.user.tenant
+        loan_id = request.query_params.get('loan_id')
+        if not loan_id:
+            return Response({"error": "loan_id is required"}, status=400)
+        qs = EmployeeLoanLedger.objects.filter(tenant=tenant, loan_id=loan_id).order_by('-cycle_month')
+        return Response({"items": EmployeeLoanLedgerSerializer(qs, many=True).data})
+
+    @require_roles('SUPER_ADMIN', 'ADMIN', 'HR')
+    def post(self, request):
+        ensure_payroll_workflow_tables_exist()
+        tenant = request.user.tenant
+        ser = EmployeeLoanLedgerSerializer(data=request.data, context={'request': request})
+        if not ser.is_valid():
+            return Response({"error": "Validation failed", "details": ser.errors}, status=400)
+        obj = ser.save(tenant=tenant)
+        return Response(EmployeeLoanLedgerSerializer(obj).data, status=201)
+
+
+class ReimbursementCategoryView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    @require_roles('SUPER_ADMIN', 'ADMIN', 'HR')
+    def get(self, request):
+        ensure_payroll_workflow_tables_exist()
+        tenant = request.user.tenant
+        qs = ReimbursementCategory.objects.filter(tenant=tenant).order_by('name')
+        return Response({"items": ReimbursementCategorySerializer(qs, many=True).data})
+
+    @require_roles('SUPER_ADMIN', 'ADMIN', 'HR')
+    def post(self, request):
+        ensure_payroll_workflow_tables_exist()
+        tenant = request.user.tenant
+        ser = ReimbursementCategorySerializer(data=request.data, context={'request': request})
+        if not ser.is_valid():
+            return Response({"error": "Validation failed", "details": ser.errors}, status=400)
+        obj = ser.save(tenant=tenant)
+        return Response(ReimbursementCategorySerializer(obj).data, status=201)
+
+    @require_roles('SUPER_ADMIN', 'ADMIN', 'HR')
+    def put(self, request):
+        ensure_payroll_workflow_tables_exist()
+        tenant = request.user.tenant
+        cat_id = request.data.get('id')
+        if not cat_id:
+            return Response({"error": "id is required"}, status=400)
+        try:
+            obj = ReimbursementCategory.objects.get(tenant=tenant, id=cat_id)
+        except ReimbursementCategory.DoesNotExist:
+            return Response({"error": "Not found"}, status=404)
+        ser = ReimbursementCategorySerializer(obj, data=request.data, partial=True, context={'request': request})
+        if not ser.is_valid():
+            return Response({"error": "Validation failed", "details": ser.errors}, status=400)
+        ser.save()
+        return Response(ReimbursementCategorySerializer(obj).data)
+
+
+class ReimbursementClaimView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    @require_roles('SUPER_ADMIN', 'ADMIN', 'HR')
+    def get(self, request):
+        ensure_payroll_workflow_tables_exist()
+        tenant = request.user.tenant
+        cycle = request.query_params.get('cycle') or timezone.localdate().strftime('%Y-%m')
+        employee_id = request.query_params.get('employee_id')
+        status_val = request.query_params.get('status')
+        qs = ReimbursementClaim.objects.filter(tenant=tenant, cycle_month=cycle).select_related('employee', 'category').order_by('-created_at')
+        if employee_id:
+            qs = qs.filter(employee_id=employee_id)
+        if status_val:
+            qs = qs.filter(status=status_val)
+        return Response({"cycle": cycle, "items": ReimbursementClaimSerializer(qs, many=True).data})
+
+    @require_roles('SUPER_ADMIN', 'ADMIN', 'HR')
+    def post(self, request):
+        ensure_payroll_workflow_tables_exist()
+        tenant = request.user.tenant
+        ser = ReimbursementClaimSerializer(data=request.data, context={'request': request})
+        if not ser.is_valid():
+            return Response({"error": "Validation failed", "details": ser.errors}, status=400)
+        obj = ser.save(tenant=tenant)
+        return Response(ReimbursementClaimSerializer(obj).data, status=201)
+
+    @require_roles('SUPER_ADMIN', 'ADMIN', 'HR')
+    def put(self, request):
+        ensure_payroll_workflow_tables_exist()
+        tenant = request.user.tenant
+        claim_id = request.data.get('id')
+        if not claim_id:
+            return Response({"error": "id is required"}, status=400)
+        try:
+            obj = ReimbursementClaim.objects.get(tenant=tenant, id=claim_id)
+        except ReimbursementClaim.DoesNotExist:
+            return Response({"error": "Not found"}, status=404)
+        ser = ReimbursementClaimSerializer(obj, data=request.data, partial=True, context={'request': request})
+        if not ser.is_valid():
+            return Response({"error": "Validation failed", "details": ser.errors}, status=400)
+        ser.save()
+        return Response(ReimbursementClaimSerializer(obj).data)
+
+
+class PayrollArrearView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    @require_roles('SUPER_ADMIN', 'ADMIN', 'HR')
+    def get(self, request):
+        ensure_payroll_workflow_tables_exist()
+        tenant = request.user.tenant
+        employee_id = request.query_params.get('employee_id')
+        status_val = request.query_params.get('status')
+        qs = PayrollArrear.objects.filter(tenant=tenant).select_related('employee').order_by('-created_at')
+        if employee_id:
+            qs = qs.filter(employee_id=employee_id)
+        if status_val:
+            qs = qs.filter(status=status_val)
+        return Response({"items": PayrollArrearSerializer(qs, many=True).data})
+
+    @require_roles('SUPER_ADMIN', 'ADMIN', 'HR')
+    def post(self, request):
+        ensure_payroll_workflow_tables_exist()
+        tenant = request.user.tenant
+        ser = PayrollArrearSerializer(data=request.data, context={'request': request})
+        if not ser.is_valid():
+            return Response({"error": "Validation failed", "details": ser.errors}, status=400)
+        obj = ser.save(tenant=tenant)
+        return Response(PayrollArrearSerializer(obj).data, status=201)
+
+    @require_roles('SUPER_ADMIN', 'ADMIN', 'HR')
+    def put(self, request):
+        ensure_payroll_workflow_tables_exist()
+        tenant = request.user.tenant
+        arrear_id = request.data.get('id')
+        if not arrear_id:
+            return Response({"error": "id is required"}, status=400)
+        try:
+            obj = PayrollArrear.objects.get(tenant=tenant, id=arrear_id)
+        except PayrollArrear.DoesNotExist:
+            return Response({"error": "Not found"}, status=404)
+        ser = PayrollArrearSerializer(obj, data=request.data, partial=True, context={'request': request})
+        if not ser.is_valid():
+            return Response({"error": "Validation failed", "details": ser.errors}, status=400)
+        ser.save()
+        return Response(PayrollArrearSerializer(obj).data)
 
 
 # ─────────────────────────────────────────────

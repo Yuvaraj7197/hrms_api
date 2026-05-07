@@ -379,6 +379,182 @@ class PayrollAuditLog(TenantScopedModel):
     class Meta:
         db_table = "t_payroll_audit_log"
 
+
+# ── Payroll Workflows (Variable Inputs / Loans / Reimbursements / Arrears) ──────
+
+class PayrollCycleLock(TenantScopedModel):
+    """
+    Locks upstream inputs for a given payroll cycle.
+    - attendance_locked: prevents attendance changes impacting payroll
+    - leave_locked: prevents leave changes impacting payroll
+    - payroll_locked: prevents payroll regeneration/adjustments
+    """
+    cycle_month = models.CharField(max_length=7)  # YYYY-MM
+    attendance_locked = models.BooleanField(default=False)
+    leave_locked = models.BooleanField(default=False)
+    payroll_locked = models.BooleanField(default=False)
+    locked_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='payroll_cycle_locks')
+    locked_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        managed = False
+        db_table = "t_payroll_cycle_lock"
+        unique_together = ('tenant', 'cycle_month')
+
+
+class PayrollVariableInput(TenantScopedModel):
+    """
+    Monthly variable inputs captured before payroll run.
+    Examples: overtime hours/amount, manual adjustment, one-time earnings/deductions, incentive payout.
+    """
+    INPUT_TYPE_CHOICES = [
+        ('OVERTIME', 'Overtime'),
+        ('INCENTIVE', 'Incentive'),
+        ('BONUS', 'Bonus'),
+        ('ARREAR', 'Arrear'),
+        ('EARNING', 'One-time Earning'),
+        ('DEDUCTION', 'One-time Deduction'),
+        ('ADJUSTMENT', 'Manual Adjustment'),
+        ('REIMBURSEMENT', 'Reimbursement Payout'),
+    ]
+
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='payroll_variable_inputs')
+    cycle_month = models.CharField(max_length=7)  # YYYY-MM
+    input_type = models.CharField(max_length=20, choices=INPUT_TYPE_CHOICES, default='ADJUSTMENT')
+    label = models.CharField(max_length=255)
+    amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    meta = models.JSONField(default=dict, blank=True)  # e.g. {"hours": 12, "rate": 250}
+    status = models.CharField(max_length=20, default='Draft')  # Draft/Submitted/Approved/Rejected/Applied
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='created_payroll_inputs')
+    approved_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='approved_payroll_inputs')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        managed = False
+        db_table = "t_payroll_variable_input"
+        indexes = [
+            models.Index(fields=['tenant', 'cycle_month', 'input_type']),
+            models.Index(fields=['tenant', 'employee', 'cycle_month']),
+        ]
+
+
+class EmployeeLoan(TenantScopedModel):
+    """Loan request/approval + EMI setup."""
+    STATUS_CHOICES = [
+        ('Requested', 'Requested'),
+        ('Approved', 'Approved'),
+        ('Rejected', 'Rejected'),
+        ('Active', 'Active'),
+        ('Closed', 'Closed'),
+    ]
+
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='loans')
+    loan_code = models.CharField(max_length=30, null=True, blank=True)
+    principal_amount = models.DecimalField(max_digits=12, decimal_places=2)
+    annual_interest_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    tenure_months = models.IntegerField(default=12)
+    emi_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    start_cycle_month = models.CharField(max_length=7, null=True, blank=True)  # YYYY-MM
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='Requested')
+    remarks = models.TextField(null=True, blank=True)
+    approved_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='approved_loans')
+    approved_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        managed = False
+        db_table = "t_employee_loan"
+        indexes = [
+            models.Index(fields=['tenant', 'employee']),
+            models.Index(fields=['tenant', 'status']),
+        ]
+
+
+class EmployeeLoanLedger(TenantScopedModel):
+    """Per-cycle ledger lines to track outstanding + auto-deduction mapping."""
+    loan = models.ForeignKey(EmployeeLoan, on_delete=models.CASCADE, related_name='ledger')
+    cycle_month = models.CharField(max_length=7)  # YYYY-MM
+    opening_balance = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    emi_due = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    interest_due = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    amount_paid = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    closing_balance = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    status = models.CharField(max_length=20, default='Due')  # Due/Paid/Skipped
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        managed = False
+        db_table = "t_employee_loan_ledger"
+        unique_together = ('tenant', 'loan', 'cycle_month')
+
+
+class ReimbursementCategory(TenantScopedModel):
+    """Reimbursement master (Fuel/Travel/Mobile/Internet/Medical)."""
+    code = models.CharField(max_length=30)
+    name = models.CharField(max_length=100)
+    is_active = models.BooleanField(default=True)
+    taxable = models.BooleanField(default=False)
+    max_amount_per_month = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+
+    class Meta:
+        managed = False
+        db_table = "t_reimbursement_category"
+        unique_together = ('tenant', 'code')
+
+
+class ReimbursementClaim(TenantScopedModel):
+    """Employee reimbursement claim with approval workflow."""
+    STATUS_CHOICES = [
+        ('Draft', 'Draft'),
+        ('Submitted', 'Submitted'),
+        ('HR Approved', 'HR Approved'),
+        ('Finance Approved', 'Finance Approved'),
+        ('Rejected', 'Rejected'),
+        ('Paid', 'Paid'),
+    ]
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='reimbursement_claims')
+    category = models.ForeignKey(ReimbursementCategory, on_delete=models.PROTECT, related_name='claims')
+    cycle_month = models.CharField(max_length=7)  # YYYY-MM
+    claim_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    description = models.TextField(null=True, blank=True)
+    attachments = models.JSONField(default=list, blank=True)  # file keys/urls (storage integration later)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='Draft')
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    hr_approved_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='hr_approved_claims')
+    finance_approved_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='finance_approved_claims')
+    approved_at = models.DateTimeField(null=True, blank=True)
+    paid_at = models.DateTimeField(null=True, blank=True)
+    payout_reference = models.CharField(max_length=100, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        managed = False
+        db_table = "t_reimbursement_claim"
+        indexes = [
+            models.Index(fields=['tenant', 'cycle_month', 'status']),
+            models.Index(fields=['tenant', 'employee', 'cycle_month']),
+        ]
+
+
+class PayrollArrear(TenantScopedModel):
+    """Arrears for salary revisions / retro processing."""
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='payroll_arrears')
+    from_cycle_month = models.CharField(max_length=7)  # YYYY-MM
+    to_cycle_month = models.CharField(max_length=7)    # YYYY-MM
+    arrear_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    reason = models.CharField(max_length=255, blank=True, default='')
+    status = models.CharField(max_length=20, default='Open')  # Open/Applied/Cancelled
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        managed = False
+        db_table = "t_payroll_arrear"
+        indexes = [
+            models.Index(fields=['tenant', 'employee']),
+            models.Index(fields=['tenant', 'status']),
+        ]
+
 class HolidayCalendar(TenantScopedModel):
     name = models.CharField(max_length=255)                     # e.g. "Independence Day"
     date = models.DateField()

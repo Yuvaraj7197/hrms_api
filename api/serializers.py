@@ -1,5 +1,8 @@
 from rest_framework import serializers
-from .models import User, Tenant, OTP, Department, Role, Employee, EmployeeDocument, AttendanceRecord, PayrollRecord, PayrollAuditLog, AttendanceStatus
+from .models import (
+    User, Tenant, OTP, Department, Role, Employee, EmployeeDocument, AttendanceRecord, PayrollRecord, PayrollAuditLog, AttendanceStatus,
+    PayrollCycleLock, PayrollVariableInput, EmployeeLoan, EmployeeLoanLedger, ReimbursementCategory, ReimbursementClaim, PayrollArrear
+)
 
 class TenantSerializer(serializers.ModelSerializer):
     class Meta:
@@ -141,3 +144,82 @@ class PayrollAuditLogSerializer(serializers.ModelSerializer):
     class Meta:
         model = PayrollAuditLog
         fields = ['id', 'payroll_record', 'action', 'performed_by', 'created_at', 'notes']
+
+
+class PayrollCycleLockSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PayrollCycleLock
+        fields = ['id', 'cycle_month', 'attendance_locked', 'leave_locked', 'payroll_locked', 'locked_by', 'locked_at']
+
+
+class PayrollVariableInputSerializer(serializers.ModelSerializer):
+    employee_name = serializers.CharField(source='employee.name', read_only=True, default='')
+    employee_code = serializers.CharField(source='employee.employee_code', read_only=True, default='')
+
+    class Meta:
+        model = PayrollVariableInput
+        fields = [
+            'id', 'employee', 'employee_name', 'employee_code',
+            'cycle_month', 'input_type', 'label', 'amount', 'meta',
+            'status', 'created_by', 'approved_by', 'created_at', 'updated_at',
+        ]
+
+
+class EmployeeLoanSerializer(serializers.ModelSerializer):
+    employee_name = serializers.CharField(source='employee.name', read_only=True, default='')
+    employee_code = serializers.CharField(source='employee.employee_code', read_only=True, default='')
+
+    class Meta:
+        model = EmployeeLoan
+        fields = [
+            'id', 'employee', 'employee_name', 'employee_code',
+            'loan_code', 'principal_amount', 'annual_interest_rate',
+            'tenure_months', 'emi_amount', 'start_cycle_month',
+            'status', 'remarks', 'approved_by', 'approved_at', 'created_at',
+        ]
+
+
+class EmployeeLoanLedgerSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = EmployeeLoanLedger
+        fields = [
+            'id', 'loan', 'cycle_month', 'opening_balance', 'emi_due', 'interest_due',
+            'amount_paid', 'closing_balance', 'status', 'created_at',
+        ]
+
+
+class ReimbursementCategorySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ReimbursementCategory
+        fields = ['id', 'code', 'name', 'is_active', 'taxable', 'max_amount_per_month']
+
+
+class ReimbursementClaimSerializer(serializers.ModelSerializer):
+    employee_name = serializers.CharField(source='employee.name', read_only=True, default='')
+    employee_code = serializers.CharField(source='employee.employee_code', read_only=True, default='')
+    category_name = serializers.CharField(source='category.name', read_only=True, default='')
+    category_code = serializers.CharField(source='category.code', read_only=True, default='')
+
+    class Meta:
+        model = ReimbursementClaim
+        fields = [
+            'id',
+            'employee', 'employee_name', 'employee_code',
+            'category', 'category_name', 'category_code',
+            'cycle_month', 'claim_amount', 'description', 'attachments',
+            'status', 'submitted_at', 'hr_approved_by', 'finance_approved_by',
+            'approved_at', 'paid_at', 'payout_reference', 'created_at',
+        ]
+
+
+class PayrollArrearSerializer(serializers.ModelSerializer):
+    employee_name = serializers.CharField(source='employee.name', read_only=True, default='')
+    employee_code = serializers.CharField(source='employee.employee_code', read_only=True, default='')
+
+    class Meta:
+        model = PayrollArrear
+        fields = [
+            'id', 'employee', 'employee_name', 'employee_code',
+            'from_cycle_month', 'to_cycle_month', 'arrear_amount',
+            'reason', 'status', 'created_at'
+        ]
