@@ -1730,6 +1730,33 @@ class EmployeeDocumentUploadView(views.APIView):
             "url": request.build_absolute_uri(doc.file.url) if doc.file else None
         }, status=status.HTTP_201_CREATED)
 
+
+class EmployeeDocumentVerifyView(views.APIView):
+    """HR/Admin: mark an employee document as verified/unverified."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, employee_id, document_id):
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+
+        tenant = request.user.tenant
+        doc = EmployeeDocument.objects.filter(
+            tenant=tenant,
+            employee_id=employee_id,
+            id=document_id
+        ).first()
+        if not doc:
+            return Response({"error": "Document not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        is_verified = request.data.get('is_verified')
+        doc.is_verified = bool(is_verified)
+        doc.save(update_fields=['is_verified'])
+        return Response({
+            "message": "Document verification updated",
+            "document_id": doc.id,
+            "is_verified": doc.is_verified,
+        })
+
 class AttendanceDataView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -1936,15 +1963,47 @@ class PayrollDataView(views.APIView):
 
         for employee in employees:
             base_salary = employee.base_salary if employee.base_salary else Decimal('0')
+            # If base salary is missing but CTC is available in extended_profile, derive a sensible default.
+            try:
+                ext = employee.extended_profile or {}
+            except Exception:
+                ext = {}
+            try:
+                ctc = Decimal(str(ext.get('ctc', 0) or 0))
+            except Exception:
+                ctc = Decimal('0')
+            if (base_salary is None or base_salary == 0) and ctc > 0:
+                # Default: Basic = 50% of monthly gross; align with UI auto-split.
+                monthly_gross = (ctc / Decimal('12')).quantize(Decimal('0.01'))
+                base_salary = (monthly_gross * Decimal('0.50')).quantize(Decimal('0.01'))
+                # Keep employee base_salary updated for payroll engine consistency
+                try:
+                    employee.base_salary = base_salary
+                    employee.save(update_fields=['base_salary'])
+                except Exception:
+                    pass
+
+            # Prefer onboarding breakup (monthly) if present; otherwise fallback to 20% mock allowance.
+            try:
+                hra = Decimal(str(ext.get('hra', 0) or 0))
+                allowances = Decimal(str(ext.get('allowances', 0) or 0))
+                bonus = Decimal(str(ext.get('bonus', 0) or 0))
+                incentives = Decimal(str(ext.get('incentives', 0) or 0))
+            except Exception:
+                hra = allowances = bonus = incentives = Decimal('0')
+            seeded_allowances = (hra + allowances + bonus + incentives).quantize(Decimal('0.01'))
+            if seeded_allowances <= 0:
+                seeded_allowances = (base_salary * Decimal('0.2')).quantize(Decimal('0.01'))
+
             record, created = PayrollRecord.objects.get_or_create(
                 tenant=tenant,
                 employee=employee,
                 cycle_month=cycle_month,
                 defaults={
                     'base_salary': base_salary,
-                    'allowances': base_salary * Decimal('0.2'),
+                    'allowances': seeded_allowances,
                     'deductions': Decimal('0'),
-                    'loan_emi': Decimal('5000') if employee.id % 4 == 0 else Decimal('0'),
+                    'loan_emi': Decimal('0'),
                     'tax_status': 'Pending',
                     'net_pay': Decimal('0'),
                     'status': 'Pending',
@@ -1954,7 +2013,8 @@ class PayrollDataView(views.APIView):
             # Sync base salary if the record is still pending and doesn't match
             if not created and record.status == 'Pending' and record.base_salary != base_salary:
                 record.base_salary = base_salary
-                record.allowances = base_salary * Decimal('0.2')
+                # Keep allowances in sync with onboarding breakup (or fallback)
+                record.allowances = seeded_allowances
                 record.save(update_fields=['base_salary', 'allowances'])
 
         records = PayrollRecord.objects.filter(tenant=tenant, cycle_month=cycle_month).select_related('employee__department')
@@ -2182,11 +2242,12 @@ class PayrollProcessView(views.APIView):
                         total_deductions += amount
                         breakdown["deductions"].append(comp_data)
             else:
-                # Fallback to Basic + 20% Allowance logic
-                allowance_amt = (base_salary * Decimal('0.2')).quantize(Decimal('0.01'))
+                # Fallback to Basic + onboarding allowances (or 20% if not available)
+                seeded_allow = Decimal(record.allowances or 0).quantize(Decimal('0.01'))
+                allowance_amt = seeded_allow if seeded_allow > 0 else (base_salary * Decimal('0.2')).quantize(Decimal('0.01'))
                 total_earnings = base_salary + allowance_amt
                 breakdown["earnings"].append({"name": "Basic", "amount": float(base_salary), "code": "BASIC"})
-                breakdown["earnings"].append({"name": "Standard Allowance", "amount": float(allowance_amt), "code": "SA"})
+                breakdown["earnings"].append({"name": "Allowances", "amount": float(allowance_amt), "code": "ALLOW"})
 
             # 2) Apply one-time adjustments (bonus/deduction) from the cycle
             adjustments = list(record.one_time_adjustments or [])
@@ -2254,31 +2315,51 @@ class PayrollProcessView(views.APIView):
                 breakdown["earnings"].append({"name": f"{cat_name} Reimbursement", "amount": float(amt), "code": "REIMB"})
 
             # 3) Statutory deductions computed by engine rules
+            emp = record.employee
+            ext = {}
+            try:
+                ext = emp.extended_profile or {}
+            except Exception:
+                ext = {}
+            pf_applicable = bool(getattr(emp, 'pf_applicable', True))
+            esi_applicable = bool(getattr(emp, 'esi_applicable', False))
+            tds_applicable = bool(ext.get('tds_applicable', True))
+            pt_applicable = bool(ext.get('professional_tax', True))
+
             # PF: employee deduction affects net pay; employer contribution is stored separately for display.
-            pf_emp = (base_salary * setting.pf_rate_employee / Decimal('100')).quantize(Decimal('0.01'))
-            employer_pf = (base_salary * setting.pf_rate_employer / Decimal('100')).quantize(Decimal('0.01'))
-            total_deductions += pf_emp
-            breakdown["deductions"].append({"name": "Provident Fund", "amount": float(pf_emp), "code": "PF"})
+            if pf_applicable:
+                pf_emp = (base_salary * setting.pf_rate_employee / Decimal('100')).quantize(Decimal('0.01'))
+                employer_pf = (base_salary * setting.pf_rate_employer / Decimal('100')).quantize(Decimal('0.01'))
+                total_deductions += pf_emp
+                breakdown["deductions"].append({"name": "Provident Fund", "amount": float(pf_emp), "code": "PF"})
+            else:
+                pf_emp = Decimal('0')
+                employer_pf = Decimal('0')
 
             # TDS / Income tax slab (MVP rule). If you need full regime support, extend here.
-            itax = base_salary * (
-                Decimal('0.20') if base_salary > 100000 else (Decimal('0.10') if base_salary > 50000 else Decimal('0.05'))
-            )
-            tds_amount = itax.quantize(Decimal('0.01'))
-            total_deductions += tds_amount
-            breakdown["deductions"].append({"name": "Income Tax", "amount": float(tds_amount), "code": "ITAX"})
+            if tds_applicable:
+                itax = base_salary * (
+                    Decimal('0.20') if base_salary > 100000 else (Decimal('0.10') if base_salary > 50000 else Decimal('0.05'))
+                )
+                tds_amount = itax.quantize(Decimal('0.01'))
+                total_deductions += tds_amount
+                breakdown["deductions"].append({"name": "Income Tax", "amount": float(tds_amount), "code": "ITAX"})
+            else:
+                tds_amount = Decimal('0')
 
-            ptax = Decimal('200') if base_salary > 15000 else Decimal('0')
+            ptax = (Decimal('200') if base_salary > 15000 else Decimal('0')) if pt_applicable else Decimal('0')
             if ptax > 0:
                 total_deductions += ptax
                 breakdown["deductions"].append({"name": "Professional Tax", "amount": float(ptax), "code": "PTAX"})
 
             # ESI threshold logic (employee share only affects net pay)
             # If gross pay <= 21000, apply ESI (Employee % from tenant setting)
-            if total_earnings <= Decimal('21000'):
+            if esi_applicable and total_earnings <= Decimal('21000'):
                 esi_emp = (total_earnings * setting.esi_rate_employee / Decimal('100')).quantize(Decimal('0.01'))
                 total_deductions += esi_emp
                 breakdown["deductions"].append({"name": "ESI (Employee)", "amount": float(esi_emp), "code": "ESI"})
+            else:
+                esi_emp = Decimal('0')
 
             # LOP Deduction (Loss of Pay) — based on missing paid days
             paid_days = paid_days_report.get(str(record.employee_id), 0)
@@ -2352,6 +2433,157 @@ class PayrollProcessView(views.APIView):
             updated += 1
 
         return Response({'message': 'Next-Level Payroll processing completed', 'updated': updated})
+
+
+class PayrollSimulateView(views.APIView):
+    """
+    HR/Admin: simulate a payslip calculation for preview (no DB writes).
+
+    Expected payload (monthly values unless specified):
+      - employee_id (optional; if provided we can read statutory flags from Employee)
+      - salary_structure_id (optional)
+      - ctc (annual, optional) OR base_salary + allowances/hra/bonus/incentives
+      - base_salary (monthly)
+      - hra/allowances/bonus/incentives (monthly, optional)
+      - pf_applicable / esi_applicable (optional; overrides employee flags if provided)
+      - tds_applicable / professional_tax (optional)
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        tenant = request.user.tenant
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+
+        setting, _ = PayrollSetting.objects.get_or_create(
+            tenant=tenant,
+            defaults={
+                'pf_rate_employee': Decimal('12.0'),
+                'pf_rate_employer': Decimal('12.0'),
+                'esi_rate_employee': Decimal('0.75'),
+                'esi_rate_employer': Decimal('3.25'),
+                'tax_regime_default': 'New',
+                'loan_interest_rate_annual': Decimal('8.5'),
+            }
+        )
+
+        p = request.data or {}
+        employee = None
+        emp_id = p.get('employee_id')
+        if emp_id:
+            employee = Employee.objects.filter(tenant=tenant, id=safe_int(emp_id)).first()
+
+        def _dec(val, default='0'):
+            try:
+                return Decimal(str(val if val is not None else default))
+            except Exception:
+                return Decimal(default)
+
+        ctc = _dec(p.get('ctc', 0))
+        gross_from_ctc = (ctc / Decimal('12')).quantize(Decimal('0.01')) if ctc > 0 else Decimal('0')
+
+        base_salary = _dec(p.get('base_salary', 0)).quantize(Decimal('0.01'))
+        hra = _dec(p.get('hra', 0)).quantize(Decimal('0.01'))
+        allowances = _dec(p.get('allowances', 0)).quantize(Decimal('0.01'))
+        bonus = _dec(p.get('bonus', 0)).quantize(Decimal('0.01'))
+        incentives = _dec(p.get('incentives', 0)).quantize(Decimal('0.01'))
+
+        # If base is missing but CTC is given, derive default base = 50% of monthly gross.
+        if base_salary <= 0 and gross_from_ctc > 0:
+            base_salary = (gross_from_ctc * Decimal('0.50')).quantize(Decimal('0.01'))
+
+        # Attempt to build earnings from structure if provided.
+        breakdown = {"earnings": [], "deductions": []}
+        total_earnings = Decimal('0')
+        statutory_skip_codes = {'PF_EMP', 'PF_EMPLR', 'ESI_EMP', 'ESI_EMPLR', 'PTAX', 'TDS'}
+
+        structure_id = p.get('salary_structure_id') or p.get('structure_id')
+        structure = None
+        if structure_id:
+            structure = SalaryStructure.objects.filter(tenant=tenant, id=safe_int(structure_id)).prefetch_related('components__component').first()
+
+        if structure:
+            total_earnings = base_salary
+            breakdown["earnings"].append({"name": "Basic", "amount": float(base_salary), "code": "BASIC"})
+            for sc in structure.components.all():
+                if sc.component.code == 'BASIC':
+                    continue
+                amount = Decimal('0')
+                if sc.calculation_type == 'Fixed':
+                    amount = Decimal(sc.value or 0).quantize(Decimal('0.01'))
+                elif sc.calculation_type == 'Percentage':
+                    amount = (base_salary * Decimal(sc.value or 0) / Decimal('100')).quantize(Decimal('0.01'))
+                comp_data = {"name": sc.component.name, "amount": float(amount), "code": sc.component.code}
+                if sc.component.component_type == 'Earning':
+                    total_earnings += amount
+                    breakdown["earnings"].append(comp_data)
+                else:
+                    if sc.component.code in statutory_skip_codes:
+                        continue
+                    breakdown["deductions"].append(comp_data)
+        else:
+            # Use manual breakup (hra/allowances/bonus/incentives) if present; else fallback.
+            extra = (hra + allowances + bonus + incentives).quantize(Decimal('0.01'))
+            if extra <= 0 and gross_from_ctc > 0:
+                # If only CTC is present, treat remaining as allowances.
+                extra = (gross_from_ctc - base_salary).quantize(Decimal('0.01'))
+            if extra < 0:
+                extra = Decimal('0')
+            total_earnings = (base_salary + extra).quantize(Decimal('0.01'))
+            breakdown["earnings"].append({"name": "Basic", "amount": float(base_salary), "code": "BASIC"})
+            breakdown["earnings"].append({"name": "Allowances", "amount": float(extra), "code": "ALLOW"})
+
+        # Statutory flags: payload overrides employee when provided.
+        pf_applicable = bool(p.get('pf_applicable')) if 'pf_applicable' in p else bool(getattr(employee, 'pf_applicable', True) if employee else True)
+        esi_applicable = bool(p.get('esi_applicable')) if 'esi_applicable' in p else bool(getattr(employee, 'esi_applicable', False) if employee else False)
+        tds_applicable = bool(p.get('tds_applicable')) if 'tds_applicable' in p else bool(getattr(employee, 'extended_profile', {}).get('tds_applicable', True) if employee else True)
+        pt_applicable = bool(p.get('professional_tax')) if 'professional_tax' in p else bool(getattr(employee, 'extended_profile', {}).get('professional_tax', True) if employee else True)
+
+        total_deductions = Decimal('0')
+        employer_pf = Decimal('0')
+        esi_emp = Decimal('0')
+        tds_amount = Decimal('0')
+        ptax = Decimal('0')
+
+        if pf_applicable:
+            pf_emp = (base_salary * setting.pf_rate_employee / Decimal('100')).quantize(Decimal('0.01'))
+            employer_pf = (base_salary * setting.pf_rate_employer / Decimal('100')).quantize(Decimal('0.01'))
+            total_deductions += pf_emp
+            breakdown["deductions"].append({"name": "Provident Fund", "amount": float(pf_emp), "code": "PF"})
+
+        if tds_applicable:
+            itax = base_salary * (
+                Decimal('0.20') if base_salary > 100000 else (Decimal('0.10') if base_salary > 50000 else Decimal('0.05'))
+            )
+            tds_amount = itax.quantize(Decimal('0.01'))
+            total_deductions += tds_amount
+            breakdown["deductions"].append({"name": "Income Tax", "amount": float(tds_amount), "code": "ITAX"})
+
+        if pt_applicable:
+            ptax = Decimal('200') if base_salary > 15000 else Decimal('0')
+            if ptax > 0:
+                total_deductions += ptax
+                breakdown["deductions"].append({"name": "Professional Tax", "amount": float(ptax), "code": "PTAX"})
+
+        if esi_applicable and total_earnings <= Decimal('21000'):
+            esi_emp = (total_earnings * setting.esi_rate_employee / Decimal('100')).quantize(Decimal('0.01'))
+            total_deductions += esi_emp
+            breakdown["deductions"].append({"name": "ESI (Employee)", "amount": float(esi_emp), "code": "ESI"})
+
+        net_pay = (total_earnings - total_deductions).quantize(Decimal('0.01'))
+        return Response({
+            "gross_pay": float(total_earnings),
+            "total_deductions": float(total_deductions),
+            "net_pay": float(net_pay),
+            "statutory": {
+                "pf_employee": float((base_salary * setting.pf_rate_employee / Decimal('100')).quantize(Decimal('0.01'))) if pf_applicable else 0,
+                "pf_employer": float(employer_pf),
+                "esi_employee": float(esi_emp),
+                "tds": float(tds_amount),
+                "ptax": float(ptax),
+            },
+            "breakdown": breakdown,
+        })
 
 
 class PayrollTaxVerifyView(views.APIView):
@@ -2511,6 +2743,7 @@ class EmployeeSalarySetupView(views.APIView):
         tenant = request.user.tenant
         emp_id = request.data.get('employee_id')
         struct_id = request.data.get('structure_id')
+        effective_from = request.data.get('effective_from')
         
         # DEBUG LOG
         print(f"DEBUG: emp_id={repr(emp_id)}, type={type(emp_id)}")
@@ -2531,12 +2764,24 @@ class EmployeeSalarySetupView(views.APIView):
         except Exception as e:
             return Response({"error": f"Exception checking emp_id {emp_id}: {str(e)}"}, status=400)
         
+        # Parse effective_from if provided (YYYY-MM-DD), else default to today.
+        eff = timezone.localdate()
+        if effective_from:
+            try:
+                from datetime import date
+                if isinstance(effective_from, date):
+                    eff = effective_from
+                else:
+                    eff = date.fromisoformat(str(effective_from))
+            except Exception:
+                eff = timezone.localdate()
+
         EmployeeSalaryStructure.objects.update_or_create(
             tenant=tenant,
             employee_id=emp_id,
             defaults={
                 'structure_id': struct_id,
-                'effective_from': timezone.localdate(),
+                'effective_from': eff,
                 'is_active': True
             }
         )
@@ -3211,6 +3456,36 @@ class HREmployeeListView(views.APIView):
                 extended_profile=payload.get('extended_profile', {}),
             )
 
+            # Persist salary structure link (source of truth for payroll).
+            struct_id = payload.get('salary_structure_id') or payload.get('structure_id')
+            eff = payload.get('salary_effective_from') or payload.get('effective_from') or payload.get('joining_date')
+            if struct_id:
+                try:
+                    # Let setup endpoint logic handle parsing/tenant scoping via ORM here.
+                    # effective_from: if invalid/missing, default to today.
+                    from datetime import date
+                    eff_date = timezone.localdate()
+                    if eff:
+                        try:
+                            eff_date = eff if isinstance(eff, date) else date.fromisoformat(str(eff))
+                        except Exception:
+                            eff_date = timezone.localdate()
+                    # Validate structure belongs to tenant
+                    s = SalaryStructure.objects.filter(tenant=tenant, id=safe_int(struct_id)).first()
+                    if s:
+                        EmployeeSalaryStructure.objects.update_or_create(
+                            tenant=tenant,
+                            employee=employee,
+                            defaults={
+                                'structure': s,
+                                'effective_from': eff_date,
+                                'is_active': True,
+                            }
+                        )
+                except Exception:
+                    # Salary structure linking should not block employee creation.
+                    pass
+
             # Create login account if requested
             create_account = payload.get('create_account')
             if str(create_account).lower() == 'true' or create_account is True:
@@ -3336,6 +3611,32 @@ class HREmployeeDetailView(views.APIView):
         if p.get('reporting_hr_id'):
             e.reporting_hr = Employee.objects.filter(tenant=tenant, id=safe_int(p['reporting_hr_id'])).first()
         e.save()
+
+        # Persist salary structure link updates (if provided).
+        struct_id = p.get('salary_structure_id') or p.get('structure_id')
+        eff = p.get('salary_effective_from') or p.get('effective_from') or p.get('joining_date')
+        if struct_id is not None:
+            try:
+                from datetime import date
+                eff_date = timezone.localdate()
+                if eff:
+                    try:
+                        eff_date = eff if isinstance(eff, date) else date.fromisoformat(str(eff))
+                    except Exception:
+                        eff_date = timezone.localdate()
+                s = SalaryStructure.objects.filter(tenant=tenant, id=safe_int(struct_id)).first()
+                if s:
+                    EmployeeSalaryStructure.objects.update_or_create(
+                        tenant=tenant,
+                        employee=e,
+                        defaults={
+                            'structure': s,
+                            'effective_from': eff_date,
+                            'is_active': True,
+                        }
+                    )
+            except Exception:
+                pass
 
         # Optional: update linked login role designation (t_user.role FK -> t_role)
         if e.user and p.get('designation_id') is not None:

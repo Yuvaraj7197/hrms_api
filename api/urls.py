@@ -25,6 +25,7 @@ urlpatterns = [
     path('employees/',               views.HREmployeeListView.as_view(),          name='hr_employees'),
     path('employees/<int:employee_id>/', views.HREmployeeDetailView.as_view(),    name='hr_employee_detail'),
     path('employees/<int:employee_id>/upload/', views.EmployeeDocumentUploadView.as_view(), name='employee_document_upload'),
+    path('employees/<int:employee_id>/documents/<int:document_id>/verify/', views.EmployeeDocumentVerifyView.as_view(), name='employee_document_verify'),
 
     # ── Attendance ──────────────────────────────────────
     path('attendance/data/',         views.AttendanceDataView.as_view(),          name='attendance_data'),
@@ -37,6 +38,7 @@ urlpatterns = [
     # ── Payroll ────────────────────────────────────────
     path('payroll/data/',            views.PayrollDataView.as_view(),             name='payroll_data'),
     path('payroll/process/',         views.PayrollProcessView.as_view(),          name='payroll_process'),
+    path('payroll/simulate/',        views.PayrollSimulateView.as_view(),         name='payroll_simulate'),
     path('payroll/components/',      views.SalaryComponentView.as_view(),         name='salary_components'),
     path('payroll/structures/',      views.SalaryStructureView.as_view(),         name='salary_structures'),
     path('payroll/setup/',           views.EmployeeSalarySetupView.as_view(),     name='employee_salary_setup'),
