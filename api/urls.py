@@ -31,6 +31,7 @@ urlpatterns = [
     path('employees/<int:employee_id>/salary-revision/', views.EmployeeSalaryRevisionView.as_view(), name='employee_salary_revision'),
     path('employees/<int:employee_id>/exit/', views.EmployeeExitView.as_view(), name='employee_exit'),
     path('employees/<int:employee_id>/reinstate/', views.EmployeeReinstateView.as_view(), name='employee_reinstate'),
+    path('employees/<int:employee_id>/shift-assignments/', views.EmployeeShiftAssignmentsView.as_view(), name='employee_shift_assignments'),
 
     # ── HR Lifecycle (tenant-wide reporting) ──────────────────────────────
     path('lifecycle/transfers/', views.LifecycleTransfersListView.as_view(), name='lifecycle_transfers'),
@@ -105,4 +106,8 @@ urlpatterns = [
     path('master/departments/',      views.MasterDepartmentView.as_view(),       name='master_departments'),
     path('master/roles/',            views.MasterRoleView.as_view(),             name='master_roles'),
     path('lookups/',                 views.MasterLookupView.as_view(),           name='master_lookups'),
+
+    # ── Org Masters (Branch / Shift) ─────────────────────────────────────
+    path('branches/',                views.BranchMasterView.as_view(),          name='branches'),
+    path('shifts/',                  views.ShiftMasterView.as_view(),           name='shifts'),
 ]
