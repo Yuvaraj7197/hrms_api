@@ -10,9 +10,9 @@ from .models import (
     PayrollAuditLog, EmployeeDocument, AttendanceStatus, SalaryComponent, 
     SalaryStructure, SalaryStructureComponent, EmployeeSalaryStructure, PayrollSetting,
     LeaveType, LeaveBalance, LeaveApplication, HolidayCalendar, Notification,
-    IndustryMaster, DepartmentMaster, RoleMaster, RolePermission
+    IndustryMaster, DepartmentMaster, RoleMaster, RolePermission, Branch, Shift
 )
-from .serializers import RegisterSerializer, OTPVerifySerializer, OnboardingSerializer, UserSerializer, DepartmentSerializer, RoleSerializer, EmployeeSerializer, AttendanceRecordSerializer, EmployeeDocumentSerializer, AttendanceStatusSerializer
+from .serializers import RegisterSerializer, OTPVerifySerializer, OnboardingSerializer, UserSerializer, DepartmentSerializer, RoleSerializer, EmployeeSerializer, AttendanceRecordSerializer, EmployeeDocumentSerializer, AttendanceStatusSerializer, BranchSerializer, ShiftSerializer
 from django.db import transaction, connection
 from django.db.models import Q
 from django.core.mail import send_mail
@@ -476,6 +476,207 @@ def ensure_hr_lifecycle_tables_exist():
                 CONSTRAINT t_emp_exit_emp_fk FOREIGN KEY (employee_id) REFERENCES t_employee(id) ON DELETE CASCADE
             )
             """
+        )
+
+
+def ensure_branch_shift_tables_exist():
+    """Create branch + shift masters if missing (SQLite + MySQL)."""
+    vendor = getattr(connection, "vendor", "")
+    with connection.cursor() as cursor:
+        if vendor == "sqlite":
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS t_branch (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id CHAR(32) NOT NULL,
+                    code VARCHAR(30) DEFAULT '',
+                    name VARCHAR(255) NOT NULL,
+                    address TEXT,
+                    city VARCHAR(100),
+                    state VARCHAR(100),
+                    country VARCHAR(100) DEFAULT 'India',
+                    is_active BOOLEAN DEFAULT 1,
+                    created_at DATETIME NOT NULL,
+                    FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS t_shift (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id CHAR(32) NOT NULL,
+                    code VARCHAR(30) DEFAULT '',
+                    name VARCHAR(100) NOT NULL,
+                    start_time TIME NOT NULL,
+                    end_time TIME NOT NULL,
+                    grace_minutes INTEGER DEFAULT 0,
+                    is_night_shift BOOLEAN DEFAULT 0,
+                    is_active BOOLEAN DEFAULT 1,
+                    created_at DATETIME NOT NULL,
+                    FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE
+                )
+                """
+            )
+            # Add optional branch_id column to t_employee if missing (best-effort)
+            try:
+                cursor.execute("SELECT branch_id FROM t_employee LIMIT 1")
+            except Exception:
+                try:
+                    cursor.execute("ALTER TABLE t_employee ADD COLUMN branch_id INTEGER NULL")
+                except Exception:
+                    pass
+            return
+
+        # MySQL / MariaDB
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_branch (
+                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                tenant_id CHAR(32) NOT NULL,
+                code VARCHAR(30) DEFAULT '',
+                name VARCHAR(255) NOT NULL,
+                address TEXT NULL,
+                city VARCHAR(100) NULL,
+                state VARCHAR(100) NULL,
+                country VARCHAR(100) DEFAULT 'India',
+                is_active BOOLEAN DEFAULT 1,
+                created_at DATETIME(6) NOT NULL,
+                INDEX t_branch_tenant_idx (tenant_id),
+                CONSTRAINT t_branch_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_shift (
+                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                tenant_id CHAR(32) NOT NULL,
+                code VARCHAR(30) DEFAULT '',
+                name VARCHAR(100) NOT NULL,
+                start_time TIME NOT NULL,
+                end_time TIME NOT NULL,
+                grace_minutes INT DEFAULT 0,
+                is_night_shift BOOLEAN DEFAULT 0,
+                is_active BOOLEAN DEFAULT 1,
+                created_at DATETIME(6) NOT NULL,
+                INDEX t_shift_tenant_idx (tenant_id),
+                CONSTRAINT t_shift_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE
+            )
+            """
+        )
+        # Add optional branch_id column to t_employee if missing
+        try:
+            cursor.execute("SELECT branch_id FROM t_employee LIMIT 1")
+        except Exception:
+            try:
+                cursor.execute("ALTER TABLE t_employee ADD COLUMN branch_id BIGINT NULL")
+            except Exception:
+                pass
+
+
+def ensure_employee_shift_assignment_tables_exist():
+    """
+    Shift assignment history for employees (effective-dated).
+    Stored in its own table instead of extended_profile to keep payroll/attendance reliable.
+    """
+    ensure_branch_shift_tables_exist()
+    vendor = getattr(connection, "vendor", "")
+    with connection.cursor() as cursor:
+        if vendor == "sqlite":
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS t_employee_shift_assignment (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id CHAR(32) NOT NULL,
+                    employee_id INTEGER NOT NULL,
+                    shift_id INTEGER NOT NULL,
+                    effective_from DATE NOT NULL,
+                    effective_to DATE NULL,
+                    is_active BOOLEAN DEFAULT 1,
+                    created_by_id INTEGER NULL,
+                    created_at DATETIME NOT NULL,
+                    FOREIGN KEY(tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
+                    FOREIGN KEY(employee_id) REFERENCES t_employee(id) ON DELETE CASCADE,
+                    FOREIGN KEY(shift_id) REFERENCES t_shift(id) ON DELETE RESTRICT
+                )
+                """
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS t_emp_shift_tenant_emp_idx ON t_employee_shift_assignment(tenant_id, employee_id)"
+            )
+            return
+
+        # MySQL / MariaDB
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_employee_shift_assignment (
+                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                tenant_id CHAR(32) NOT NULL,
+                employee_id BIGINT NOT NULL,
+                shift_id BIGINT NOT NULL,
+                effective_from DATE NOT NULL,
+                effective_to DATE NULL,
+                is_active BOOLEAN DEFAULT 1,
+                created_by_id BIGINT NULL,
+                created_at DATETIME(6) NOT NULL,
+                INDEX t_emp_shift_tenant_emp_idx (tenant_id, employee_id),
+                INDEX t_emp_shift_tenant_shift_idx (tenant_id, shift_id),
+                CONSTRAINT t_emp_shift_tenant_fk FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
+                CONSTRAINT t_emp_shift_emp_fk FOREIGN KEY (employee_id) REFERENCES t_employee(id) ON DELETE CASCADE,
+                CONSTRAINT t_emp_shift_shift_fk FOREIGN KEY (shift_id) REFERENCES t_shift(id) ON DELETE RESTRICT
+            )
+            """
+        )
+
+
+def _upsert_employee_shift_assignment(tenant_id, employee_id, shift_id, effective_from, created_by_id=None):
+    """
+    Make the given shift the active assignment as of effective_from.
+    Closes any previous active assignment by setting effective_to = effective_from - 1 day.
+    """
+    if not (tenant_id and employee_id and shift_id and effective_from):
+        return
+    ensure_employee_shift_assignment_tables_exist()
+    vendor = getattr(connection, "vendor", "")
+    with connection.cursor() as cursor:
+        # Close previous active assignment(s)
+        if vendor == "sqlite":
+            cursor.execute(
+                """
+                UPDATE t_employee_shift_assignment
+                SET is_active = 0,
+                    effective_to = date(?, '-1 day')
+                WHERE tenant_id = ? AND employee_id = ? AND is_active = 1
+                """,
+                [str(effective_from), str(tenant_id), int(employee_id)],
+            )
+            cursor.execute(
+                """
+                INSERT INTO t_employee_shift_assignment
+                  (tenant_id, employee_id, shift_id, effective_from, effective_to, is_active, created_by_id, created_at)
+                VALUES (?, ?, ?, ?, NULL, 1, ?, ?)
+                """,
+                [str(tenant_id), int(employee_id), int(shift_id), str(effective_from), created_by_id, timezone.now()],
+            )
+            return
+
+        cursor.execute(
+            """
+            UPDATE t_employee_shift_assignment
+            SET is_active = 0,
+                effective_to = DATE_SUB(%s, INTERVAL 1 DAY)
+            WHERE tenant_id = %s AND employee_id = %s AND is_active = 1
+            """,
+            [effective_from, tenant_id, employee_id],
+        )
+        cursor.execute(
+            """
+            INSERT INTO t_employee_shift_assignment
+              (tenant_id, employee_id, shift_id, effective_from, effective_to, is_active, created_by_id, created_at)
+            VALUES (%s, %s, %s, %s, NULL, 1, %s, %s)
+            """,
+            [tenant_id, employee_id, shift_id, effective_from, created_by_id, timezone.now()],
         )
 
 
@@ -3559,6 +3760,7 @@ class HREmployeeListView(views.APIView):
 
     def get(self, request):
         ensure_master_tables_exist()
+        ensure_branch_shift_tables_exist()
         if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
@@ -3581,6 +3783,9 @@ class HREmployeeListView(views.APIView):
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         payload = request.data
+        ensure_branch_shift_tables_exist()
+        ensure_employee_shift_assignment_tables_exist()
+        ensure_hr_lifecycle_tables_exist()
 
         # Auto-generate employee code if not provided
         emp_code = payload.get('employee_code') or self._generate_code(tenant)
@@ -3589,6 +3794,7 @@ class HREmployeeListView(views.APIView):
         role = Role.objects.filter(tenant=tenant, id=safe_int(payload.get('designation_id'))).first()
         manager = Employee.objects.filter(tenant=tenant, id=safe_int(payload.get('reporting_to_id'))).first()
         hr_manager = Employee.objects.filter(tenant=tenant, id=safe_int(payload.get('reporting_hr_id'))).first()
+        branch = Branch.objects.filter(tenant=tenant, id=safe_int(payload.get('branch_id'))).first()
 
         with transaction.atomic():
             employee = Employee.objects.create(
@@ -3597,6 +3803,7 @@ class HREmployeeListView(views.APIView):
                 email=payload.get('email'),
                 phone=payload.get('phone', ''),
                 employee_code=emp_code,
+                branch=branch,
                 department=dept,
                 designation=role,
                 reporting_to=manager,
@@ -3631,6 +3838,37 @@ class HREmployeeListView(views.APIView):
                 nationality=payload.get('nationality', 'Indian'),
                 extended_profile=payload.get('extended_profile', {}),
             )
+
+            # Persist shift assignment history (effective-dated).
+            shift_id = payload.get('shift_id')
+            if shift_id is None and isinstance(payload.get('extended_profile'), dict):
+                shift_id = payload['extended_profile'].get('shift_id')
+            eff = payload.get('shift_effective_from') or payload.get('joining_date')
+            if shift_id:
+                try:
+                    from datetime import date
+                    eff_date = timezone.localdate()
+                    if eff:
+                        try:
+                            eff_date = eff if isinstance(eff, date) else date.fromisoformat(str(eff))
+                        except Exception:
+                            eff_date = timezone.localdate()
+                    sft = Shift.objects.filter(tenant=tenant, id=safe_int(shift_id)).first()
+                    if sft:
+                        _upsert_employee_shift_assignment(tenant.id, employee.id, sft.id, eff_date, request.user.id)
+                        try:
+                            _insert_lifecycle_event(
+                                tenant.id,
+                                employee.id,
+                                "SHIFT_CHANGE",
+                                eff_date,
+                                {"shift_id": sft.id, "shift_name": sft.name},
+                                request.user.id,
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
 
             # Persist salary structure link (source of truth for payroll).
             struct_id = payload.get('salary_structure_id') or payload.get('structure_id')
@@ -3711,6 +3949,7 @@ class HREmployeeDetailView(views.APIView):
     def get(self, request, employee_id):
         ensure_master_tables_exist()
         ensure_hr_lifecycle_tables_exist()
+        ensure_branch_shift_tables_exist()
         if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
@@ -3724,6 +3963,8 @@ class HREmployeeDetailView(views.APIView):
 
     def put(self, request, employee_id):
         ensure_hr_lifecycle_tables_exist()
+        ensure_branch_shift_tables_exist()
+        ensure_employee_shift_assignment_tables_exist()
         if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
@@ -3784,11 +4025,45 @@ class HREmployeeDetailView(views.APIView):
             e.department = Department.objects.filter(tenant=tenant, id=safe_int(p['department_id'])).first()
         if p.get('designation_id'):
             e.designation = Role.objects.filter(tenant=tenant, id=safe_int(p['designation_id'])).first()
+        if 'branch_id' in p:
+            bid = p.get('branch_id')
+            e.branch = Branch.objects.filter(tenant=tenant, id=safe_int(bid)).first() if bid else None
         if p.get('reporting_to_id'):
             e.reporting_to = Employee.objects.filter(tenant=tenant, id=safe_int(p['reporting_to_id'])).first()
         if p.get('reporting_hr_id'):
             e.reporting_hr = Employee.objects.filter(tenant=tenant, id=safe_int(p['reporting_hr_id'])).first()
         e.save()
+
+        # Persist shift assignment history (effective-dated), if provided.
+        shift_id = p.get('shift_id')
+        if shift_id is None and isinstance(p.get('extended_profile'), dict):
+            shift_id = p['extended_profile'].get('shift_id')
+        eff = p.get('shift_effective_from') or p.get('joining_date') or e.joining_date
+        if shift_id:
+            try:
+                from datetime import date
+                eff_date = timezone.localdate()
+                if eff:
+                    try:
+                        eff_date = eff if isinstance(eff, date) else date.fromisoformat(str(eff))
+                    except Exception:
+                        eff_date = timezone.localdate()
+                sft = Shift.objects.filter(tenant=tenant, id=safe_int(shift_id)).first()
+                if sft:
+                    _upsert_employee_shift_assignment(tenant.id, e.id, sft.id, eff_date, request.user.id)
+                    try:
+                        _insert_lifecycle_event(
+                            tenant.id,
+                            e.id,
+                            "SHIFT_CHANGE",
+                            eff_date,
+                            {"shift_id": sft.id, "shift_name": sft.name},
+                            request.user.id,
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
         # Persist salary structure link updates (if provided).
         struct_id = p.get('salary_structure_id') or p.get('structure_id')
@@ -5375,6 +5650,213 @@ class HolidayCalendarView(views.APIView):
 
 
 # ─────────────────────────────────────────────
+# Org Masters — Branch / Shift
+# ─────────────────────────────────────────────
+class BranchMasterView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        ensure_branch_shift_tables_exist()
+        qs = Branch.objects.filter(tenant=request.user.tenant, is_active=True).order_by('name')
+        return Response({"branches": BranchSerializer(qs, many=True).data})
+
+    def post(self, request):
+        ensure_branch_shift_tables_exist()
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+        data = request.data.copy()
+        data['tenant'] = request.user.tenant.id
+        ser = BranchSerializer(data=data)
+        if not ser.is_valid():
+            return Response(ser.errors, status=400)
+        obj = Branch.objects.create(
+            tenant=request.user.tenant,
+            code=ser.validated_data.get('code', ''),
+            name=ser.validated_data.get('name'),
+            address=ser.validated_data.get('address'),
+            city=ser.validated_data.get('city'),
+            state=ser.validated_data.get('state'),
+            country=ser.validated_data.get('country', 'India'),
+            is_active=True,
+        )
+        return Response({"message": "Branch created", "branch": BranchSerializer(obj).data}, status=201)
+
+    def put(self, request):
+        ensure_branch_shift_tables_exist()
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+        bid = request.data.get('id')
+        obj = Branch.objects.filter(tenant=request.user.tenant, id=safe_int(bid)).first()
+        if not obj:
+            return Response({"error": "Branch not found"}, status=404)
+        for f in ['code', 'name', 'address', 'city', 'state', 'country']:
+            if f in request.data:
+                setattr(obj, f, request.data.get(f))
+        if 'is_active' in request.data:
+            obj.is_active = bool(request.data.get('is_active'))
+        obj.save()
+        return Response({"message": "Branch updated", "branch": BranchSerializer(obj).data})
+
+    def delete(self, request):
+        ensure_branch_shift_tables_exist()
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+        bid = request.query_params.get('id') or request.data.get('id')
+        obj = Branch.objects.filter(tenant=request.user.tenant, id=safe_int(bid)).first()
+        if not obj:
+            return Response({"error": "Branch not found"}, status=404)
+        obj.is_active = False
+        obj.save(update_fields=['is_active'])
+        return Response({"message": "Branch deactivated"})
+
+
+class ShiftMasterView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        ensure_branch_shift_tables_exist()
+        qs = Shift.objects.filter(tenant=request.user.tenant, is_active=True).order_by('name')
+        return Response({"shifts": ShiftSerializer(qs, many=True).data})
+
+    def post(self, request):
+        ensure_branch_shift_tables_exist()
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+        ser = ShiftSerializer(data=request.data)
+        if not ser.is_valid():
+            return Response(ser.errors, status=400)
+        obj = Shift.objects.create(
+            tenant=request.user.tenant,
+            code=ser.validated_data.get('code', ''),
+            name=ser.validated_data.get('name'),
+            start_time=ser.validated_data.get('start_time'),
+            end_time=ser.validated_data.get('end_time'),
+            grace_minutes=ser.validated_data.get('grace_minutes', 0),
+            is_night_shift=ser.validated_data.get('is_night_shift', False),
+            is_active=True,
+        )
+        return Response({"message": "Shift created", "shift": ShiftSerializer(obj).data}, status=201)
+
+    def put(self, request):
+        ensure_branch_shift_tables_exist()
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+        sid = request.data.get('id')
+        obj = Shift.objects.filter(tenant=request.user.tenant, id=safe_int(sid)).first()
+        if not obj:
+            return Response({"error": "Shift not found"}, status=404)
+        for f in ['code', 'name', 'start_time', 'end_time', 'grace_minutes', 'is_night_shift']:
+            if f in request.data:
+                setattr(obj, f, request.data.get(f))
+        if 'is_active' in request.data:
+            obj.is_active = bool(request.data.get('is_active'))
+        obj.save()
+        return Response({"message": "Shift updated", "shift": ShiftSerializer(obj).data})
+
+    def delete(self, request):
+        ensure_branch_shift_tables_exist()
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+        sid = request.query_params.get('id') or request.data.get('id')
+        obj = Shift.objects.filter(tenant=request.user.tenant, id=safe_int(sid)).first()
+        if not obj:
+            return Response({"error": "Shift not found"}, status=404)
+        obj.is_active = False
+        obj.save(update_fields=['is_active'])
+        return Response({"message": "Shift deactivated"})
+
+
+class EmployeeShiftAssignmentsView(views.APIView):
+    """HR/Admin: list/create employee shift assignment history."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, employee_id):
+        ensure_employee_shift_assignment_tables_exist()
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
+            return Response({"error": "Permission denied"}, status=403)
+        tenant = request.user.tenant
+        with connection.cursor() as cursor:
+            vendor = getattr(connection, "vendor", "")
+            if vendor == "sqlite":
+                cursor.execute(
+                    """
+                    SELECT esa.id, esa.shift_id, s.name, esa.effective_from, esa.effective_to, esa.is_active, esa.created_at
+                    FROM t_employee_shift_assignment esa
+                    LEFT JOIN t_shift s ON s.id = esa.shift_id
+                    WHERE esa.tenant_id = ? AND esa.employee_id = ?
+                    ORDER BY esa.effective_from DESC, esa.created_at DESC
+                    LIMIT 200
+                    """,
+                    [str(tenant.id), int(employee_id)],
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT esa.id, esa.shift_id, s.name, esa.effective_from, esa.effective_to, esa.is_active, esa.created_at
+                    FROM t_employee_shift_assignment esa
+                    LEFT JOIN t_shift s ON s.id = esa.shift_id
+                    WHERE esa.tenant_id = %s AND esa.employee_id = %s
+                    ORDER BY esa.effective_from DESC, esa.created_at DESC
+                    LIMIT 200
+                    """,
+                    [tenant.id, employee_id],
+                )
+            rows = cursor.fetchall()
+        data = []
+        for r in rows:
+            data.append({
+                "id": r[0],
+                "shift_id": r[1],
+                "shift_name": r[2] or "",
+                "effective_from": str(r[3]) if r[3] else None,
+                "effective_to": str(r[4]) if r[4] else None,
+                "is_active": bool(r[5]),
+                "created_at": str(r[6]) if r[6] else None,
+            })
+        return Response({"assignments": data})
+
+    def post(self, request, employee_id):
+        ensure_employee_shift_assignment_tables_exist()
+        ensure_hr_lifecycle_tables_exist()
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+        tenant = request.user.tenant
+        try:
+            e = Employee.objects.get(tenant=tenant, id=employee_id)
+        except Employee.DoesNotExist:
+            return Response({"error": "Employee not found"}, status=404)
+
+        shift_id = request.data.get('shift_id')
+        effective_from = request.data.get('effective_from') or request.data.get('shift_effective_from') or e.joining_date or timezone.localdate()
+        if not shift_id:
+            return Response({"error": "shift_id is required"}, status=400)
+
+        try:
+            from datetime import date
+            eff_date = effective_from if isinstance(effective_from, date) else date.fromisoformat(str(effective_from))
+        except Exception:
+            eff_date = timezone.localdate()
+
+        sft = Shift.objects.filter(tenant=tenant, id=safe_int(shift_id)).first()
+        if not sft:
+            return Response({"error": "Shift not found"}, status=404)
+
+        _upsert_employee_shift_assignment(tenant.id, e.id, sft.id, eff_date, request.user.id)
+        try:
+            _insert_lifecycle_event(
+                tenant.id,
+                e.id,
+                "SHIFT_CHANGE",
+                eff_date,
+                {"shift_id": sft.id, "shift_name": sft.name},
+                request.user.id,
+            )
+        except Exception:
+            pass
+        return Response({"message": "Shift assigned", "shift_id": sft.id, "effective_from": str(eff_date)})
+
+
+# ─────────────────────────────────────────────
 # LEAVE TYPES — GET/POST (settings page)
 # ─────────────────────────────────────────────
 class LeaveTypeMasterView(views.APIView):
@@ -6104,6 +6586,12 @@ SEED_LOOKUP_DATA = {
         ('General', 'General'), ('Morning', 'Morning'),
         ('Afternoon', 'Afternoon'), ('Night', 'Night'),
     ],
+    'SHIFT_CODE': [
+        ('GEN', 'GEN'),
+        ('MOR', 'MOR'),
+        ('EVE', 'EVE'),
+        ('NIG', 'NIG'),
+    ],
     'GRADE': [
         ('G1', 'G1'), ('G2', 'G2'), ('G3', 'G3'),
         ('G4', 'G4'), ('G5', 'G5'), ('G6', 'G6'),
@@ -6117,6 +6605,17 @@ SEED_LOOKUP_DATA = {
         ('Headquarters', 'Headquarters'), ('North Region', 'North Region'),
         ('South Region', 'South Region'), ('East Region', 'East Region'), ('West Region', 'West Region'),
     ],
+    'WORK_LOCATION': [
+        ('HQ', 'HQ'),
+        ('PLANT', 'Plant'),
+        ('WAREHOUSE', 'Warehouse'),
+        ('REMOTE', 'Remote'),
+    ],
+    'COST_CENTER': [
+        ('CC001', 'CC001'),
+        ('CC002', 'CC002'),
+        ('CC003', 'CC003'),
+    ],
     'BANK': [
         ('State Bank of India', 'State Bank of India'), ('HDFC Bank', 'HDFC Bank'),
         ('ICICI Bank', 'ICICI Bank'), ('Axis Bank', 'Axis Bank'),
@@ -6128,6 +6627,16 @@ SEED_LOOKUP_DATA = {
     'PAYMENT_MODE': [
         ('Bank Transfer', 'Bank Transfer'), ('Cash', 'Cash'),
         ('Cheque', 'Cheque'), ('UPI', 'UPI'),
+    ],
+    'PAYROLL_GROUP': [
+        ('DEFAULT', 'Default'),
+        ('STAFF', 'Staff'),
+        ('WORKERS', 'Workers'),
+    ],
+    'BANK_BRANCH': [
+        ('MAIN', 'Main Branch'),
+        ('HQ', 'HQ Branch'),
+        ('CITY', 'City Branch'),
     ],
     'TAX_REGIME': [
         ('New', 'New Tax Regime'), ('Old', 'Old Tax Regime'),

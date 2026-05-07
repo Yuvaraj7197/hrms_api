@@ -2,6 +2,7 @@ from rest_framework import serializers
 from .models import (
     User, Tenant, OTP, Department, Role, Employee, EmployeeDocument, AttendanceRecord, PayrollRecord, PayrollAuditLog, AttendanceStatus,
     PayrollCycleLock, PayrollVariableInput, EmployeeLoan, EmployeeLoanLedger, ReimbursementCategory, ReimbursementClaim, PayrollArrear
+    , Branch, Shift
 )
 
 class TenantSerializer(serializers.ModelSerializer):
@@ -48,6 +49,16 @@ class DepartmentSerializer(serializers.ModelSerializer):
         model = Department
         fields = ['id', 'name', 'head_count']
 
+class BranchSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Branch
+        fields = ['id', 'code', 'name', 'address', 'city', 'state', 'country', 'is_active', 'created_at']
+
+class ShiftSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Shift
+        fields = ['id', 'code', 'name', 'start_time', 'end_time', 'grace_minutes', 'is_night_shift', 'is_active', 'created_at']
+
 class RoleSerializer(serializers.ModelSerializer):
     class Meta:
         model = Role
@@ -65,12 +76,16 @@ class EmployeeSerializer(serializers.ModelSerializer):
     department_name   = serializers.CharField(source='department.name',       read_only=True, default='')
     designation_name  = serializers.CharField(source='designation.name',      read_only=True, default='')
     reporting_to_name = serializers.CharField(source='reporting_to.name',     read_only=True, default='')
+    branch_name       = serializers.CharField(source='branch.name',           read_only=True, default='')
     user_role = serializers.CharField(source='user.system_role', read_only=True, default='EMPLOYEE')
     salary_structure_name = serializers.CharField(source='salary_structure.structure.name', read_only=True, default='')
     salary_structure_id = serializers.IntegerField(source='salary_structure.structure.id', read_only=True, default=None)
     reporting_to_code = serializers.CharField(source='reporting_to.employee_code', read_only=True, default='')
     reporting_hr_name = serializers.CharField(source='reporting_hr.name',     read_only=True, default='')
     reporting_hr_code = serializers.CharField(source='reporting_hr.employee_code', read_only=True, default='')
+
+    shift_id = serializers.SerializerMethodField()
+    shift_name = serializers.SerializerMethodField()
 
     class Meta:
         model = Employee
@@ -79,12 +94,14 @@ class EmployeeSerializer(serializers.ModelSerializer):
             'id', 'employee_code', 'name', 'email', 'phone', 'personal_email',
 
             # Job Info
+            'branch', 'branch_name',
             'department', 'department_name',
             'designation', 'designation_name',
             'user_role',
             'reporting_to', 'reporting_to_name', 'reporting_to_code',
             'reporting_hr', 'reporting_hr_name', 'reporting_hr_code',
             'joining_date', 'status', 'base_salary',
+            'shift_id', 'shift_name',
             'salary_structure_name', 'salary_structure_id',
 
             # Personal
@@ -114,6 +131,51 @@ class EmployeeSerializer(serializers.ModelSerializer):
         if value and value.tenant != user.tenant:
             raise serializers.ValidationError("Department does not belong to your organization.")
         return value
+
+    def _latest_shift_row(self, obj):
+        """
+        Fetch latest active shift assignment for the employee.
+        Uses raw SQL to avoid requiring migrations in all environments.
+        """
+        from django.db import connection
+        try:
+            with connection.cursor() as cursor:
+                vendor = getattr(connection, "vendor", "")
+                if vendor == "sqlite":
+                    cursor.execute(
+                        """
+                        SELECT esa.shift_id, s.name
+                        FROM t_employee_shift_assignment esa
+                        LEFT JOIN t_shift s ON s.id = esa.shift_id
+                        WHERE esa.tenant_id = ? AND esa.employee_id = ? AND esa.is_active = 1
+                        ORDER BY esa.effective_from DESC, esa.created_at DESC
+                        LIMIT 1
+                        """,
+                        [str(obj.tenant_id), int(obj.id)],
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT esa.shift_id, s.name
+                        FROM t_employee_shift_assignment esa
+                        LEFT JOIN t_shift s ON s.id = esa.shift_id
+                        WHERE esa.tenant_id = %s AND esa.employee_id = %s AND esa.is_active = 1
+                        ORDER BY esa.effective_from DESC, esa.created_at DESC
+                        LIMIT 1
+                        """,
+                        [obj.tenant_id, obj.id],
+                    )
+                return cursor.fetchone()
+        except Exception:
+            return None
+
+    def get_shift_id(self, obj):
+        row = self._latest_shift_row(obj)
+        return row[0] if row else None
+
+    def get_shift_name(self, obj):
+        row = self._latest_shift_row(obj)
+        return row[1] if row else ''
 
     def validate_designation(self, value):
         user = self.context['request'].user

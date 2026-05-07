@@ -117,6 +117,28 @@ class Department(TenantScopedModel):
     def __str__(self):
         return f"{self.name} ({self.tenant.name})"
 
+
+class Branch(TenantScopedModel):
+    """
+    Tenant branch / location master.
+    Used for multi-branch organizations (HQ, Plant, Warehouse, etc.).
+    """
+    code = models.CharField(max_length=30, blank=True, default='')
+    name = models.CharField(max_length=255)
+    address = models.TextField(null=True, blank=True)
+    city = models.CharField(max_length=100, null=True, blank=True)
+    state = models.CharField(max_length=100, null=True, blank=True)
+    country = models.CharField(max_length=100, default='India')
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "t_branch"
+        unique_together = ('tenant', 'name')
+
+    def __str__(self):
+        return f"{self.name} ({self.tenant.name})"
+
 class Role(TenantScopedModel):
     SYSTEM_ROLE_CHOICES = [
         ('SUPER_ADMIN', 'Super Admin'),
@@ -173,6 +195,7 @@ class Employee(TenantScopedModel):
     designation = models.ForeignKey(Role, on_delete=models.SET_NULL, null=True, related_name='employees')
     reporting_to = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='subordinates')
     reporting_hr = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='hr_subordinates')
+    branch = models.ForeignKey(Branch, on_delete=models.SET_NULL, null=True, blank=True, related_name='employees')
     joining_date = models.DateField(null=True, blank=True)
     status = models.CharField(max_length=50, default='Active')
     base_salary = models.DecimalField(max_digits=12, decimal_places=2, default=0)
@@ -235,6 +258,27 @@ class Employee(TenantScopedModel):
 
     def __str__(self):
         return f"{self.name} - {self.employee_code}"
+
+
+class Shift(TenantScopedModel):
+    """
+    Shift master (multi-shift support).
+    """
+    code = models.CharField(max_length=30, blank=True, default='')
+    name = models.CharField(max_length=100)
+    start_time = models.TimeField()
+    end_time = models.TimeField()
+    grace_minutes = models.IntegerField(default=0)
+    is_night_shift = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "t_shift"
+        unique_together = ('tenant', 'name')
+
+    def __str__(self):
+        return f"{self.name} ({self.tenant.name})"
 
 class EmployeeDocument(TenantScopedModel):
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='documents')
