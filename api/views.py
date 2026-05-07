@@ -6559,106 +6559,41 @@ class NotificationView(views.APIView):
         return Response({"message": "Marked as read"})
 
 
+import os
+
 # ─────────────────────────────────────────────
 # MASTER LOOKUP (Dropdown Data Store)
 # ─────────────────────────────────────────────
 
-SEED_LOOKUP_DATA = {
-    'GENDER': [
-        ('Male', 'Male'), ('Female', 'Female'), ('Other', 'Other'),
-    ],
-    'BLOOD_GROUP': [
-        ('A+', 'A+'), ('A-', 'A-'), ('B+', 'B+'), ('B-', 'B-'),
-        ('O+', 'O+'), ('O-', 'O-'), ('AB+', 'AB+'), ('AB-', 'AB-'),
-    ],
-    'MARITAL_STATUS': [
-        ('Single', 'Single'), ('Married', 'Married'),
-        ('Divorced', 'Divorced'), ('Widowed', 'Widowed'),
-    ],
-    'EMPLOYEE_TYPE': [
-        ('Permanent', 'Permanent'), ('Contract', 'Contract'),
-        ('Intern', 'Intern'), ('Consultant', 'Consultant'), ('Part Time', 'Part Time'),
-    ],
-    'WORK_TYPE': [
-        ('Office', 'Office'), ('Remote', 'Remote'), ('Hybrid', 'Hybrid'),
-    ],
-    'SHIFT': [
-        ('General', 'General'), ('Morning', 'Morning'),
-        ('Afternoon', 'Afternoon'), ('Night', 'Night'),
-    ],
-    'SHIFT_CODE': [
-        ('GEN', 'GEN'),
-        ('MOR', 'MOR'),
-        ('EVE', 'EVE'),
-        ('NIG', 'NIG'),
-    ],
-    'GRADE': [
-        ('G1', 'G1'), ('G2', 'G2'), ('G3', 'G3'),
-        ('G4', 'G4'), ('G5', 'G5'), ('G6', 'G6'),
-    ],
-    'BAND': [
-        ('L1 - Entry Level', 'L1 - Entry Level'), ('L2 - Intermediate', 'L2 - Intermediate'),
-        ('L3 - Specialist', 'L3 - Specialist'), ('L4 - Lead', 'L4 - Lead'),
-        ('L5 - Manager', 'L5 - Manager'), ('L6 - Director', 'L6 - Director'),
-    ],
-    'BUSINESS_UNIT': [
-        ('Headquarters', 'Headquarters'), ('North Region', 'North Region'),
-        ('South Region', 'South Region'), ('East Region', 'East Region'), ('West Region', 'West Region'),
-    ],
-    'WORK_LOCATION': [
-        ('HQ', 'HQ'),
-        ('PLANT', 'Plant'),
-        ('WAREHOUSE', 'Warehouse'),
-        ('REMOTE', 'Remote'),
-    ],
-    'COST_CENTER': [
-        ('CC001', 'CC001'),
-        ('CC002', 'CC002'),
-        ('CC003', 'CC003'),
-    ],
-    'BANK': [
-        ('State Bank of India', 'State Bank of India'), ('HDFC Bank', 'HDFC Bank'),
-        ('ICICI Bank', 'ICICI Bank'), ('Axis Bank', 'Axis Bank'),
-        ('Kotak Mahindra Bank', 'Kotak Mahindra Bank'), ('Punjab National Bank', 'Punjab National Bank'),
-        ('Bank of Baroda', 'Bank of Baroda'), ('Canara Bank', 'Canara Bank'),
-        ('IndusInd Bank', 'IndusInd Bank'), ('Yes Bank', 'Yes Bank'),
-        ('Federal Bank', 'Federal Bank'), ('IDFC First Bank', 'IDFC First Bank'), ('Other', 'Other'),
-    ],
-    'PAYMENT_MODE': [
-        ('Bank Transfer', 'Bank Transfer'), ('Cash', 'Cash'),
-        ('Cheque', 'Cheque'), ('UPI', 'UPI'),
-    ],
-    'PAYROLL_GROUP': [
-        ('DEFAULT', 'Default'),
-        ('STAFF', 'Staff'),
-        ('WORKERS', 'Workers'),
-    ],
-    'BANK_BRANCH': [
-        ('MAIN', 'Main Branch'),
-        ('HQ', 'HQ Branch'),
-        ('CITY', 'City Branch'),
-    ],
-    'TAX_REGIME': [
-        ('New', 'New Tax Regime'), ('Old', 'Old Tax Regime'),
-    ],
-    'ACCOUNT_TYPE': [
-        ('Savings', 'Savings'), ('Current', 'Current'),
-    ],
-    'NATIONALITY': [
-        ('Indian', 'Indian'), ('Other', 'Other'),
-    ],
-    'EMPLOYEE_STATUS': [
-        ('Active', 'Active'), ('Inactive', 'Inactive'),
-        ('Resigned', 'Resigned'), ('Terminated', 'Terminated'),
-    ],
-}
+def _load_default_lookup_seed() -> dict:
+    """
+    Loads default lookup seed values from a JSON file to avoid hardcoding values in Python.
+    The table `t_master_lookup` will generate IDs automatically on insert.
+    """
+    try:
+        here = os.path.dirname(__file__)
+        path = os.path.join(here, "seed_lookups.default.json")
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def seed_lookups_for_tenant(tenant_id):
     """Insert default lookup values for a tenant if they don't already exist."""
+    seed = _load_default_lookup_seed()
     with connection.cursor() as cursor:
-        for category, items in SEED_LOOKUP_DATA.items():
-            for sort_order, (code, label) in enumerate(items):
+        for category, items in seed.items():
+            if not isinstance(items, list):
+                continue
+            for sort_order, item in enumerate(items):
+                if not isinstance(item, dict):
+                    continue
+                code = str(item.get("code", "")).strip()
+                label = str(item.get("label", "")).strip()
+                if not code or not label:
+                    continue
                 cursor.execute(
                     """
                     INSERT IGNORE INTO t_master_lookup

@@ -1,0 +1,131 @@
+{
+  "GENDER": [
+    { "code": "Male", "label": "Male" },
+    { "code": "Female", "label": "Female" },
+    { "code": "Other", "label": "Other" }
+  ],
+  "BLOOD_GROUP": [
+    { "code": "A+", "label": "A+" },
+    { "code": "A-", "label": "A-" },
+    { "code": "B+", "label": "B+" },
+    { "code": "B-", "label": "B-" },
+    { "code": "O+", "label": "O+" },
+    { "code": "O-", "label": "O-" },
+    { "code": "AB+", "label": "AB+" },
+    { "code": "AB-", "label": "AB-" }
+  ],
+  "MARITAL_STATUS": [
+    { "code": "Single", "label": "Single" },
+    { "code": "Married", "label": "Married" },
+    { "code": "Divorced", "label": "Divorced" },
+    { "code": "Widowed", "label": "Widowed" }
+  ],
+  "EMPLOYEE_TYPE": [
+    { "code": "Permanent", "label": "Permanent" },
+    { "code": "Contract", "label": "Contract" },
+    { "code": "Intern", "label": "Intern" },
+    { "code": "Consultant", "label": "Consultant" },
+    { "code": "Part Time", "label": "Part Time" }
+  ],
+  "WORK_TYPE": [
+    { "code": "Office", "label": "Office" },
+    { "code": "Remote", "label": "Remote" },
+    { "code": "Hybrid", "label": "Hybrid" }
+  ],
+  "SHIFT": [
+    { "code": "General", "label": "General" },
+    { "code": "Morning", "label": "Morning" },
+    { "code": "Afternoon", "label": "Afternoon" },
+    { "code": "Night", "label": "Night" }
+  ],
+  "SHIFT_CODE": [
+    { "code": "GEN", "label": "General Shift" },
+    { "code": "MOR", "label": "Morning Shift" },
+    { "code": "EVE", "label": "Evening Shift" },
+    { "code": "NIG", "label": "Night Shift" }
+  ],
+  "GRADE": [
+    { "code": "G1", "label": "G1" },
+    { "code": "G2", "label": "G2" },
+    { "code": "G3", "label": "G3" },
+    { "code": "G4", "label": "G4" },
+    { "code": "G5", "label": "G5" },
+    { "code": "G6", "label": "G6" }
+  ],
+  "BAND": [
+    { "code": "L1 - Entry Level", "label": "L1 - Entry Level" },
+    { "code": "L2 - Intermediate", "label": "L2 - Intermediate" },
+    { "code": "L3 - Specialist", "label": "L3 - Specialist" },
+    { "code": "L4 - Lead", "label": "L4 - Lead" },
+    { "code": "L5 - Manager", "label": "L5 - Manager" },
+    { "code": "L6 - Director", "label": "L6 - Director" }
+  ],
+  "BUSINESS_UNIT": [
+    { "code": "Headquarters", "label": "Headquarters" },
+    { "code": "North Region", "label": "North Region" },
+    { "code": "South Region", "label": "South Region" },
+    { "code": "East Region", "label": "East Region" },
+    { "code": "West Region", "label": "West Region" }
+  ],
+  "WORK_LOCATION": [
+    { "code": "HQ", "label": "HQ" },
+    { "code": "PLANT", "label": "Plant" },
+    { "code": "WAREHOUSE", "label": "Warehouse" },
+    { "code": "REMOTE", "label": "Remote" }
+  ],
+  "COST_CENTER": [
+    { "code": "CC001", "label": "CC001" },
+    { "code": "CC002", "label": "CC002" },
+    { "code": "CC003", "label": "CC003" }
+  ],
+  "BANK": [
+    { "code": "State Bank of India", "label": "State Bank of India" },
+    { "code": "HDFC Bank", "label": "HDFC Bank" },
+    { "code": "ICICI Bank", "label": "ICICI Bank" },
+    { "code": "Axis Bank", "label": "Axis Bank" },
+    { "code": "Kotak Mahindra Bank", "label": "Kotak Mahindra Bank" },
+    { "code": "Punjab National Bank", "label": "Punjab National Bank" },
+    { "code": "Bank of Baroda", "label": "Bank of Baroda" },
+    { "code": "Canara Bank", "label": "Canara Bank" },
+    { "code": "IndusInd Bank", "label": "IndusInd Bank" },
+    { "code": "Yes Bank", "label": "Yes Bank" },
+    { "code": "Federal Bank", "label": "Federal Bank" },
+    { "code": "IDFC First Bank", "label": "IDFC First Bank" },
+    { "code": "Other", "label": "Other" }
+  ],
+  "PAYMENT_MODE": [
+    { "code": "Bank Transfer", "label": "Bank Transfer" },
+    { "code": "Cash", "label": "Cash" },
+    { "code": "Cheque", "label": "Cheque" },
+    { "code": "UPI", "label": "UPI" }
+  ],
+  "PAYROLL_GROUP": [
+    { "code": "DEFAULT", "label": "Default" },
+    { "code": "STAFF", "label": "Staff" },
+    { "code": "WORKERS", "label": "Workers" }
+  ],
+  "BANK_BRANCH": [
+    { "code": "MAIN", "label": "Main Branch" },
+    { "code": "HQ", "label": "HQ Branch" },
+    { "code": "CITY", "label": "City Branch" }
+  ],
+  "TAX_REGIME": [
+    { "code": "New", "label": "New Tax Regime" },
+    { "code": "Old", "label": "Old Tax Regime" }
+  ],
+  "ACCOUNT_TYPE": [
+    { "code": "Savings", "label": "Savings" },
+    { "code": "Current", "label": "Current" }
+  ],
+  "NATIONALITY": [
+    { "code": "Indian", "label": "Indian" },
+    { "code": "Other", "label": "Other" }
+  ],
+  "EMPLOYEE_STATUS": [
+    { "code": "Active", "label": "Active" },
+    { "code": "Inactive", "label": "Inactive" },
+    { "code": "Resigned", "label": "Resigned" },
+    { "code": "Terminated", "label": "Terminated" }
+  ]
+}
+
