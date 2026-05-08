@@ -40,6 +40,8 @@ urlpatterns = [
 
     # ── Attendance ──────────────────────────────────────
     path('attendance/data/',         views.AttendanceDataView.as_view(),          name='attendance_data'),
+    path('attendance/bulk/',         views.AttendanceBulkView.as_view(),          name='attendance_bulk'),
+    path('attendance/bulk/generate-absent/', views.AttendanceBulkGenerateAbsentView.as_view(), name='attendance_bulk_generate_absent'),
     path('attendance/mark/',         views.AttendanceMarkView.as_view(),          name='attendance_mark'),
     path('attendance/regularize/',   views.AttendanceRegularizeView.as_view(),    name='attendance_regularize'),
     path('attendance/shift-assignments/', views.AttendanceShiftAssignmentsView.as_view(), name='attendance_shift_assignments'),

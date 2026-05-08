@@ -2256,6 +2256,48 @@ class AttendanceDataView(views.APIView):
         tenant = request.user.tenant
         target_date = request.query_params.get('date')
         target_month = request.query_params.get('month')
+        target_start = request.query_params.get('start')
+        target_end = request.query_params.get('end')
+
+        if target_start and target_end:
+            try:
+                from datetime import datetime
+                start_date = datetime.strptime(target_start, '%Y-%m-%d').date()
+                end_date = datetime.strptime(target_end, '%Y-%m-%d').date()
+            except Exception:
+                return Response({"error": "start/end must be YYYY-MM-DD"}, status=400)
+            if start_date > end_date:
+                return Response({"error": "start cannot be after end"}, status=400)
+
+            employees = Employee.objects.filter(tenant=tenant).select_related('department')
+            records = AttendanceRecord.objects.filter(
+                tenant=tenant, date__range=[start_date, end_date]
+            ).select_related('status')
+
+            record_map = {}
+            for record in records:
+                emp_id = str(record.employee_id)
+                if emp_id not in record_map:
+                    record_map[emp_id] = {}
+                record_map[emp_id][record.date.isoformat()] = {
+                    'id': str(record.id),
+                    'status': record.status.code if record.status else record.status_str,
+                    'checkIn': record.check_in.strftime('%H:%M') if record.check_in else '',
+                    'checkOut': record.check_out.strftime('%H:%M') if record.check_out else '',
+                    'workHours': float(record.work_hours),
+                }
+
+            grouped_data = []
+            for emp in employees:
+                emp_id = str(emp.id)
+                grouped_data.append({
+                    'employeeId': emp_id,
+                    'employeeName': emp.name,
+                    'employeeCode': emp.employee_code or '',
+                    'departmentName': emp.department.name if emp.department else 'N/A',
+                    'records': record_map.get(emp_id, {})
+                })
+            return Response({'range_data': grouped_data, 'start': target_start, 'end': target_end})
 
         if target_month:
             # Monthly view - Fetch all employees to ensure everyone is in the grid
@@ -3751,6 +3793,165 @@ class LoginView(views.APIView):
             })
         
         return Response({"error": "Invalid credentials"}, status=status.HTTP_401_UNAUTHORIZED)
+
+class AttendanceBulkView(views.APIView):
+    """
+    POST /api/attendance/bulk/
+    Body: { date: "YYYY-MM-DD", records: [{ employee_id, status, check_in, check_out, work_hours }] }
+    Upserts all records atomically. Returns { saved, errors }.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        sr = getattr(request.user, 'system_role', None)
+        if sr not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
+            return Response({"error": "Permission denied"}, status=403)
+
+        tenant = request.user.tenant
+        date = request.data.get('date')
+        records = request.data.get('records', [])
+
+        if not date:
+            return Response({"error": "date is required"}, status=400)
+        if not isinstance(records, list) or len(records) == 0:
+            return Response({"error": "records[] must be a non-empty list"}, status=400)
+
+        # Prevent edits for payroll cycles with attendance lock enabled.
+        cycle_month = str(date)[:7]
+        try:
+            from django.apps import apps
+            PayrollCycleLockModel = apps.get_model('api', 'PayrollCycleLock')
+            cycle_lock = PayrollCycleLockModel.objects.filter(tenant=tenant, cycle_month=cycle_month).first()
+            if cycle_lock and bool(getattr(cycle_lock, 'attendance_locked', False)):
+                return Response({
+                    "error": f"Attendance is locked for cycle {cycle_month}. Unlock attendance before updating."
+                }, status=403)
+        except Exception:
+            # Keep backward compatibility if workflow model/table is unavailable.
+            pass
+
+        # Pre-fetch all status objects to avoid N+1 queries
+        all_statuses = {s.code.upper(): s for s in AttendanceStatus.objects.all()}
+
+        saved = []
+        errors = []
+
+        try:
+            with transaction.atomic():
+                for item in records:
+                    emp_id = item.get('employee_id')
+                    status_code = str(item.get('status') or 'A').strip().upper()
+                    check_in = item.get('check_in') or None
+                    check_out = item.get('check_out') or None
+                    work_hours = item.get('work_hours')
+                    location = item.get('location') or 'Office'
+
+                    status_obj = all_statuses.get(status_code)
+                    if not status_obj:
+                        errors.append({"employee_id": emp_id, "error": f"Unknown status '{status_code}'"})
+                        continue
+
+                    # Default work_hours from status master if not provided
+                    if work_hours is None:
+                        work_hours = getattr(status_obj, 'default_work_hours', None)
+                    try:
+                        work_hours = float(work_hours) if work_hours is not None else 0.0
+                    except (ValueError, TypeError):
+                        work_hours = 0.0
+
+                    # Derive check-in/out defaults from status master if not provided
+                    if not check_in and status_obj.default_check_in:
+                        check_in = status_obj.default_check_in.strftime('%H:%M:%S')
+                    if not check_out and status_obj.default_check_out:
+                        check_out = status_obj.default_check_out.strftime('%H:%M:%S')
+
+                    try:
+                        rec, _ = AttendanceRecord.objects.update_or_create(
+                            tenant=tenant,
+                            employee_id=emp_id,
+                            date=date,
+                            defaults={
+                                'status': status_obj,
+                                'status_str': status_obj.code,
+                                'check_in': check_in,
+                                'check_out': check_out,
+                                'work_hours': work_hours,
+                                'location': location,
+                            },
+                        )
+                        saved.append({"employee_id": emp_id, "record_id": rec.id})
+                    except Exception as row_err:
+                        errors.append({"employee_id": emp_id, "error": str(row_err)})
+        except Exception as e:
+            return Response({"error": str(e)}, status=500)
+
+        return Response({
+            "saved": len(saved),
+            "errors": errors,
+            "total": len(records),
+            "records": saved,
+        })
+
+
+class AttendanceBulkGenerateAbsentView(views.APIView):
+    """
+    POST /api/attendance/bulk/generate-absent/
+    Body: { date: "YYYY-MM-DD" }
+    Creates Absent records for every active employee who has no record on that date.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        sr = getattr(request.user, 'system_role', None)
+        if sr not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+
+        tenant = request.user.tenant
+        date = request.data.get('date')
+        if not date:
+            return Response({"error": "date is required"}, status=400)
+
+        absent_status = AttendanceStatus.objects.filter(code='A').first()
+        if not absent_status:
+            return Response({"error": "Absent status not configured"}, status=500)
+
+        # Employees that already have a record on this date
+        existing_ids = set(
+            AttendanceRecord.objects.filter(tenant=tenant, date=date)
+            .values_list('employee_id', flat=True)
+        )
+
+        # All active employees without a record
+        employees_to_fill = Employee.objects.filter(
+            tenant=tenant,
+            status='Active',
+        ).exclude(id__in=existing_ids)
+
+        new_records = [
+            AttendanceRecord(
+                tenant=tenant,
+                employee=emp,
+                date=date,
+                status=absent_status,
+                check_in=None,
+                check_out=None,
+                work_hours=0.0,
+                location='N/A',
+            )
+            for emp in employees_to_fill
+        ]
+
+        try:
+            AttendanceRecord.objects.bulk_create(new_records, ignore_conflicts=True)
+        except Exception as e:
+            return Response({"error": str(e)}, status=500)
+
+        return Response({
+            "message": f"Generated absent for {len(new_records)} employee(s)",
+            "created": len(new_records),
+            "date": date,
+        })
+
 
 class AttendanceMarkView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
