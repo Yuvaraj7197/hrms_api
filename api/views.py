@@ -4201,9 +4201,9 @@ class CompOffRequestsView(views.APIView):
         with connection.cursor() as cursor:
             if vendor == "sqlite":
                 params = [str(tenant.id), state]
-                where = "tenant_id = ? AND UPPER(state) = ?"
+                where = "r.tenant_id = ? AND UPPER(r.state) = ?"
                 if employee_id:
-                    where += " AND employee_id = ?"
+                    where += " AND r.employee_id = ?"
                     params.append(int(employee_id))
                 cursor.execute(
                     f"""
@@ -4218,9 +4218,9 @@ class CompOffRequestsView(views.APIView):
                 )
             else:
                 params = [tenant.id, state]
-                where = "tenant_id = %s AND UPPER(state) = %s"
+                where = "r.tenant_id = %s AND UPPER(r.state) = %s"
                 if employee_id:
-                    where += " AND employee_id = %s"
+                    where += " AND r.employee_id = %s"
                     params.append(int(employee_id))
                 cursor.execute(
                     f"""
@@ -7083,11 +7083,13 @@ class LeaveBalanceView(views.APIView):
     def get(self, request):
         ensure_master_tables_exist()
         tenant = request.user.tenant
+        sr = getattr(request.user, 'system_role', None)
         employee_id = request.query_params.get('employee_id')
         year = request.query_params.get('year', str(timezone.localdate().year))
 
         # If no employee_id specified, auto-scope to the requesting user's own employee profile
-        if not employee_id:
+        # for non-admin roles. Admin/HR should be able to fetch tenant-wide balances.
+        if (not employee_id) and (sr not in ['ADMIN', 'SUPER_ADMIN', 'HR']):
             emp_profile = getattr(request.user, 'employee_profile', None)
             if emp_profile:
                 employee_id = str(emp_profile.id)
