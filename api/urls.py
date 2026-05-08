@@ -100,6 +100,7 @@ urlpatterns = [
     path('admin/role-permissions/', views.AdminRolePermissionListView.as_view(), name='admin_role_permissions'),
     path('admin/role-permissions/<int:role_id>/', views.AdminRolePermissionUpdateView.as_view(), name='admin_role_permission_update'),
     path('admin/role-permissions/seed/', views.AdminSeedRolePermissionsView.as_view(), name='admin_role_permissions_seed'),
+    path('admin/role-permissions/reconcile/', views.AdminReconcileRoleCategoriesView.as_view(), name='admin_role_categories_reconcile'),
 
     # ── Master Data ────────────────────────────────────
     path('master/industries/',       views.MasterIndustryView.as_view(),         name='master_industries'),

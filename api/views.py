@@ -1589,7 +1589,7 @@ class OnboardingRolesView(views.APIView):
         roles_data = request.data.get('roles', [])
         if not roles_data:
             # Do not wipe tenant designations if the UI is using DB-seeded roles.
-            tenant.onboarding_step = max(int(getattr(tenant, 'onboarding_step', 0) or 0), 4)
+            tenant.onboarding_step = max(int(getattr(tenant, 'onboarding_step', 0) or 0), 5)
             tenant.save(update_fields=['onboarding_step'])
             return Response({"message": "No role payload provided. Existing roles preserved."})
         
@@ -1614,7 +1614,7 @@ class OnboardingRolesView(views.APIView):
                 system_role_category=category,
             )
 
-        tenant.onboarding_step = 4
+        tenant.onboarding_step = 5
         tenant.save(update_fields=['onboarding_step'])
 
         return Response({"message": "Roles saved successfully"})
@@ -1755,7 +1755,7 @@ class OnboardingEmployeesView(views.APIView):
                     if manager:
                         Employee.objects.filter(tenant=tenant, email=emp.get('email')).update(reporting_to=manager)
 
-        tenant.onboarding_step = 5
+        tenant.onboarding_step = 9
         tenant.save(update_fields=['onboarding_step'])
 
         return Response({
@@ -1819,7 +1819,7 @@ class OnboardingDepartmentsView(views.APIView):
                 }
             )
 
-        tenant.onboarding_step = 3
+        tenant.onboarding_step = 4
         tenant.save(update_fields=['onboarding_step'])
 
         return Response(
@@ -3797,7 +3797,39 @@ class HREmployeeListView(views.APIView):
         branch = Branch.objects.filter(tenant=tenant, id=safe_int(payload.get('branch_id'))).first()
 
         with transaction.atomic():
-            employee = Employee.objects.create(
+            # Create login account if requested.
+            create_account = payload.get('create_account')
+            wants_account = str(create_account).lower() == 'true' or create_account is True
+
+            user = None
+            temp_password = None
+            username = None
+
+            if wants_account:
+                password = payload.get('password')
+                temp_password = password if password else ''.join(random.choices(string.ascii_letters + string.digits, k=10))
+                username = payload.get('email').split('@')[0] + "_" + str(random.randint(100, 999))
+
+                user, created = User.objects.get_or_create(
+                    email=payload.get('email'),
+                    defaults={
+                        'username': username,
+                        'tenant': tenant,
+                        'is_verified': True
+                    }
+                )
+                if not created:
+                    user.tenant = tenant
+                    user.is_verified = True
+
+                if role and user.role_id != role.id:
+                    user.role = role
+
+                if created or password:
+                    user.set_password(temp_password)
+                user.save()
+
+            defaults = dict(
                 tenant=tenant,
                 name=payload.get('name'),
                 email=payload.get('email'),
@@ -3825,7 +3857,6 @@ class HREmployeeListView(views.APIView):
                 emergency_contact_phone=payload.get('emergency_contact_phone'),
                 onboarding_status=payload.get('onboarding_status', 'Pending'),
                 onboarding_completed_at=timezone.now() if payload.get('onboarding_status') == 'Completed' else None,
-                # Statutory / Compliance fields
                 father_name=payload.get('father_name'),
                 pan_number=payload.get('pan_number'),
                 aadhar_number=payload.get('aadhar_number'),
@@ -3838,6 +3869,16 @@ class HREmployeeListView(views.APIView):
                 nationality=payload.get('nationality', 'Indian'),
                 extended_profile=payload.get('extended_profile', {}),
             )
+
+            # If a user account is being used, upsert by (tenant, user) to respect the OneToOne constraint.
+            if user is not None:
+                employee, _created = Employee.objects.update_or_create(
+                    tenant=tenant,
+                    user=user,
+                    defaults=defaults,
+                )
+            else:
+                employee = Employee.objects.create(**defaults)
 
             # Persist shift assignment history (effective-dated).
             shift_id = payload.get('shift_id')
@@ -3900,34 +3941,7 @@ class HREmployeeListView(views.APIView):
                     # Salary structure linking should not block employee creation.
                     pass
 
-            # Create login account if requested
-            create_account = payload.get('create_account')
-            if str(create_account).lower() == 'true' or create_account is True:
-                password = payload.get('password')
-                temp_password = password if password else ''.join(random.choices(string.ascii_letters + string.digits, k=10))
-                username = payload.get('email').split('@')[0] + "_" + str(random.randint(100, 999))
-                
-                user, created = User.objects.get_or_create(
-                    email=payload.get('email'),
-                    defaults={
-                        'username': username,
-                        'tenant': tenant,
-                        'is_verified': True
-                    }
-                )
-                if not created:
-                    user.tenant = tenant
-                    user.is_verified = True
-                
-                if role and user.role_id != role.id:
-                    user.role = role
-
-                if created or password:
-                    user.set_password(temp_password)
-                user.save()
-                    
-                employee.user = user
-                employee.save()
+            if user is not None:
                 print(f"[HR] New/Updated employee account: {username} / {temp_password}")
 
         return Response({
@@ -6067,8 +6081,8 @@ class AdminSetupWizardView(views.APIView):
                     user.role = admin_role
                     user.save(update_fields=['role'])
             
-            # 5. Mark Onboarding as complete (Optional)
-            tenant.onboarding_step = 5
+            # 5. Mark onboarding as complete for dashboard access (aligns with UI wizard finalize).
+            tenant.onboarding_step = 10
             tenant.save(update_fields=['onboarding_step'])
 
             return Response({
@@ -6365,9 +6379,19 @@ class AdminSeedRolePermissionsView(views.APIView):
         role_names_payload = incoming if isinstance(incoming, list) else None
         stats = self.sync_catalog_for_tenant(tenant, incoming_role_names=role_names_payload)
 
+        # Also reconcile category for *all* existing tenant roles (including custom roles),
+        # so the UI can reliably read `system_role_category`.
+        reconciled = 0
+        for r in Role.objects.filter(tenant=tenant).only('id', 'name', 'system_role_category'):
+            if not str(getattr(r, 'system_role_category', '') or '').strip():
+                r.system_role_category = self._derive_category(r.name)
+                r.save(update_fields=['system_role_category'])
+                reconciled += 1
+
         return Response({
             "message": "Seeded roles and default admin permissions",
             "admin_route_keys": ADMIN_ROUTE_KEYS,
+            "reconciled_role_categories": reconciled,
             **stats,
         })
 
@@ -6394,6 +6418,36 @@ class AdminSeedRolePermissionsView(views.APIView):
         ]):
             return 'MANAGER'
         return 'EMPLOYEE'
+
+
+class AdminReconcileRoleCategoriesView(views.APIView):
+    """
+    Reconcile `t_role.system_role_category` for the current tenant.
+
+    This is safe and idempotent. It is useful for older tenants whose roles were created
+    before `system_role_category` was populated consistently.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        sr = str(getattr(request.user, 'system_role', '') or '').upper()
+        if sr not in ('SUPER_ADMIN', 'ADMIN'):
+            return Response({"error": "Permission denied"}, status=403)
+
+        tenant = request.user.tenant
+        updated = 0
+        for r in Role.objects.filter(tenant=tenant).only('id', 'name', 'system_role_category'):
+            derived = AdminSeedRolePermissionsView._derive_category(r.name)
+            current = str(getattr(r, 'system_role_category', '') or '').strip().upper()
+            if current != derived:
+                r.system_role_category = derived
+                r.save(update_fields=['system_role_category'])
+                updated += 1
+
+        return Response({
+            "message": "Role categories reconciled",
+            "updated": updated,
+        })
 
 # ─────────────────────────────────────────────
 # ATTENDANCE CSV EXPORT
