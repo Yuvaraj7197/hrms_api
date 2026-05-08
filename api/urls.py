@@ -42,6 +42,9 @@ urlpatterns = [
     path('attendance/data/',         views.AttendanceDataView.as_view(),          name='attendance_data'),
     path('attendance/mark/',         views.AttendanceMarkView.as_view(),          name='attendance_mark'),
     path('attendance/regularize/',   views.AttendanceRegularizeView.as_view(),    name='attendance_regularize'),
+    path('attendance/shift-assignments/', views.AttendanceShiftAssignmentsView.as_view(), name='attendance_shift_assignments'),
+    path('attendance/regularization/requests/', views.AttendanceRegularizationRequestsView.as_view(), name='attendance_regularization_requests'),
+    path('attendance/regularization/approve/', views.AttendanceRegularizationApproveView.as_view(), name='attendance_regularization_approve'),
     path('attendance/report/',       views.AttendanceReportView.as_view(),        name='attendance_report'),
     path('attendance/statuses/',     views.AttendanceStatusListView.as_view(),    name='attendance_statuses'),
     path('attendance/export/',       views.AttendanceExportView.as_view(),        name='attendance_export'),
@@ -82,6 +85,14 @@ urlpatterns = [
     path('leave/master/',            views.LeaveTypeMasterView.as_view(),         name='leave_type_master'),
     path('leave/balances/',          views.LeaveBalanceView.as_view(),            name='leave_balances'),
     path('leave/reconcile/',         views.ReconcileBalancesView.as_view(),       name='leave_reconcile'),
+
+    # ── Comp Off ───────────────────────────────────────
+    path('comp-off/requests/',       views.CompOffRequestsView.as_view(),         name='comp_off_requests'),
+    path('comp-off/approve/',        views.CompOffApproveView.as_view(),          name='comp_off_approve'),
+
+    # ── Overtime ───────────────────────────────────────
+    path('overtime/requests/',       views.OvertimeRequestsView.as_view(),        name='overtime_requests'),
+    path('overtime/approve/',        views.OvertimeApproveView.as_view(),         name='overtime_approve'),
 
     # ── Holiday Calendar ───────────────────────────────
     path('holidays/',                views.HolidayCalendarView.as_view(),         name='holidays'),

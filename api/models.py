@@ -318,6 +318,7 @@ class AttendanceRecord(TenantScopedModel):
     status_str = models.CharField(max_length=20, default='Present', db_column='status') # For legacy support/transition
     work_hours = models.FloatField(default=0)
     location = models.CharField(max_length=100, default='Office')
+    regularization_reason = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "t_attendance_record"

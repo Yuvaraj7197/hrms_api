@@ -1031,6 +1031,101 @@ def ensure_payroll_workflow_tables_exist():
         except Exception:
             cursor.execute("ALTER TABLE t_employee ADD COLUMN reporting_hr_id BIGINT NULL")
             cursor.execute("ALTER TABLE t_employee ADD CONSTRAINT t_employee_hr_fk FOREIGN KEY (reporting_hr_id) REFERENCES t_employee(id) ON DELETE SET NULL")
+        
+        # Attendance record: store regularization comment / reason (best-effort)
+        try:
+            cursor.execute("SELECT regularization_reason FROM t_attendance_record LIMIT 1")
+        except Exception:
+            try:
+                cursor.execute("ALTER TABLE t_attendance_record ADD COLUMN regularization_reason TEXT NULL")
+            except Exception:
+                pass
+
+        # Attendance regularization request queue (best-effort; approvals workflow)
+        try:
+            cursor.execute("SELECT state FROM t_attendance_regularization_request LIMIT 1")
+        except Exception:
+            try:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS t_attendance_regularization_request (
+                        id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                        tenant_id CHAR(32) NOT NULL,
+                        employee_id BIGINT NOT NULL,
+                        date DATE NOT NULL,
+                        requested_status_id BIGINT NULL,
+                        requested_check_in TIME NULL,
+                        requested_check_out TIME NULL,
+                        requested_work_hours DECIMAL(6,2) NULL,
+                        reason TEXT NULL,
+                        state VARCHAR(20) DEFAULT 'PENDING',
+                        requested_by_id BIGINT NULL,
+                        requested_at DATETIME(6) NOT NULL,
+                        reviewed_by_id BIGINT NULL,
+                        reviewed_at DATETIME(6) NULL,
+                        review_comment TEXT NULL,
+                        INDEX t_att_reg_req_tenant_state_idx (tenant_id, state),
+                        INDEX t_att_reg_req_tenant_emp_date_idx (tenant_id, employee_id, date)
+                    )
+                    """
+                )
+            except Exception:
+                pass
+
+        # Comp Off & Overtime requests (best-effort)
+        try:
+            cursor.execute("SELECT state FROM t_comp_off_request LIMIT 1")
+        except Exception:
+            try:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS t_comp_off_request (
+                        id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                        tenant_id CHAR(32) NOT NULL,
+                        employee_id BIGINT NOT NULL,
+                        worked_date DATE NOT NULL,
+                        credit_days DECIMAL(6,2) DEFAULT 1,
+                        reason TEXT NULL,
+                        state VARCHAR(20) DEFAULT 'PENDING',
+                        requested_by_id BIGINT NULL,
+                        requested_at DATETIME(6) NOT NULL,
+                        reviewed_by_id BIGINT NULL,
+                        reviewed_at DATETIME(6) NULL,
+                        review_comment TEXT NULL,
+                        INDEX t_comp_off_req_tenant_state_idx (tenant_id, state),
+                        INDEX t_comp_off_req_tenant_emp_idx (tenant_id, employee_id)
+                    )
+                    """
+                )
+            except Exception:
+                pass
+
+        try:
+            cursor.execute("SELECT state FROM t_overtime_request LIMIT 1")
+        except Exception:
+            try:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS t_overtime_request (
+                        id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                        tenant_id CHAR(32) NOT NULL,
+                        employee_id BIGINT NOT NULL,
+                        ot_date DATE NOT NULL,
+                        hours DECIMAL(6,2) NOT NULL,
+                        reason TEXT NULL,
+                        state VARCHAR(20) DEFAULT 'PENDING',
+                        requested_by_id BIGINT NULL,
+                        requested_at DATETIME(6) NOT NULL,
+                        reviewed_by_id BIGINT NULL,
+                        reviewed_at DATETIME(6) NULL,
+                        review_comment TEXT NULL,
+                        INDEX t_ot_req_tenant_state_idx (tenant_id, state),
+                        INDEX t_ot_req_tenant_emp_idx (tenant_id, employee_id)
+                    )
+                    """
+                )
+            except Exception:
+                pass
             
         try:
             cursor.execute("SELECT file FROM t_employee_document LIMIT 1")
@@ -2138,6 +2233,13 @@ class AttendanceDataView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
+        # Best-effort schema guard for environments where migrations were skipped.
+        # Prevents "Unknown column ...regularization_reason" when AttendanceRecord model evolves.
+        try:
+            ensure_master_tables_exist()
+        except Exception:
+            pass
+
         tenant = request.user.tenant
         target_date = request.query_params.get('date')
         target_month = request.query_params.get('month')
@@ -2251,6 +2353,12 @@ class AttendanceReportView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
+        # Best-effort schema guard for environments where migrations were skipped.
+        try:
+            ensure_master_tables_exist()
+        except Exception:
+            pass
+
         tenant = request.user.tenant
         target_month = request.query_params.get('month') or timezone.localdate().strftime('%Y-%m')
         employee_id  = request.query_params.get('employee_id')  # optional filter
@@ -3673,11 +3781,18 @@ class AttendanceRegularizeView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
+        # Ensure evolving schema exists (legacy environments may skip migrations)
+        try:
+            ensure_master_tables_exist()
+        except Exception:
+            pass
+
         tenant = request.user.tenant
         record_id   = request.data.get('record_id')
         employee_id = request.data.get('employee_id')
         target_date = request.data.get('date')
         status_val  = request.data.get('status')
+        reason      = request.data.get('reason') or request.data.get('comment') or ''
 
         try:
             # Map status code/label/ID to AttendanceStatus object
@@ -3697,43 +3812,934 @@ class AttendanceRegularizeView(views.APIView):
                 check_out  = check_out or (status_obj.default_check_out.strftime('%H:%M:%S') if status_obj.default_check_out else None)
                 work_hours = work_hours if work_hours is not None else status_obj.default_work_hours
 
-            if record_id:
-                # Update existing record by PK
-                record = AttendanceRecord.objects.get(tenant=tenant, id=record_id)
-                if status_obj: record.status = status_obj
-                record.check_in    = check_in
-                record.check_out   = check_out
-                record.work_hours  = work_hours if work_hours is not None else 0.0
-                record.save()
+            def _code_from_record(rec):
+                try:
+                    if getattr(rec, 'status', None) and getattr(rec.status, 'code', None):
+                        return str(rec.status.code).strip().upper()
+                except Exception:
+                    pass
+                try:
+                    return str(getattr(rec, 'status_str', '') or '').strip().upper()
+                except Exception:
+                    return ''
 
+            def _needs_comment(prev_code: str, next_code: str) -> bool:
+                prev_code = str(prev_code or '').strip().upper()
+                next_code = str(next_code or '').strip().upper()
+                is_lop = prev_code == 'LOP' or next_code == 'LOP'
+                is_absent_to_present = prev_code == 'A' and next_code in ('P', 'L')
+                return is_lop or is_absent_to_present
+
+            next_code = str(getattr(status_obj, 'code', '') or status_val or '').strip().upper()
+
+            # Load current record (if exists) for comment validation + audit
+            record = None
+            if record_id:
+                record = AttendanceRecord.objects.get(tenant=tenant, id=record_id)
+                employee_id = employee_id or record.employee_id
+                target_date = target_date or (record.date.isoformat() if record.date else None)
             elif employee_id and target_date:
-                # Upsert by employee + date
-                record, created = AttendanceRecord.objects.get_or_create(
+                record = AttendanceRecord.objects.filter(tenant=tenant, employee_id=employee_id, date=target_date).select_related('status').first()
+            else:
+                return Response({"error": "Provide record_id OR (employee_id + date)"}, status=400)
+
+            prev_code = _code_from_record(record) if record else ''
+            if _needs_comment(prev_code, next_code) and not str(reason or '').strip():
+                return Response(
+                    {"error": "Reason is required for Absent→Present/Late or any LOP change."},
+                    status=400,
+                )
+
+            # Approvals MVP+: HR/Admin/SuperAdmin auto-approve, others create a pending request.
+            auto_approve = request.user.system_role in ['ADMIN', 'SUPER_ADMIN', 'HR']
+            state = 'APPROVED' if auto_approve else 'PENDING'
+
+            # Insert request row (audit trail)
+            req_id = None
+            try:
+                with connection.cursor() as cursor:
+                    vendor = getattr(connection, "vendor", "")
+                    requested_at = timezone.now()
+                    if vendor == "sqlite":
+                        cursor.execute(
+                            """
+                            INSERT INTO t_attendance_regularization_request
+                              (tenant_id, employee_id, date, requested_status_id, requested_check_in, requested_check_out,
+                               requested_work_hours, reason, state, requested_by_id, requested_at,
+                               reviewed_by_id, reviewed_at, review_comment)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            [
+                                str(tenant.id),
+                                int(employee_id),
+                                str(target_date),
+                                int(status_obj.id) if status_obj else None,
+                                check_in,
+                                check_out,
+                                float(work_hours) if work_hours is not None else None,
+                                str(reason or '')[:2000],
+                                state,
+                                int(request.user.id) if request.user and request.user.id else None,
+                                str(requested_at),
+                                int(request.user.id) if auto_approve else None,
+                                str(requested_at) if auto_approve else None,
+                                str(reason or '')[:2000] if auto_approve else None,
+                            ],
+                        )
+                        cursor.execute("SELECT last_insert_rowid()")
+                        req_id = cursor.fetchone()[0]
+                    else:
+                        cursor.execute(
+                            """
+                            INSERT INTO t_attendance_regularization_request
+                              (tenant_id, employee_id, date, requested_status_id, requested_check_in, requested_check_out,
+                               requested_work_hours, reason, state, requested_by_id, requested_at,
+                               reviewed_by_id, reviewed_at, review_comment)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            [
+                                tenant.id,
+                                int(employee_id),
+                                target_date,
+                                int(status_obj.id) if status_obj else None,
+                                check_in,
+                                check_out,
+                                float(work_hours) if work_hours is not None else None,
+                                str(reason or '')[:2000],
+                                state,
+                                request.user.id if request.user and request.user.id else None,
+                                requested_at,
+                                request.user.id if auto_approve else None,
+                                requested_at if auto_approve else None,
+                                str(reason or '')[:2000] if auto_approve else None,
+                            ],
+                        )
+                        req_id = cursor.lastrowid
+            except Exception:
+                req_id = None
+
+            if not auto_approve:
+                return Response({
+                    "message": "Regularization submitted for approval",
+                    "state": state,
+                    "request_id": req_id,
+                }, status=202)
+
+            # Auto-approve path: apply changes to AttendanceRecord (upsert)
+            if record_id and record:
+                if status_obj:
+                    record.status = status_obj
+                record.check_in = check_in
+                record.check_out = check_out
+                record.work_hours = work_hours if work_hours is not None else 0.0
+                try:
+                    record.regularization_reason = str(reason or '')[:2000]
+                except Exception:
+                    pass
+                record.save()
+            else:
+                rec, created = AttendanceRecord.objects.get_or_create(
                     tenant=tenant,
                     employee_id=employee_id,
                     date=target_date,
                     defaults={
-                        'status':     status_obj,
-                        'check_in':   check_in,
-                        'check_out':  check_out,
+                        'status': status_obj,
+                        'check_in': check_in,
+                        'check_out': check_out,
                         'work_hours': work_hours if work_hours is not None else 9.0,
-                        'location':   'Office'
-                    }
+                        'location': 'Office',
+                    },
                 )
                 if not created:
-                    if status_obj: record.status = status_obj
-                    record.check_in   = check_in
-                    record.check_out  = check_out
-                    record.work_hours = work_hours if work_hours is not None else 0.0
-                    record.save()
-            else:
-                return Response({"error": "Provide record_id OR (employee_id + date)"}, status=400)
+                    if status_obj:
+                        rec.status = status_obj
+                    rec.check_in = check_in
+                    rec.check_out = check_out
+                    rec.work_hours = work_hours if work_hours is not None else 0.0
+                try:
+                    rec.regularization_reason = str(reason or '')[:2000]
+                except Exception:
+                    pass
+                rec.save()
 
-            return Response({"message": "Attendance regularized successfully"})
+            return Response({"message": "Attendance regularized successfully", "state": state, "request_id": req_id})
         except AttendanceRecord.DoesNotExist:
             return Response({"error": "Record not found"}, status=404)
         except Exception as e:
             return Response({"error": str(e)}, status=500)
+
+
+class AttendanceRegularizationRequestsView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        try:
+            ensure_master_tables_exist()
+        except Exception:
+            pass
+
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
+            return Response({"error": "Permission denied"}, status=403)
+
+        tenant = request.user.tenant
+        state = (request.query_params.get('state') or 'PENDING').strip().upper()
+        employee_id = request.query_params.get('employee_id')
+        month = request.query_params.get('month')  # YYYY-MM optional
+
+        clauses = ["r.tenant_id = %s", "UPPER(r.state) = %s"]
+        params = [tenant.id, state]
+        if employee_id:
+            clauses.append("r.employee_id = %s")
+            params.append(int(employee_id))
+        if month:
+            clauses.append("DATE_FORMAT(r.date, '%%Y-%%m') = %s")
+            params.append(str(month))
+
+        vendor = getattr(connection, "vendor", "")
+        with connection.cursor() as cursor:
+            if vendor == "sqlite":
+                # SQLite doesn't have DATE_FORMAT; treat month filter as prefix.
+                clauses_sql = ["r.tenant_id = ?", "UPPER(r.state) = ?"]
+                params_sql = [str(tenant.id), state]
+                if employee_id:
+                    clauses_sql.append("r.employee_id = ?")
+                    params_sql.append(int(employee_id))
+                if month:
+                    clauses_sql.append("substr(r.date, 1, 7) = ?")
+                    params_sql.append(str(month))
+                where = " AND ".join(clauses_sql)
+                cursor.execute(
+                    f"""
+                    SELECT r.id, r.employee_id, e.name, r.date,
+                           r.requested_status_id, s.code, s.label,
+                           r.requested_check_in, r.requested_check_out, r.requested_work_hours,
+                           r.reason, r.state, r.requested_at
+                    FROM t_attendance_regularization_request r
+                    LEFT JOIN t_employee e ON e.id = r.employee_id
+                    LEFT JOIN t_attendance_status s ON s.id = r.requested_status_id
+                    WHERE {where}
+                    ORDER BY r.requested_at DESC
+                    LIMIT 500
+                    """,
+                    params_sql,
+                )
+            else:
+                where = " AND ".join(clauses)
+                cursor.execute(
+                    f"""
+                    SELECT r.id, r.employee_id, e.name, r.date,
+                           r.requested_status_id, s.code, s.label,
+                           r.requested_check_in, r.requested_check_out, r.requested_work_hours,
+                           r.reason, r.state, r.requested_at
+                    FROM t_attendance_regularization_request r
+                    LEFT JOIN t_employee e ON e.id = r.employee_id
+                    LEFT JOIN t_attendance_status s ON s.id = r.requested_status_id
+                    WHERE {where}
+                    ORDER BY r.requested_at DESC
+                    LIMIT 500
+                    """,
+                    params,
+                )
+            rows = cursor.fetchall()
+
+        data = []
+        for r in rows:
+            data.append({
+                "id": r[0],
+                "employee_id": r[1],
+                "employee_name": r[2] or "",
+                "date": str(r[3]) if r[3] else None,
+                "requested_status_id": r[4],
+                "requested_status_code": (r[5] or ""),
+                "requested_status_label": (r[6] or ""),
+                "requested_check_in": str(r[7]) if r[7] else "",
+                "requested_check_out": str(r[8]) if r[8] else "",
+                "requested_work_hours": float(r[9]) if r[9] is not None else None,
+                "reason": r[10] or "",
+                "state": r[11] or "",
+                "requested_at": str(r[12]) if r[12] else None,
+            })
+        return Response({"requests": data})
+
+
+class AttendanceRegularizationApproveView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        try:
+            ensure_master_tables_exist()
+        except Exception:
+            pass
+
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+
+        tenant = request.user.tenant
+        req_id = request.data.get('request_id')
+        action = (request.data.get('action') or '').strip().lower()
+        review_comment = request.data.get('comment') or request.data.get('reason') or ''
+
+        if not req_id:
+            return Response({"error": "request_id is required"}, status=400)
+        if action not in ['approve', 'reject']:
+            return Response({"error": "action must be approve|reject"}, status=400)
+
+        vendor = getattr(connection, "vendor", "")
+        with connection.cursor() as cursor:
+            # Load request row
+            if vendor == "sqlite":
+                cursor.execute(
+                    """
+                    SELECT id, employee_id, date, requested_status_id, requested_check_in, requested_check_out, requested_work_hours, reason, state
+                    FROM t_attendance_regularization_request
+                    WHERE tenant_id = ? AND id = ?
+                    """,
+                    [str(tenant.id), int(req_id)],
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT id, employee_id, date, requested_status_id, requested_check_in, requested_check_out, requested_work_hours, reason, state
+                    FROM t_attendance_regularization_request
+                    WHERE tenant_id = %s AND id = %s
+                    """,
+                    [tenant.id, int(req_id)],
+                )
+            row = cursor.fetchone()
+
+        if not row:
+            return Response({"error": "Request not found"}, status=404)
+
+        current_state = str(row[8] or '').upper()
+        if current_state != 'PENDING':
+            return Response({"error": f"Request already {current_state}"}, status=400)
+
+        employee_id = row[1]
+        target_date = row[2]
+        requested_status_id = row[3]
+        check_in = row[4]
+        check_out = row[5]
+        work_hours = row[6]
+        fallback_reason = row[7] or ''
+
+        new_state = 'APPROVED' if action == 'approve' else 'REJECTED'
+        reviewed_at = timezone.now()
+        review_comment = str(review_comment or fallback_reason or '')[:2000]
+
+        # Update request row state
+        with connection.cursor() as cursor:
+            vendor = getattr(connection, "vendor", "")
+            if vendor == "sqlite":
+                cursor.execute(
+                    """
+                    UPDATE t_attendance_regularization_request
+                    SET state = ?, reviewed_by_id = ?, reviewed_at = ?, review_comment = ?
+                    WHERE tenant_id = ? AND id = ?
+                    """,
+                    [new_state, int(request.user.id), str(reviewed_at), review_comment, str(tenant.id), int(req_id)],
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE t_attendance_regularization_request
+                    SET state = %s, reviewed_by_id = %s, reviewed_at = %s, review_comment = %s
+                    WHERE tenant_id = %s AND id = %s
+                    """,
+                    [new_state, request.user.id, reviewed_at, review_comment, tenant.id, int(req_id)],
+                )
+
+        if action == 'reject':
+            return Response({"message": "Rejected", "state": new_state})
+
+        status_obj = AttendanceStatus.objects.filter(pk=requested_status_id).first() if requested_status_id else None
+        rec, created = AttendanceRecord.objects.get_or_create(
+            tenant=tenant,
+            employee_id=employee_id,
+            date=target_date,
+            defaults={
+                'status': status_obj,
+                'check_in': check_in,
+                'check_out': check_out,
+                'work_hours': float(work_hours) if work_hours is not None else 0.0,
+                'location': 'Office',
+            },
+        )
+        if not created:
+            if status_obj:
+                rec.status = status_obj
+            rec.check_in = check_in
+            rec.check_out = check_out
+            rec.work_hours = float(work_hours) if work_hours is not None else 0.0
+        try:
+            rec.regularization_reason = review_comment
+        except Exception:
+            pass
+        rec.save()
+
+        return Response({"message": "Approved and applied", "state": new_state, "record_id": rec.id})
+
+
+# ─────────────────────────────────────────────
+# Comp Off — requests & approvals
+# ─────────────────────────────────────────────
+class CompOffRequestsView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        try:
+            ensure_master_tables_exist()
+        except Exception:
+            pass
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
+            return Response({"error": "Permission denied"}, status=403)
+
+        tenant = request.user.tenant
+        state = (request.query_params.get('state') or 'PENDING').strip().upper()
+        employee_id = request.query_params.get('employee_id')
+
+        vendor = getattr(connection, "vendor", "")
+        with connection.cursor() as cursor:
+            if vendor == "sqlite":
+                params = [str(tenant.id), state]
+                where = "tenant_id = ? AND UPPER(state) = ?"
+                if employee_id:
+                    where += " AND employee_id = ?"
+                    params.append(int(employee_id))
+                cursor.execute(
+                    f"""
+                    SELECT r.id, r.employee_id, e.name, r.worked_date, r.credit_days, r.reason, r.state, r.requested_at
+                    FROM t_comp_off_request r
+                    LEFT JOIN t_employee e ON e.id = r.employee_id
+                    WHERE {where}
+                    ORDER BY r.requested_at DESC
+                    LIMIT 500
+                    """,
+                    params,
+                )
+            else:
+                params = [tenant.id, state]
+                where = "tenant_id = %s AND UPPER(state) = %s"
+                if employee_id:
+                    where += " AND employee_id = %s"
+                    params.append(int(employee_id))
+                cursor.execute(
+                    f"""
+                    SELECT r.id, r.employee_id, e.name, r.worked_date, r.credit_days, r.reason, r.state, r.requested_at
+                    FROM t_comp_off_request r
+                    LEFT JOIN t_employee e ON e.id = r.employee_id
+                    WHERE {where}
+                    ORDER BY r.requested_at DESC
+                    LIMIT 500
+                    """,
+                    params,
+                )
+            rows = cursor.fetchall()
+
+        data = []
+        for r in rows:
+            data.append({
+                "id": r[0],
+                "employee_id": r[1],
+                "employee_name": r[2] or "",
+                "worked_date": str(r[3]) if r[3] else None,
+                "credit_days": float(r[4]) if r[4] is not None else 1.0,
+                "reason": r[5] or "",
+                "state": r[6] or "",
+                "requested_at": str(r[7]) if r[7] else None,
+            })
+        return Response({"requests": data})
+
+    def post(self, request):
+        try:
+            ensure_master_tables_exist()
+        except Exception:
+            pass
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
+            return Response({"error": "Permission denied"}, status=403)
+
+        tenant = request.user.tenant
+        employee_id = request.data.get('employee_id')
+        worked_date = request.data.get('worked_date')
+        credit_days = request.data.get('credit_days') or 1
+        reason = request.data.get('reason') or ''
+
+        if not employee_id or not worked_date:
+            return Response({"error": "employee_id and worked_date are required"}, status=400)
+
+        try:
+            from datetime import date
+            wd = worked_date if isinstance(worked_date, date) else date.fromisoformat(str(worked_date))
+        except Exception:
+            return Response({"error": "Invalid worked_date (use YYYY-MM-DD)"}, status=400)
+
+        try:
+            emp = Employee.objects.get(tenant=tenant, id=safe_int(employee_id))
+        except Employee.DoesNotExist:
+            return Response({"error": "Employee not found"}, status=404)
+
+        # HR/Admin auto-approve; Manager -> pending.
+        auto_approve = request.user.system_role in ['ADMIN', 'SUPER_ADMIN', 'HR']
+        state = 'APPROVED' if auto_approve else 'PENDING'
+        now = timezone.now()
+
+        req_id = None
+        with connection.cursor() as cursor:
+            vendor = getattr(connection, "vendor", "")
+            if vendor == "sqlite":
+                cursor.execute(
+                    """
+                    INSERT INTO t_comp_off_request
+                      (tenant_id, employee_id, worked_date, credit_days, reason, state, requested_by_id, requested_at,
+                       reviewed_by_id, reviewed_at, review_comment)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        str(tenant.id), int(emp.id), str(wd), float(credit_days),
+                        str(reason or '')[:2000], state,
+                        int(request.user.id) if request.user.id else None, str(now),
+                        int(request.user.id) if auto_approve else None,
+                        str(now) if auto_approve else None,
+                        str(reason or '')[:2000] if auto_approve else None,
+                    ],
+                )
+                cursor.execute("SELECT last_insert_rowid()")
+                req_id = cursor.fetchone()[0]
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO t_comp_off_request
+                      (tenant_id, employee_id, worked_date, credit_days, reason, state, requested_by_id, requested_at,
+                       reviewed_by_id, reviewed_at, review_comment)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    [
+                        tenant.id, emp.id, wd, float(credit_days),
+                        str(reason or '')[:2000], state,
+                        request.user.id if request.user.id else None, now,
+                        request.user.id if auto_approve else None,
+                        now if auto_approve else None,
+                        str(reason or '')[:2000] if auto_approve else None,
+                    ],
+                )
+                req_id = cursor.lastrowid
+
+        if not auto_approve:
+            return Response({"message": "Submitted for approval", "state": state, "request_id": req_id}, status=202)
+
+        # Auto-credit COMP leave balance on approval
+        year = str(wd.year)
+        lt = LeaveType.objects.filter(tenant=tenant, code__iexact='COMP').first()
+        if not lt:
+            return Response({"error": "COMP leave type not configured in Leave Master"}, status=400)
+
+        bal, _ = LeaveBalance.objects.get_or_create(
+            tenant=tenant,
+            employee=emp,
+            leave_type=lt,
+            year=year,
+            defaults={'allocated': 0, 'used': 0, 'carried_forward': 0},
+        )
+        bal.carried_forward = (bal.carried_forward or 0) + float(credit_days)
+        bal.save(update_fields=['carried_forward'])
+
+        return Response({"message": "Approved and credited", "state": state, "request_id": req_id})
+
+
+class CompOffApproveView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        try:
+            ensure_master_tables_exist()
+        except Exception:
+            pass
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+
+        tenant = request.user.tenant
+        req_id = request.data.get('request_id')
+        action = (request.data.get('action') or '').strip().lower()
+        comment = request.data.get('comment') or ''
+        credit_days = request.data.get('credit_days')  # optional override on approval
+
+        if not req_id:
+            return Response({"error": "request_id is required"}, status=400)
+        if action not in ['approve', 'reject']:
+            return Response({"error": "action must be approve|reject"}, status=400)
+
+        vendor = getattr(connection, "vendor", "")
+        with connection.cursor() as cursor:
+            if vendor == "sqlite":
+                cursor.execute(
+                    """
+                    SELECT id, employee_id, worked_date, credit_days, state, reason
+                    FROM t_comp_off_request
+                    WHERE tenant_id = ? AND id = ?
+                    """,
+                    [str(tenant.id), int(req_id)],
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT id, employee_id, worked_date, credit_days, state, reason
+                    FROM t_comp_off_request
+                    WHERE tenant_id = %s AND id = %s
+                    """,
+                    [tenant.id, int(req_id)],
+                )
+            row = cursor.fetchone()
+
+        if not row:
+            return Response({"error": "Request not found"}, status=404)
+        if str(row[4] or '').upper() != 'PENDING':
+            return Response({"error": "Request is not pending"}, status=400)
+
+        employee_id = row[1]
+        worked_date = row[2]
+        days = float(credit_days) if credit_days is not None else float(row[3] or 1)
+        fallback_reason = row[5] or ''
+
+        new_state = 'APPROVED' if action == 'approve' else 'REJECTED'
+        reviewed_at = timezone.now()
+        review_comment = str(comment or fallback_reason or '')[:2000]
+
+        with connection.cursor() as cursor:
+            vendor = getattr(connection, "vendor", "")
+            if vendor == "sqlite":
+                cursor.execute(
+                    """
+                    UPDATE t_comp_off_request
+                    SET state = ?, reviewed_by_id = ?, reviewed_at = ?, review_comment = ?, credit_days = ?
+                    WHERE tenant_id = ? AND id = ?
+                    """,
+                    [new_state, int(request.user.id), str(reviewed_at), review_comment, float(days), str(tenant.id), int(req_id)],
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE t_comp_off_request
+                    SET state = %s, reviewed_by_id = %s, reviewed_at = %s, review_comment = %s, credit_days = %s
+                    WHERE tenant_id = %s AND id = %s
+                    """,
+                    [new_state, request.user.id, reviewed_at, review_comment, float(days), tenant.id, int(req_id)],
+                )
+
+        if action == 'reject':
+            return Response({"message": "Rejected", "state": new_state})
+
+        # Credit COMP leave balance
+        try:
+            emp = Employee.objects.get(tenant=tenant, id=safe_int(employee_id))
+        except Employee.DoesNotExist:
+            return Response({"error": "Employee not found"}, status=404)
+
+        lt = LeaveType.objects.filter(tenant=tenant, code__iexact='COMP').first()
+        if not lt:
+            return Response({"error": "COMP leave type not configured in Leave Master"}, status=400)
+
+        year = str(worked_date.year) if worked_date else str(timezone.localdate().year)
+        bal, _ = LeaveBalance.objects.get_or_create(
+            tenant=tenant,
+            employee=emp,
+            leave_type=lt,
+            year=year,
+            defaults={'allocated': 0, 'used': 0, 'carried_forward': 0},
+        )
+        bal.carried_forward = (bal.carried_forward or 0) + float(days)
+        bal.save(update_fields=['carried_forward'])
+
+        return Response({"message": "Approved and credited", "state": new_state})
+
+
+# ─────────────────────────────────────────────
+# Overtime — requests & approvals
+# ─────────────────────────────────────────────
+class OvertimeRequestsView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        try:
+            ensure_master_tables_exist()
+        except Exception:
+            pass
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
+            return Response({"error": "Permission denied"}, status=403)
+
+        tenant = request.user.tenant
+        state = (request.query_params.get('state') or 'PENDING').strip().upper()
+        employee_id = request.query_params.get('employee_id')
+        cycle = request.query_params.get('cycle')  # YYYY-MM optional
+
+        vendor = getattr(connection, "vendor", "")
+        with connection.cursor() as cursor:
+            if vendor == "sqlite":
+                params = [str(tenant.id), state]
+                where = "r.tenant_id = ? AND UPPER(r.state) = ?"
+                if employee_id:
+                    where += " AND r.employee_id = ?"
+                    params.append(int(employee_id))
+                if cycle:
+                    where += " AND substr(r.ot_date, 1, 7) = ?"
+                    params.append(str(cycle))
+                cursor.execute(
+                    f"""
+                    SELECT r.id, r.employee_id, e.name, r.ot_date, r.hours, r.reason, r.state, r.requested_at
+                    FROM t_overtime_request r
+                    LEFT JOIN t_employee e ON e.id = r.employee_id
+                    WHERE {where}
+                    ORDER BY r.requested_at DESC
+                    LIMIT 500
+                    """,
+                    params,
+                )
+            else:
+                params = [tenant.id, state]
+                where = "r.tenant_id = %s AND UPPER(r.state) = %s"
+                if employee_id:
+                    where += " AND r.employee_id = %s"
+                    params.append(int(employee_id))
+                if cycle:
+                    where += " AND DATE_FORMAT(r.ot_date, '%%Y-%%m') = %s"
+                    params.append(str(cycle))
+                cursor.execute(
+                    f"""
+                    SELECT r.id, r.employee_id, e.name, r.ot_date, r.hours, r.reason, r.state, r.requested_at
+                    FROM t_overtime_request r
+                    LEFT JOIN t_employee e ON e.id = r.employee_id
+                    WHERE {where}
+                    ORDER BY r.requested_at DESC
+                    LIMIT 500
+                    """,
+                    params,
+                )
+            rows = cursor.fetchall()
+
+        data = []
+        for r in rows:
+            data.append({
+                "id": r[0],
+                "employee_id": r[1],
+                "employee_name": r[2] or "",
+                "ot_date": str(r[3]) if r[3] else None,
+                "hours": float(r[4]) if r[4] is not None else 0.0,
+                "reason": r[5] or "",
+                "state": r[6] or "",
+                "requested_at": str(r[7]) if r[7] else None,
+            })
+        return Response({"requests": data})
+
+    def post(self, request):
+        try:
+            ensure_master_tables_exist()
+        except Exception:
+            pass
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
+            return Response({"error": "Permission denied"}, status=403)
+
+        tenant = request.user.tenant
+        employee_id = request.data.get('employee_id')
+        ot_date = request.data.get('ot_date')
+        hours = request.data.get('hours')
+        reason = request.data.get('reason') or ''
+
+        if not employee_id or not ot_date or hours is None:
+            return Response({"error": "employee_id, ot_date, hours are required"}, status=400)
+
+        try:
+            from datetime import date
+            d = ot_date if isinstance(ot_date, date) else date.fromisoformat(str(ot_date))
+        except Exception:
+            return Response({"error": "Invalid ot_date (use YYYY-MM-DD)"}, status=400)
+
+        try:
+            emp = Employee.objects.get(tenant=tenant, id=safe_int(employee_id))
+        except Employee.DoesNotExist:
+            return Response({"error": "Employee not found"}, status=404)
+
+        auto_approve = request.user.system_role in ['ADMIN', 'SUPER_ADMIN', 'HR']
+        state = 'APPROVED' if auto_approve else 'PENDING'
+        now = timezone.now()
+
+        req_id = None
+        with connection.cursor() as cursor:
+            vendor = getattr(connection, "vendor", "")
+            if vendor == "sqlite":
+                cursor.execute(
+                    """
+                    INSERT INTO t_overtime_request
+                      (tenant_id, employee_id, ot_date, hours, reason, state, requested_by_id, requested_at,
+                       reviewed_by_id, reviewed_at, review_comment)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        str(tenant.id), int(emp.id), str(d), float(hours),
+                        str(reason or '')[:2000], state,
+                        int(request.user.id) if request.user.id else None, str(now),
+                        int(request.user.id) if auto_approve else None,
+                        str(now) if auto_approve else None,
+                        str(reason or '')[:2000] if auto_approve else None,
+                    ],
+                )
+                cursor.execute("SELECT last_insert_rowid()")
+                req_id = cursor.fetchone()[0]
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO t_overtime_request
+                      (tenant_id, employee_id, ot_date, hours, reason, state, requested_by_id, requested_at,
+                       reviewed_by_id, reviewed_at, review_comment)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    [
+                        tenant.id, emp.id, d, float(hours),
+                        str(reason or '')[:2000], state,
+                        request.user.id if request.user.id else None, now,
+                        request.user.id if auto_approve else None,
+                        now if auto_approve else None,
+                        str(reason or '')[:2000] if auto_approve else None,
+                    ],
+                )
+                req_id = cursor.lastrowid
+
+        if not auto_approve:
+            return Response({"message": "Submitted for approval", "state": state, "request_id": req_id}, status=202)
+
+        # Auto-sync into payroll variable inputs
+        cycle = str(d)[:7]
+        try:
+            ensure_payroll_workflow_tables_exist()
+        except Exception:
+            pass
+
+        try:
+            PayrollVariableInput.objects.create(
+                tenant=tenant,
+                employee=emp,
+                cycle_month=cycle,
+                input_type='OVERTIME',
+                label=f"OT {d}",
+                amount=float(hours),
+                meta={"date": str(d), "request_id": req_id, "reason": str(reason or '')[:2000]},
+                status='Active',
+                created_by=request.user.id,
+                approved_by=request.user.id,
+            )
+        except Exception:
+            pass
+
+        return Response({"message": "Approved and synced to payroll", "state": state, "request_id": req_id})
+
+
+class OvertimeApproveView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        try:
+            ensure_master_tables_exist()
+        except Exception:
+            pass
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+
+        tenant = request.user.tenant
+        req_id = request.data.get('request_id')
+        action = (request.data.get('action') or '').strip().lower()
+        comment = request.data.get('comment') or ''
+
+        if not req_id:
+            return Response({"error": "request_id is required"}, status=400)
+        if action not in ['approve', 'reject']:
+            return Response({"error": "action must be approve|reject"}, status=400)
+
+        vendor = getattr(connection, "vendor", "")
+        with connection.cursor() as cursor:
+            if vendor == "sqlite":
+                cursor.execute(
+                    """
+                    SELECT id, employee_id, ot_date, hours, state, reason
+                    FROM t_overtime_request
+                    WHERE tenant_id = ? AND id = ?
+                    """,
+                    [str(tenant.id), int(req_id)],
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT id, employee_id, ot_date, hours, state, reason
+                    FROM t_overtime_request
+                    WHERE tenant_id = %s AND id = %s
+                    """,
+                    [tenant.id, int(req_id)],
+                )
+            row = cursor.fetchone()
+
+        if not row:
+            return Response({"error": "Request not found"}, status=404)
+        if str(row[4] or '').upper() != 'PENDING':
+            return Response({"error": "Request is not pending"}, status=400)
+
+        employee_id = row[1]
+        ot_date = row[2]
+        hours = float(row[3] or 0)
+        fallback_reason = row[5] or ''
+
+        new_state = 'APPROVED' if action == 'approve' else 'REJECTED'
+        reviewed_at = timezone.now()
+        review_comment = str(comment or fallback_reason or '')[:2000]
+
+        with connection.cursor() as cursor:
+            vendor = getattr(connection, "vendor", "")
+            if vendor == "sqlite":
+                cursor.execute(
+                    """
+                    UPDATE t_overtime_request
+                    SET state = ?, reviewed_by_id = ?, reviewed_at = ?, review_comment = ?
+                    WHERE tenant_id = ? AND id = ?
+                    """,
+                    [new_state, int(request.user.id), str(reviewed_at), review_comment, str(tenant.id), int(req_id)],
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE t_overtime_request
+                    SET state = %s, reviewed_by_id = %s, reviewed_at = %s, review_comment = %s
+                    WHERE tenant_id = %s AND id = %s
+                    """,
+                    [new_state, request.user.id, reviewed_at, review_comment, tenant.id, int(req_id)],
+                )
+
+        if action == 'reject':
+            return Response({"message": "Rejected", "state": new_state})
+
+        # Sync into payroll variable inputs
+        try:
+            ensure_payroll_workflow_tables_exist()
+        except Exception:
+            pass
+
+        try:
+            emp = Employee.objects.get(tenant=tenant, id=safe_int(employee_id))
+        except Employee.DoesNotExist:
+            return Response({"error": "Employee not found"}, status=404)
+
+        cycle = str(ot_date)[:7]
+        try:
+            PayrollVariableInput.objects.create(
+                tenant=tenant,
+                employee=emp,
+                cycle_month=cycle,
+                input_type='OVERTIME',
+                label=f"OT {ot_date}",
+                amount=float(hours),
+                meta={"date": str(ot_date), "request_id": int(req_id), "review_comment": review_comment},
+                status='Active',
+                created_by=request.user.id,
+                approved_by=request.user.id,
+            )
+        except Exception:
+            pass
+
+        return Response({"message": "Approved and synced", "state": new_state})
 
 
 
@@ -5868,6 +6874,135 @@ class EmployeeShiftAssignmentsView(views.APIView):
         except Exception:
             pass
         return Response({"message": "Shift assigned", "shift_id": sft.id, "effective_from": str(eff_date)})
+
+
+# ─────────────────────────────────────────────
+# Attendance — Tenant-wide shift assignments
+# ─────────────────────────────────────────────
+class AttendanceShiftAssignmentsView(views.APIView):
+    """
+    Admin/HR: view and assign shifts tenant-wide.
+
+    - GET: list latest active shift assignment per employee (optionally filter by employee_id)
+    - POST: assign shift to an employee (effective-dated); uses the same underlying
+            table as the per-employee endpoint: t_employee_shift_assignment.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        ensure_employee_shift_assignment_tables_exist()
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
+            return Response({"error": "Permission denied"}, status=403)
+
+        tenant = request.user.tenant
+        employee_id = request.query_params.get('employee_id')
+
+        with connection.cursor() as cursor:
+            vendor = getattr(connection, "vendor", "")
+            params = [str(tenant.id)]
+            emp_clause = ""
+            if employee_id:
+                emp_clause = " AND e.id = %s " if vendor != "sqlite" else " AND e.id = ? "
+                params.append(int(employee_id))
+
+            if vendor == "sqlite":
+                cursor.execute(
+                    f"""
+                    SELECT e.id as employee_id, e.name as employee_name,
+                           esa.shift_id, s.name as shift_name,
+                           esa.effective_from, esa.effective_to, esa.is_active
+                    FROM t_employee e
+                    LEFT JOIN t_employee_shift_assignment esa
+                      ON esa.tenant_id = e.tenant_id
+                     AND esa.employee_id = e.id
+                     AND esa.is_active = 1
+                    LEFT JOIN t_shift s ON s.id = esa.shift_id
+                    WHERE e.tenant_id = ?
+                    {emp_clause}
+                    ORDER BY e.name ASC
+                    LIMIT 2000
+                    """,
+                    params,
+                )
+            else:
+                cursor.execute(
+                    f"""
+                    SELECT e.id as employee_id, e.name as employee_name,
+                           esa.shift_id, s.name as shift_name,
+                           esa.effective_from, esa.effective_to, esa.is_active
+                    FROM t_employee e
+                    LEFT JOIN t_employee_shift_assignment esa
+                      ON esa.tenant_id = e.tenant_id
+                     AND esa.employee_id = e.id
+                     AND esa.is_active = 1
+                    LEFT JOIN t_shift s ON s.id = esa.shift_id
+                    WHERE e.tenant_id = %s
+                    {emp_clause}
+                    ORDER BY e.name ASC
+                    LIMIT 2000
+                    """,
+                    params,
+                )
+            rows = cursor.fetchall()
+
+        data = []
+        for r in rows:
+            data.append({
+                "employee_id": r[0],
+                "employee_name": r[1] or "",
+                "shift_id": r[2],
+                "shift_name": r[3] or "",
+                "effective_from": str(r[4]) if r[4] else None,
+                "effective_to": str(r[5]) if r[5] else None,
+                "is_active": bool(r[6]) if r[6] is not None else False,
+            })
+        return Response({"assignments": data})
+
+    def post(self, request):
+        ensure_employee_shift_assignment_tables_exist()
+        ensure_hr_lifecycle_tables_exist()
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+
+        tenant = request.user.tenant
+        employee_id = request.data.get('employee_id')
+        shift_id = request.data.get('shift_id')
+        effective_from = request.data.get('effective_from')
+
+        if not employee_id:
+            return Response({"error": "employee_id is required"}, status=400)
+        if not shift_id:
+            return Response({"error": "shift_id is required"}, status=400)
+
+        try:
+            e = Employee.objects.get(tenant=tenant, id=safe_int(employee_id))
+        except Employee.DoesNotExist:
+            return Response({"error": "Employee not found"}, status=404)
+
+        try:
+            from datetime import date
+            eff_date = effective_from if isinstance(effective_from, date) else date.fromisoformat(str(effective_from))
+        except Exception:
+            eff_date = timezone.localdate()
+
+        sft = Shift.objects.filter(tenant=tenant, id=safe_int(shift_id)).first()
+        if not sft:
+            return Response({"error": "Shift not found"}, status=404)
+
+        _upsert_employee_shift_assignment(tenant.id, e.id, sft.id, eff_date, request.user.id)
+        try:
+            _insert_lifecycle_event(
+                tenant.id,
+                e.id,
+                "SHIFT_CHANGE",
+                eff_date,
+                {"shift_id": sft.id, "shift_name": sft.name},
+                request.user.id,
+            )
+        except Exception:
+            pass
+
+        return Response({"message": "Shift assigned", "employee_id": e.id, "shift_id": sft.id, "effective_from": str(eff_date)})
 
 
 # ─────────────────────────────────────────────
