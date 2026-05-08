@@ -1041,9 +1041,19 @@ def ensure_payroll_workflow_tables_exist():
             except Exception:
                 pass
 
-        # Attendance regularization request queue (best-effort; approvals workflow)
+        # Attendance regularization request queue (best-effort; two-stage approvals workflow)
         try:
             cursor.execute("SELECT state FROM t_attendance_regularization_request LIMIT 1")
+            # Table exists – add manager-stage columns if missing (schema upgrade)
+            for col_ddl in [
+                "ALTER TABLE t_attendance_regularization_request ADD COLUMN manager_reviewed_by_id BIGINT NULL",
+                "ALTER TABLE t_attendance_regularization_request ADD COLUMN manager_reviewed_at DATETIME(6) NULL",
+                "ALTER TABLE t_attendance_regularization_request ADD COLUMN manager_review_comment TEXT NULL",
+            ]:
+                try:
+                    cursor.execute(col_ddl)
+                except Exception:
+                    pass  # Column already exists
         except Exception:
             try:
                 cursor.execute(
@@ -1058,9 +1068,12 @@ def ensure_payroll_workflow_tables_exist():
                         requested_check_out TIME NULL,
                         requested_work_hours DECIMAL(6,2) NULL,
                         reason TEXT NULL,
-                        state VARCHAR(20) DEFAULT 'PENDING',
+                        state VARCHAR(32) DEFAULT 'PENDING_MANAGER',
                         requested_by_id BIGINT NULL,
                         requested_at DATETIME(6) NOT NULL,
+                        manager_reviewed_by_id BIGINT NULL,
+                        manager_reviewed_at DATETIME(6) NULL,
+                        manager_review_comment TEXT NULL,
                         reviewed_by_id BIGINT NULL,
                         reviewed_at DATETIME(6) NULL,
                         review_comment TEXT NULL,
@@ -3850,9 +3863,12 @@ class AttendanceRegularizeView(views.APIView):
                     status=400,
                 )
 
-            # Approvals MVP+: HR/Admin/SuperAdmin auto-approve, others create a pending request.
+            # Two-stage approval: MANAGER → HR/Admin.
+            # HR/Admin/SuperAdmin bypass stage 1 and auto-approve immediately.
+            # MANAGER requests go PENDING_MANAGER first, then PENDING_HR after manager approves.
+            # EMPLOYEE (via ESS) or any other role: PENDING_MANAGER.
             auto_approve = request.user.system_role in ['ADMIN', 'SUPER_ADMIN', 'HR']
-            state = 'APPROVED' if auto_approve else 'PENDING'
+            state = 'APPROVED' if auto_approve else 'PENDING_MANAGER'
 
             # Insert request row (audit trail)
             req_id = None
@@ -3920,7 +3936,7 @@ class AttendanceRegularizeView(views.APIView):
 
             if not auto_approve:
                 return Response({
-                    "message": "Regularization submitted for approval",
+                    "message": "Regularization submitted for manager approval",
                     "state": state,
                     "request_id": req_id,
                 }, status=202)
@@ -3982,41 +3998,76 @@ class AttendanceRegularizationRequestsView(views.APIView):
             return Response({"error": "Permission denied"}, status=403)
 
         tenant = request.user.tenant
-        state = (request.query_params.get('state') or 'PENDING').strip().upper()
+        # Accept comma-separated states e.g. "PENDING_MANAGER,PENDING_HR" or keep backward compat
+        raw_state = (request.query_params.get('state') or 'PENDING_MANAGER').strip().upper()
+        # Map legacy "PENDING" → "PENDING_MANAGER" for backward compat
+        if raw_state == 'PENDING':
+            raw_state = 'PENDING_MANAGER'
+        states = [s.strip() for s in raw_state.split(',') if s.strip()]
+
         employee_id = request.query_params.get('employee_id')
         month = request.query_params.get('month')  # YYYY-MM optional
+        mine = str(request.query_params.get('mine') or '').strip().lower() in ['1', 'true', 'yes']
+        sr = getattr(request.user, 'system_role', None)
 
-        clauses = ["r.tenant_id = %s", "UPPER(r.state) = %s"]
-        params = [tenant.id, state]
+        # Managers should only see requests of their direct reports unless mine=1 (then only their own requests).
+        manager_id = None
+        if sr == 'MANAGER':
+            try:
+                manager_id = getattr(request.user, 'employee_profile', None).id
+            except Exception:
+                manager_id = None
+
+        vendor = getattr(connection, "vendor", "")
+        state_placeholders_mysql = ', '.join(['%s'] * len(states))
+        state_placeholders_sqlite = ', '.join(['?'] * len(states))
+
+        clauses = [f"r.tenant_id = %s", f"UPPER(r.state) IN ({state_placeholders_mysql})"]
+        params = [tenant.id, *states]
         if employee_id:
             clauses.append("r.employee_id = %s")
             params.append(int(employee_id))
         if month:
             clauses.append("DATE_FORMAT(r.date, '%%Y-%%m') = %s")
             params.append(str(month))
+        if mine:
+            clauses.append("r.requested_by_id = %s")
+            params.append(int(request.user.id))
+        if sr == 'MANAGER' and (not mine) and manager_id and (not employee_id):
+            clauses.append("e.reporting_to_id = %s")
+            params.append(int(manager_id))
 
-        vendor = getattr(connection, "vendor", "")
         with connection.cursor() as cursor:
             if vendor == "sqlite":
                 # SQLite doesn't have DATE_FORMAT; treat month filter as prefix.
-                clauses_sql = ["r.tenant_id = ?", "UPPER(r.state) = ?"]
-                params_sql = [str(tenant.id), state]
+                clauses_sql = [f"r.tenant_id = ?", f"UPPER(r.state) IN ({state_placeholders_sqlite})"]
+                params_sql = [str(tenant.id), *states]
                 if employee_id:
                     clauses_sql.append("r.employee_id = ?")
                     params_sql.append(int(employee_id))
                 if month:
                     clauses_sql.append("substr(r.date, 1, 7) = ?")
                     params_sql.append(str(month))
+                if mine:
+                    clauses_sql.append("r.requested_by_id = ?")
+                    params_sql.append(int(request.user.id))
+                if sr == 'MANAGER' and (not mine) and manager_id and (not employee_id):
+                    clauses_sql.append("e.reporting_to_id = ?")
+                    params_sql.append(int(manager_id))
                 where = " AND ".join(clauses_sql)
                 cursor.execute(
                     f"""
                     SELECT r.id, r.employee_id, e.name, r.date,
                            r.requested_status_id, s.code, s.label,
                            r.requested_check_in, r.requested_check_out, r.requested_work_hours,
-                           r.reason, r.state, r.requested_at
+                           r.reason, r.state, r.requested_at,
+                           r.manager_reviewed_by_id, mu.name, r.manager_reviewed_at, r.manager_review_comment,
+                           r.reviewed_by_id, hu.name, r.reviewed_at, r.review_comment
                     FROM t_attendance_regularization_request r
                     LEFT JOIN t_employee e ON e.id = r.employee_id
                     LEFT JOIN t_attendance_status s ON s.id = r.requested_status_id
+                    LEFT JOIN t_employee mu ON mu.id = r.manager_reviewed_by_id
+                    LEFT JOIN t_employee hu ON hu.id = r.reviewed_by_id
                     WHERE {where}
                     ORDER BY r.requested_at DESC
                     LIMIT 500
@@ -4030,10 +4081,14 @@ class AttendanceRegularizationRequestsView(views.APIView):
                     SELECT r.id, r.employee_id, e.name, r.date,
                            r.requested_status_id, s.code, s.label,
                            r.requested_check_in, r.requested_check_out, r.requested_work_hours,
-                           r.reason, r.state, r.requested_at
+                           r.reason, r.state, r.requested_at,
+                           r.manager_reviewed_by_id, mu.name, r.manager_reviewed_at, r.manager_review_comment,
+                           r.reviewed_by_id, hu.name, r.reviewed_at, r.review_comment
                     FROM t_attendance_regularization_request r
                     LEFT JOIN t_employee e ON e.id = r.employee_id
                     LEFT JOIN t_attendance_status s ON s.id = r.requested_status_id
+                    LEFT JOIN t_employee mu ON mu.id = r.manager_reviewed_by_id
+                    LEFT JOIN t_employee hu ON hu.id = r.reviewed_by_id
                     WHERE {where}
                     ORDER BY r.requested_at DESC
                     LIMIT 500
@@ -4058,6 +4113,14 @@ class AttendanceRegularizationRequestsView(views.APIView):
                 "reason": r[10] or "",
                 "state": r[11] or "",
                 "requested_at": str(r[12]) if r[12] else None,
+                "manager_reviewed_by_id": r[13],
+                "manager_reviewed_by_name": r[14] or "",
+                "manager_reviewed_at": str(r[15]) if r[15] else None,
+                "manager_review_comment": r[16] or "",
+                "hr_reviewed_by_id": r[17],
+                "hr_reviewed_by_name": r[18] or "",
+                "hr_reviewed_at": str(r[19]) if r[19] else None,
+                "hr_review_comment": r[20] or "",
             })
         return Response({"requests": data})
 
@@ -4071,7 +4134,7 @@ class AttendanceRegularizationApproveView(views.APIView):
         except Exception:
             pass
 
-        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
             return Response({"error": "Permission denied"}, status=403)
 
         tenant = request.user.tenant
@@ -4111,8 +4174,7 @@ class AttendanceRegularizationApproveView(views.APIView):
             return Response({"error": "Request not found"}, status=404)
 
         current_state = str(row[8] or '').upper()
-        if current_state != 'PENDING':
-            return Response({"error": f"Request already {current_state}"}, status=400)
+        sr = getattr(request.user, 'system_role', None)
 
         employee_id = row[1]
         target_date = row[2]
@@ -4121,14 +4183,81 @@ class AttendanceRegularizationApproveView(views.APIView):
         check_out = row[5]
         work_hours = row[6]
         fallback_reason = row[7] or ''
-
-        new_state = 'APPROVED' if action == 'approve' else 'REJECTED'
         reviewed_at = timezone.now()
         review_comment = str(review_comment or fallback_reason or '')[:2000]
 
-        # Update request row state
-        with connection.cursor() as cursor:
+        # ── Two-stage state machine ─────────────────────────────────────────
+        # Stage 1: MANAGER acts on PENDING_MANAGER
+        #   approve → PENDING_HR   (record manager decision, wait for HR)
+        #   reject  → REJECTED
+        # Stage 2: HR/Admin acts on PENDING_HR
+        #   approve → APPROVED     (apply correction)
+        #   reject  → REJECTED
+        # HR/Admin can also directly reject a PENDING_MANAGER request.
+        # ───────────────────────────────────────────────────────────────────
+
+        VALID_STATES = {'PENDING_MANAGER', 'PENDING_HR'}
+        if current_state not in VALID_STATES:
+            return Response({"error": f"Request is already {current_state} and cannot be actioned."}, status=400)
+
+        # Authorization & stage routing
+        if sr == 'MANAGER':
+            # Manager can only act on PENDING_MANAGER
+            if current_state != 'PENDING_MANAGER':
+                return Response({"error": "Manager can only act on requests awaiting manager approval."}, status=403)
+            # Must be the direct reporting manager
+            try:
+                mgr = request.user.employee_profile
+            except Exception:
+                return Response({"error": "Manager profile not found"}, status=403)
+            try:
+                emp = Employee.objects.filter(tenant=tenant, id=int(employee_id)).first()
+            except Exception:
+                emp = None
+            if (not emp) or (getattr(emp, 'reporting_to_id', None) != getattr(mgr, 'id', None)):
+                return Response({"error": "You are not authorized to approve this request."}, status=403)
+
+            new_state = 'PENDING_HR' if action == 'approve' else 'REJECTED'
             vendor = getattr(connection, "vendor", "")
+            with connection.cursor() as cursor:
+                if vendor == "sqlite":
+                    cursor.execute(
+                        """
+                        UPDATE t_attendance_regularization_request
+                        SET state = ?,
+                            manager_reviewed_by_id = ?, manager_reviewed_at = ?, manager_review_comment = ?
+                        WHERE tenant_id = ? AND id = ?
+                        """,
+                        [new_state, int(request.user.id), str(reviewed_at), review_comment, str(tenant.id), int(req_id)],
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE t_attendance_regularization_request
+                        SET state = %s,
+                            manager_reviewed_by_id = %s, manager_reviewed_at = %s, manager_review_comment = %s
+                        WHERE tenant_id = %s AND id = %s
+                        """,
+                        [new_state, request.user.id, reviewed_at, review_comment, tenant.id, int(req_id)],
+                    )
+            if action == 'reject':
+                return Response({"message": "Rejected by manager", "state": new_state})
+            return Response({"message": "Forwarded to HR for final approval", "state": new_state})
+
+        # HR / Admin / SuperAdmin path
+        if sr not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({"error": "Permission denied"}, status=403)
+
+        # HR/Admin can act on PENDING_HR only (or optionally reject PENDING_MANAGER directly)
+        if current_state == 'PENDING_MANAGER' and action == 'approve':
+            return Response(
+                {"error": "This request is still awaiting manager approval. HR can only approve after the manager has reviewed."},
+                status=400,
+            )
+
+        new_state = 'APPROVED' if action == 'approve' else 'REJECTED'
+        vendor = getattr(connection, "vendor", "")
+        with connection.cursor() as cursor:
             if vendor == "sqlite":
                 cursor.execute(
                     """
@@ -4149,8 +4278,9 @@ class AttendanceRegularizationApproveView(views.APIView):
                 )
 
         if action == 'reject':
-            return Response({"message": "Rejected", "state": new_state})
+            return Response({"message": "Rejected by HR", "state": new_state})
 
+        # Apply correction to AttendanceRecord
         status_obj = AttendanceStatus.objects.filter(pk=requested_status_id).first() if requested_status_id else None
         rec, created = AttendanceRecord.objects.get_or_create(
             tenant=tenant,
