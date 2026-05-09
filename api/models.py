@@ -534,6 +534,41 @@ class EmployeeLoanLedger(TenantScopedModel):
         unique_together = ('tenant', 'loan', 'cycle_month')
 
 
+class EmployeeGrievance(TenantScopedModel):
+    """Employee grievance/feedback ticket submitted via ESS."""
+    STATUS_CHOICES = [
+        ('Open', 'Open'),
+        ('Pending', 'Pending'),
+        ('Resolved', 'Resolved'),
+        ('Closed', 'Closed'),
+    ]
+
+    TYPE_CHOICES = [
+        ('Grievance', 'Grievance'),
+        ('Feedback', 'Feedback'),
+        ('Suggestion', 'Suggestion'),
+    ]
+
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='grievances')
+    grievance_type = models.CharField(max_length=30, choices=TYPE_CHOICES, default='Grievance')
+    subject = models.CharField(max_length=255)
+    description = models.TextField(null=True, blank=True)
+    is_confidential = models.BooleanField(default=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='Open')
+    response = models.TextField(null=True, blank=True)
+    submitted_at = models.DateTimeField(auto_now_add=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        managed = False
+        db_table = "t_employee_grievance"
+        indexes = [
+            models.Index(fields=['tenant', 'employee']),
+            models.Index(fields=['tenant', 'status']),
+        ]
+
+
 class ReimbursementCategory(TenantScopedModel):
     """Reimbursement master (Fuel/Travel/Mobile/Internet/Medical)."""
     code = models.CharField(max_length=30)

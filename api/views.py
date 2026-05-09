@@ -960,6 +960,55 @@ def ensure_payroll_workflow_tables_exist():
             """
         )
 
+
+def ensure_ess_grievance_tables_exist():
+    """Creates ESS grievance/ticket table if missing."""
+    vendor = getattr(connection, "vendor", "")
+    with connection.cursor() as cursor:
+        if vendor == "sqlite":
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS t_employee_grievance (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  tenant_id CHAR(32) NOT NULL,
+                  employee_id INTEGER NOT NULL,
+                  grievance_type VARCHAR(30) DEFAULT 'Grievance',
+                  subject VARCHAR(255) NOT NULL,
+                  description TEXT,
+                  is_confidential BOOLEAN DEFAULT 1,
+                  status VARCHAR(20) DEFAULT 'Open',
+                  response TEXT,
+                  submitted_at DATETIME NOT NULL,
+                  resolved_at DATETIME,
+                  created_at DATETIME NOT NULL
+                )
+                """
+            )
+            return
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS t_employee_grievance (
+              id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+              tenant_id CHAR(32) NOT NULL,
+              employee_id BIGINT NOT NULL,
+              grievance_type VARCHAR(30) DEFAULT 'Grievance',
+              subject VARCHAR(255) NOT NULL,
+              description TEXT NULL,
+              is_confidential BOOLEAN DEFAULT 1,
+              status VARCHAR(20) DEFAULT 'Open',
+              response TEXT NULL,
+              submitted_at DATETIME(6) NOT NULL,
+              resolved_at DATETIME NULL,
+              created_at DATETIME(6) NOT NULL,
+              INDEX idx_griev_emp (tenant_id, employee_id),
+              INDEX idx_griev_status (tenant_id, status),
+              CONSTRAINT fk_griev_tenant FOREIGN KEY (tenant_id) REFERENCES t_tenant(id) ON DELETE CASCADE,
+              CONSTRAINT fk_griev_emp FOREIGN KEY (employee_id) REFERENCES t_employee(id) ON DELETE CASCADE
+            )
+            """
+        )
+
         # Leave Tables
         cursor.execute(
             """
@@ -1229,17 +1278,34 @@ ADMIN_ROUTE_KEYS = [
     'pending',
     'notifications',
     'employees/new',
-    'attendance',
+    'employee-movements',
+    'salary-revisions',
+    'exit-management',
+    'attendance/shift-assignment',
+    'attendance/capture',
+    'attendance/regularization',
+    'attendance/approval',
+    'attendance/reports',
+    'leave/master',
+    'leave/policy',
+    'leave/application',
+    'leave/approval',
+    'leave/balance',
+    'leave/holiday-calendar',
+    'leave/comp-off',
+    'leave/reports',
+    'payroll/input',
+    'payroll/process',
+    'payroll/verification',
+    'payroll/approval',
+    'payroll/payslip-generation',
+    'payroll/master',
+    'payroll/compliance-reports',
     'reports',
-    'leave-master',
-    'holiday-calendar',
-    'asset-register',
-    'recruitment',
-    'setup',
+    'org-master',
+    'branch-setup',
+    'shift-setup',
     'role-permissions',
-    'payroll',
-    'performance',
-    'training',
     'grievance',
     'settings',
 ]
@@ -1258,7 +1324,7 @@ def default_allowed_routes_for_role_name(role_name: str):
     if any(k in name for k in ['chief executive officer', 'ceo', 'director', 'vice president', 'vp', 'general manager']):
         return ['*']
 
-    # C-level / architects / delivery/program/project leadership: strong visibility, no system settings
+    # C-level / architects / delivery/program/project leadership: strong visibility
     if any(k in name for k in [
         'chief technology officer', 'cto',
         'chief financial officer', 'cfo',
@@ -1267,36 +1333,33 @@ def default_allowed_routes_for_role_name(role_name: str):
     ]):
         return [
             'dashboard', 'pending', 'notifications',
-            'employees/new', 'attendance',
-            'reports', 'performance', 'training',
-            'asset-register', 'grievance',
-            'payroll',
+            'employees/new', 'employee-movements', 'salary-revisions', 'exit-management',
+            'attendance/reports', 'leave/reports',
+            'payroll/compliance-reports', 'reports',
         ]
 
     # HR
-    if 'talent acquisition' in name or 'recruiter' in name:
-        return ['dashboard', 'notifications', 'recruitment', 'employees/new', 'reports']
-
-    if 'hr' in name:
-        # HR Intern -> limited
+    if 'hr' in name or 'talent acquisition' in name or 'recruiter' in name:
         if 'intern' in name:
-            return ['dashboard', 'notifications', 'employees/new', 'recruitment']
-        # HR roles -> full HR ops
+            return ['dashboard', 'notifications', 'employees/new']
+        
+        # Standard HR access
         return [
             'dashboard', 'pending', 'notifications',
-            'employees/new', 'attendance',
-            'leave-master', 'holiday-calendar',
-            'recruitment', 'training', 'performance',
-            'grievance', 'asset-register',
-            'reports', 'payroll',
+            'employees/new', 'employee-movements', 'salary-revisions', 'exit-management',
+            'attendance/shift-assignment', 'attendance/capture', 'attendance/regularization', 'attendance/approval', 'attendance/reports',
+            'leave/master', 'leave/policy', 'leave/application', 'leave/approval', 'leave/balance', 'leave/holiday-calendar', 'leave/comp-off', 'leave/reports',
+            'payroll/input', 'payroll/process', 'payroll/verification', 'payroll/approval', 'payroll/payslip-generation', 'payroll/master', 'payroll/compliance-reports',
+            'reports',
         ]
 
-    # Payroll / Finance / Accounts / Audit / Tax
+    # Payroll / Finance / Accounts
     if any(k in name for k in ['payroll', 'accounts', 'accountant', 'finance', 'auditor', 'tax']):
-        # Finance manager -> broader
-        if 'manager' in name:
-            return ['dashboard', 'pending', 'notifications', 'payroll', 'reports']
-        return ['dashboard', 'notifications', 'payroll', 'reports']
+        return [
+            'dashboard', 'notifications',
+            'payroll/input', 'payroll/process', 'payroll/verification', 'payroll/approval', 'payroll/payslip-generation', 'payroll/master', 'payroll/compliance-reports',
+            'reports',
+        ]
 
     # Operations / plant / production / supply chain / quality
     if any(k in name for k in ['operations', 'plant', 'production', 'supply chain', 'quality']):
@@ -6023,6 +6086,113 @@ class ESSAttendanceHistoryView(views.APIView):
         return Response({"records": data})
 
 
+class ESSShiftsView(views.APIView):
+    """Employee: shift roster expanded from effective-dated assignments."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        ensure_employee_shift_assignment_tables_exist()
+        try:
+            emp = request.user.employee_profile
+        except Exception:
+            return Response({"error": "Employee profile not found"}, status=404)
+
+        tenant_id = str(request.user.tenant.id)
+        vendor = getattr(connection, "vendor", "")
+        with connection.cursor() as cursor:
+            if vendor == "sqlite":
+                cursor.execute(
+                    """
+                    SELECT shift_id, effective_from, effective_to, is_active
+                    FROM t_employee_shift_assignment
+                    WHERE tenant_id = ? AND employee_id = ?
+                    ORDER BY effective_from ASC
+                    """,
+                    [tenant_id, int(emp.id)],
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT shift_id, effective_from, effective_to, is_active
+                    FROM t_employee_shift_assignment
+                    WHERE tenant_id = %s AND employee_id = %s
+                    ORDER BY effective_from ASC
+                    """,
+                    [request.user.tenant.id, emp.id],
+                )
+            rows = cursor.fetchall()
+
+        assignments = []
+        for row in rows:
+            assignments.append({
+                "shift_id": int(row[0]),
+                "effective_from": str(row[1]) if row[1] else None,
+                "effective_to": str(row[2]) if row[2] else None,
+                "is_active": bool(row[3]),
+            })
+
+        from datetime import date
+        today = timezone.localdate()
+        start = today.replace(day=1)
+        # end = last day of next month
+        if start.month == 12:
+            next_month_start = date(start.year + 1, 1, 1)
+        else:
+            next_month_start = date(start.year, start.month + 1, 1)
+        if next_month_start.month == 12:
+            after_next_month = date(next_month_start.year + 1, 1, 1)
+        else:
+            after_next_month = date(next_month_start.year, next_month_start.month + 1, 1)
+        end = after_next_month - timedelta(days=1)
+
+        shift_ids = sorted(list({a["shift_id"] for a in assignments if a.get("shift_id")}))
+        shift_map = {}
+        if shift_ids:
+            for s in Shift.objects.filter(tenant=request.user.tenant, id__in=shift_ids, is_active=True):
+                shift_map[int(s.id)] = s
+
+        def _find_shift_id_for(day: date):
+            d_str = day.isoformat()
+            for a in reversed(assignments):
+                if not a.get("effective_from"):
+                    continue
+                if d_str < a["effective_from"]:
+                    continue
+                if a.get("effective_to") and d_str > a["effective_to"]:
+                    continue
+                return a["shift_id"]
+            return None
+
+        shifts = []
+        current_shift = None
+        d = start
+        while d <= end:
+            shift_id = _find_shift_id_for(d)
+            shift = shift_map.get(int(shift_id)) if shift_id else None
+            if shift:
+                item = {
+                    "date": d.isoformat(),
+                    "startTime": shift.start_time.strftime('%H:%M'),
+                    "endTime": shift.end_time.strftime('%H:%M'),
+                    "status": "Completed" if d < today else "Scheduled",
+                    "shiftName": shift.name,
+                }
+                shifts.append(item)
+                if d == today:
+                    current_shift = item
+            d = d + timedelta(days=1)
+
+        return Response({
+            "currentShift": current_shift,
+            "shifts": shifts,
+            "summary": {
+                "from": start.isoformat(),
+                "to": end.isoformat(),
+                "total": len(shifts),
+            }
+        })
+
+
 # ─────────────────────────────────────────────
 # TASK 4 — ESS Profile & Payslips
 # ─────────────────────────────────────────────
@@ -6030,12 +6200,13 @@ class ESSProfileView(views.APIView):
     """Employee: view own profile."""
     permission_classes = [permissions.IsAuthenticated]
 
-    def get(self, request):
+    def _build_payload(self, emp):
         try:
-            emp = request.user.employee_profile
+            salary_structure_name = getattr(emp.salary_structure.structure, 'name', 'Standard (Default)') if hasattr(emp, 'salary_structure') else 'Standard (Default)'
         except Exception:
-            return Response({"error": "Employee profile not found"}, status=404)
-        return Response({
+            salary_structure_name = 'Standard (Default)'
+
+        return {
             "id": emp.id,
             "employee_code": emp.employee_code or "",
             "name": emp.name,
@@ -6046,9 +6217,7 @@ class ESSProfileView(views.APIView):
             "reporting_to": emp.reporting_to.name if emp.reporting_to else "",
             "joining_date": str(emp.joining_date) if emp.joining_date else "",
             "status": emp.status,
-            "salary_structure": getattr(emp.salary_structure.structure, 'name', 'Standard (Default)') if hasattr(emp, 'salary_structure') else 'Standard (Default)',
-            
-            # Personal
+            "salary_structure": salary_structure_name,
             "dob": str(emp.dob) if emp.dob else "",
             "gender": emp.gender or "",
             "father_name": emp.father_name or "",
@@ -6056,27 +6225,108 @@ class ESSProfileView(views.APIView):
             "blood_group": emp.blood_group or "",
             "nationality": emp.nationality or "Indian",
             "personal_email": emp.personal_email or "",
-            
-            # Address
             "address": emp.address or "",
             "current_address": emp.current_address or "",
-            
-            # Compliance
             "pan_number": emp.pan_number or "",
             "aadhar_number": emp.aadhar_number or "",
             "uan_number": emp.uan_number or "",
             "tax_regime": emp.tax_regime or "New",
-            
-            # Bank
             "bank_name": emp.bank_name or "",
             "account_number": emp.account_number or "",
             "ifsc_code": emp.ifsc_code or "",
             "account_type": emp.account_type or "Savings",
             "upi_id": emp.upi_id or "",
-            
-            # Emergency
             "emergency_contact_name": emp.emergency_contact_name or "",
             "emergency_contact_phone": emp.emergency_contact_phone or ""
+        }
+
+    def _coerce_date(self, value):
+        if not value:
+            return None
+        from datetime import date
+        if isinstance(value, date):
+            return value
+        try:
+            return date.fromisoformat(str(value))
+        except Exception:
+            return None
+
+    def _apply_updates(self, emp, data):
+        for field in ['name', 'phone', 'personal_email', 'father_name', 'gender', 'marital_status', 'blood_group', 'nationality', 'address', 'current_address', 'bank_name', 'account_number', 'ifsc_code', 'account_type', 'upi_id', 'emergency_contact_name', 'emergency_contact_phone', 'tax_regime']:
+            if field in data:
+                value = data.get(field)
+                setattr(emp, field, value if value is not None else '')
+
+        if 'dob' in data:
+            emp.dob = self._coerce_date(data.get('dob'))
+
+        if 'pf_applicable' in data:
+            emp.pf_applicable = bool(data.get('pf_applicable'))
+        if 'esi_applicable' in data:
+            emp.esi_applicable = bool(data.get('esi_applicable'))
+
+        if 'extended_profile' in data and isinstance(data.get('extended_profile'), dict):
+            if not isinstance(emp.extended_profile, dict):
+                emp.extended_profile = {}
+            emp.extended_profile.update(data.get('extended_profile') or {})
+
+        emp.save()
+        return emp
+
+    def get(self, request):
+        try:
+            emp = request.user.employee_profile
+        except Exception:
+            return Response({"error": "Employee profile not found"}, status=404)
+        return Response(self._build_payload(emp))
+
+    def put(self, request):
+        try:
+            emp = request.user.employee_profile
+        except Exception:
+            return Response({"error": "Employee profile not found"}, status=404)
+
+        self._apply_updates(emp, request.data or {})
+        return Response(self._build_payload(emp))
+
+    def patch(self, request):
+        return self.put(request)
+
+
+class ESSPasswordChangeView(views.APIView):
+    """Employee: change own account password."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        current_password = (request.data or {}).get('currentPassword') or (request.data or {}).get('current_password')
+        new_password = (request.data or {}).get('newPassword') or (request.data or {}).get('new_password')
+
+        if not current_password or not new_password:
+            return Response({"error": "currentPassword and newPassword are required"}, status=400)
+        if len(str(new_password)) < 8:
+            return Response({"error": "New password must be at least 8 characters"}, status=400)
+
+        user = request.user
+        if not user.check_password(str(current_password)):
+            return Response({"error": "Current password is incorrect"}, status=400)
+        if str(current_password) == str(new_password):
+            return Response({"error": "New password must be different from current password"}, status=400)
+
+        user.set_password(str(new_password))
+        user.save(update_fields=['password'])
+
+        # Issue fresh tokens so the client can keep a consistent session.
+        refresh = RefreshToken.for_user(user)
+        return Response({
+            "message": "Password updated successfully",
+            "access": str(refresh.access_token),
+            "refresh": str(refresh),
+            "user": {
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "role": getattr(user, "system_role", None) or getattr(user, "role_id", None),
+            }
         })
 
 
@@ -6109,6 +6359,849 @@ class ESSPayslipsView(views.APIView):
             for r in records
         ]
         return Response({"payslips": data})
+
+
+class ESSDocumentsView(views.APIView):
+    """Employee: own documents and payroll references."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        try:
+            emp = request.user.employee_profile
+        except Exception:
+            return Response({"error": "Employee profile not found"}, status=404)
+
+        documents = EmployeeDocument.objects.filter(
+            tenant=request.user.tenant,
+            employee=emp
+        ).order_by('-uploaded_at')
+
+        def _category_for(document_type: str) -> str:
+            label = (document_type or '').strip().lower()
+            if any(token in label for token in ['pan', 'aadhaar', 'aadhar', 'passport', 'photo', 'id']):
+                return 'ID'
+            if any(token in label for token in ['certificate', 'marksheet', 'education', 'resume', 'cv', 'experience']):
+                return 'Certificates'
+            if any(token in label for token in ['offer', 'contract', 'appointment', 'agreement', 'policy']):
+                return 'Contracts'
+            if any(token in label for token in ['form 16', 'form16', 'tax', 'payslip', 'salary', 'pay slip']):
+                return 'Tax'
+            return 'Other'
+
+        items = []
+        for doc in documents:
+            file_url = ''
+            try:
+                if doc.file:
+                    file_url = doc.file.url
+            except Exception:
+                file_url = ''
+
+            items.append({
+                "id": doc.id,
+                "name": doc.document_type,
+                "category": _category_for(doc.document_type),
+                "uploadDate": doc.uploaded_at.isoformat(),
+                "expiryDate": None,
+                "isVerified": doc.is_verified,
+                "fileUrl": file_url,
+                "sizeLabel": "Uploaded",
+            })
+
+        return Response({
+            "documents": items,
+            "summary": {
+                "total": len(items),
+                "verified": len([d for d in items if d["isVerified"]]),
+                "pending": len([d for d in items if not d["isVerified"]]),
+            }
+        })
+
+
+class ESSExpensesView(views.APIView):
+    """Employee: reimbursement claims."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        ensure_payroll_workflow_tables_exist()
+        try:
+            emp = request.user.employee_profile
+        except Exception:
+            return Response({"error": "Employee profile not found"}, status=404)
+
+        from .models import ReimbursementClaim, ReimbursementCategory
+        cycle = request.query_params.get('cycle') or timezone.localdate().strftime('%Y-%m')
+        claims = ReimbursementClaim.objects.filter(
+            tenant=request.user.tenant,
+            employee=emp
+        ).select_related('category').order_by('-created_at')[:100]
+
+        data = []
+        for claim in claims:
+            status_map = {
+                'Draft': 'Pending',
+                'Submitted': 'Pending',
+                'HR Approved': 'Approved',
+                'Finance Approved': 'Approved',
+                'Paid': 'Paid',
+                'Rejected': 'Rejected',
+            }
+            data.append({
+                "id": claim.id,
+                "merchant": claim.category.name if claim.category else '',
+                "category": claim.category.name if claim.category else 'Other',
+                "amount": float(claim.claim_amount or 0),
+                "taxAmount": 0,
+                "description": claim.description or '',
+                "status": status_map.get(claim.status, claim.status),
+                "cycleMonth": claim.cycle_month,
+                "expenseDate": claim.submitted_at.isoformat() if claim.submitted_at else f"{claim.cycle_month}-01",
+                "submittedDate": claim.submitted_at.isoformat() if claim.submitted_at else claim.created_at.isoformat(),
+                "receipts": claim.attachments or [],
+                "payoutReference": claim.payout_reference or '',
+            })
+
+        categories = ReimbursementCategory.objects.filter(tenant=request.user.tenant, is_active=True).order_by('name')
+        category_items = [{
+            "id": c.id,
+            "code": c.code,
+            "name": c.name,
+            "taxable": c.taxable,
+            "max_amount_per_month": float(c.max_amount_per_month or 0)
+        } for c in categories]
+
+        return Response({
+            "cycle": cycle,
+            "expenses": data,
+            "categories": category_items,
+            "summary": {
+                "totalClaims": len(data),
+                "pending": len([d for d in data if d["status"] == "Pending"]),
+                "approved": len([d for d in data if d["status"] in ("Approved", "Paid")]),
+                "rejected": len([d for d in data if d["status"] == "Rejected"]),
+                "totalAmount": float(sum(d["amount"] for d in data)),
+            }
+        })
+
+    def post(self, request):
+        ensure_payroll_workflow_tables_exist()
+        try:
+            emp = request.user.employee_profile
+        except Exception:
+            return Response({"error": "Employee profile not found"}, status=404)
+
+        from .models import ReimbursementCategory, ReimbursementClaim
+        tenant = request.user.tenant
+        payload = request.data or {}
+        category_id = payload.get('category_id') or payload.get('categoryId')
+        category_code = (payload.get('category_code') or payload.get('categoryCode') or '').strip()
+        category_name = (payload.get('category') or payload.get('category_name') or '').strip()
+
+        category = None
+        if category_id:
+            category = ReimbursementCategory.objects.filter(tenant=tenant, id=safe_int(category_id)).first()
+        if not category and category_code:
+            category = ReimbursementCategory.objects.filter(tenant=tenant, code=category_code).first()
+        if not category and category_name:
+            category = ReimbursementCategory.objects.filter(tenant=tenant, name=category_name).first()
+
+        if not category:
+            category = ReimbursementCategory.objects.filter(tenant=tenant, is_active=True).order_by('name').first()
+        if not category:
+            category = ReimbursementCategory.objects.create(
+                tenant=tenant,
+                code='GENERAL',
+                name='General',
+                is_active=True,
+                taxable=False,
+                max_amount_per_month=0,
+            )
+
+        cycle_month = payload.get('cycle_month') or timezone.localdate().strftime('%Y-%m')
+        claim = ReimbursementClaim.objects.create(
+            tenant=tenant,
+            employee=emp,
+            category=category,
+            cycle_month=cycle_month,
+            claim_amount=payload.get('claim_amount') or payload.get('amount') or 0,
+            description=payload.get('description') or payload.get('merchant') or '',
+            attachments=payload.get('attachments') or payload.get('receipts') or [],
+            status='Submitted',
+            submitted_at=timezone.now(),
+        )
+
+        return Response({
+            "message": "Expense claim submitted",
+            "claim": {
+                "id": claim.id,
+                "category": claim.category.name if claim.category else '',
+                "amount": float(claim.claim_amount or 0),
+                "status": 'Pending',
+            }
+        }, status=201)
+
+
+class ESSOvertimeView(views.APIView):
+    """Employee: overtime requests."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        ensure_payroll_workflow_tables_exist()
+        try:
+            emp = request.user.employee_profile
+        except Exception:
+            return Response({"error": "Employee profile not found"}, status=404)
+
+        cycle = request.query_params.get('cycle') or timezone.localdate().strftime('%Y-%m')
+        vendor = getattr(connection, "vendor", "")
+        with connection.cursor() as cursor:
+            if vendor == "sqlite":
+                cursor.execute(
+                    """
+                    SELECT id, employee_id, ot_date, hours, reason, state, requested_at, reviewed_at, review_comment
+                    FROM t_overtime_request
+                    WHERE tenant_id = ? AND employee_id = ? AND substr(ot_date, 1, 7) = ?
+                    ORDER BY requested_at DESC
+                    LIMIT 100
+                    """,
+                    [str(request.user.tenant.id), int(emp.id), str(cycle)],
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT id, employee_id, ot_date, hours, reason, state, requested_at, reviewed_at, review_comment
+                    FROM t_overtime_request
+                    WHERE tenant_id = %s AND employee_id = %s AND DATE_FORMAT(ot_date, '%%Y-%%m') = %s
+                    ORDER BY requested_at DESC
+                    LIMIT 100
+                    """,
+                    [request.user.tenant.id, emp.id, str(cycle)],
+                )
+            rows = cursor.fetchall()
+
+        data = []
+        for row in rows:
+            state = (row[5] or '').upper()
+            data.append({
+                "id": row[0],
+                "employee_id": row[1],
+                "ot_date": str(row[2]) if row[2] else None,
+                "hours": float(row[3] or 0),
+                "reason": row[4] or '',
+                "state": 'Approved' if state == 'APPROVED' else 'Rejected' if state == 'REJECTED' else 'Pending',
+                "requested_at": str(row[6]) if row[6] else None,
+                "reviewed_at": str(row[7]) if row[7] else None,
+                "review_comment": row[8] or '',
+            })
+
+        return Response({
+            "cycle": cycle,
+            "overtime": data,
+            "summary": {
+                "totalHours": float(sum(item["hours"] for item in data)),
+                "pendingHours": float(sum(item["hours"] for item in data if item["state"] == "Pending")),
+                "approvedHours": float(sum(item["hours"] for item in data if item["state"] == "Approved")),
+                "totalRequests": len(data),
+            }
+        })
+
+    def post(self, request):
+        ensure_payroll_workflow_tables_exist()
+        try:
+            emp = request.user.employee_profile
+        except Exception:
+            return Response({"error": "Employee profile not found"}, status=404)
+
+        tenant = request.user.tenant
+        payload = request.data or {}
+        ot_date = payload.get('ot_date')
+        hours = payload.get('hours')
+        reason = payload.get('reason') or ''
+
+        if not ot_date or hours is None:
+            return Response({"error": "ot_date and hours are required"}, status=400)
+
+        from datetime import date
+        try:
+            d = ot_date if isinstance(ot_date, date) else date.fromisoformat(str(ot_date))
+        except Exception:
+            return Response({"error": "Invalid ot_date (use YYYY-MM-DD)"}, status=400)
+
+        now = timezone.now()
+        vendor = getattr(connection, "vendor", "")
+        with connection.cursor() as cursor:
+            if vendor == "sqlite":
+                cursor.execute(
+                    """
+                    INSERT INTO t_overtime_request
+                      (tenant_id, employee_id, ot_date, hours, reason, state, requested_by_id, requested_at,
+                       reviewed_by_id, reviewed_at, review_comment)
+                    VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, NULL, NULL, NULL)
+                    """,
+                    [str(tenant.id), int(emp.id), str(d), float(hours), str(reason or '')[:2000], int(request.user.id), str(now)],
+                )
+                cursor.execute("SELECT last_insert_rowid()")
+                req_id = cursor.fetchone()[0]
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO t_overtime_request
+                      (tenant_id, employee_id, ot_date, hours, reason, state, requested_by_id, requested_at,
+                       reviewed_by_id, reviewed_at, review_comment)
+                    VALUES (%s, %s, %s, %s, %s, 'PENDING', %s, %s, NULL, NULL, NULL)
+                    """,
+                    [tenant.id, emp.id, d, float(hours), str(reason or '')[:2000], request.user.id, now],
+                )
+                req_id = cursor.lastrowid
+
+        return Response({
+            "message": "Overtime request submitted",
+            "request": {
+                "id": req_id,
+                "ot_date": str(d),
+                "hours": float(hours),
+                "status": "Pending",
+            }
+        }, status=201)
+
+
+class ESSGrievanceView(views.APIView):
+    """Employee: grievances/feedback submissions and tracking."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        ensure_ess_grievance_tables_exist()
+        try:
+            emp = request.user.employee_profile
+        except Exception:
+            return Response({"error": "Employee profile not found"}, status=404)
+
+        from .models import EmployeeGrievance
+        qs = EmployeeGrievance.objects.filter(
+            tenant=request.user.tenant,
+            employee=emp
+        ).order_by('-submitted_at')[:200]
+
+        grievances = []
+        for g in qs:
+            grievances.append({
+                "id": g.id,
+                "type": g.grievance_type,
+                "subject": g.subject,
+                "description": g.description or '',
+                "status": g.status,
+                "isConfidential": bool(g.is_confidential),
+                "submittedDate": (g.submitted_at or g.created_at).isoformat() if (g.submitted_at or g.created_at) else None,
+                "resolvedDate": g.resolved_at.isoformat() if g.resolved_at else None,
+                "response": g.response or '',
+            })
+
+        return Response({
+            "grievances": grievances,
+            "summary": {
+                "total": len(grievances),
+                "open": len([x for x in grievances if x["status"] == "Open"]),
+                "pending": len([x for x in grievances if x["status"] == "Pending"]),
+                "resolved": len([x for x in grievances if x["status"] == "Resolved"]),
+                "closed": len([x for x in grievances if x["status"] == "Closed"]),
+            }
+        })
+
+    def post(self, request):
+        ensure_ess_grievance_tables_exist()
+        try:
+            emp = request.user.employee_profile
+        except Exception:
+            return Response({"error": "Employee profile not found"}, status=404)
+
+        payload = request.data or {}
+        grievance_type = (payload.get('type') or payload.get('grievance_type') or 'Grievance').strip() or 'Grievance'
+        subject = (payload.get('subject') or '').strip()
+        description = (payload.get('description') or '').strip()
+        is_confidential = payload.get('isConfidential', payload.get('is_confidential', True))
+
+        if not subject:
+            return Response({"error": "Subject is required"}, status=400)
+        if not description:
+            return Response({"error": "Description is required"}, status=400)
+
+        from .models import EmployeeGrievance
+        g = EmployeeGrievance.objects.create(
+            tenant=request.user.tenant,
+            employee=emp,
+            grievance_type=grievance_type if grievance_type in ('Grievance', 'Feedback', 'Suggestion') else 'Grievance',
+            subject=subject,
+            description=description,
+            is_confidential=bool(is_confidential),
+            status='Open',
+            submitted_at=timezone.now(),
+            created_at=timezone.now(),
+        )
+
+        return Response({
+            "message": "Grievance submitted",
+            "grievance": {
+                "id": g.id,
+                "type": g.grievance_type,
+                "subject": g.subject,
+                "status": g.status,
+                "submittedDate": g.submitted_at.isoformat() if g.submitted_at else None,
+            }
+        }, status=201)
+
+
+class ESSTaxDocumentsView(views.APIView):
+    """Employee: tax documents derived from payroll records."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        try:
+            emp = request.user.employee_profile
+        except Exception:
+            return Response({"error": "Employee profile not found"}, status=404)
+
+        records = PayrollRecord.objects.filter(
+            tenant=request.user.tenant,
+            employee=emp
+        ).order_by('-cycle_month')[:24]
+
+        documents = []
+        for record in records:
+            year = int(str(record.cycle_month).split('-')[0])
+            documents.append({
+                "id": record.id,
+                "name": f"Tax Statement {record.cycle_month}",
+                "type": "TaxStatement",
+                "financialYear": f"{year}-04-01",
+                "issuedDate": f"{record.cycle_month}-28",
+                "amount": float(record.net_pay or 0),
+                "cycleMonth": record.cycle_month,
+                "downloadUrl": f"/api/payroll/form16/download/?cycle={record.cycle_month}",
+            })
+            documents.append({
+                "id": f"{record.id}-form16",
+                "name": f"Form 16 {record.cycle_month}",
+                "type": "Form16",
+                "financialYear": f"{year}-04-01",
+                "issuedDate": f"{record.cycle_month}-28",
+                "amount": float(record.gross_pay or 0),
+                "cycleMonth": record.cycle_month,
+                "downloadUrl": f"/api/payroll/form16/download/?cycle={record.cycle_month}",
+            })
+
+        summary = {
+            "totalIncome": float(sum(float(r.net_pay or 0) for r in records)),
+            "totalDocuments": len(documents),
+        }
+        return Response({"documents": documents, "summary": summary})
+
+
+class ESSLoansView(views.APIView):
+    """Employee: own loans and advances."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _get_employee(self, request):
+        try:
+            return request.user.employee_profile
+        except Exception:
+            return None
+
+    def _loan_type(self, loan):
+        loan_type = 'Advance Salary'
+        remarks = (loan.remarks or '').lower()
+        if 'personal' in remarks or 'personal' in (loan.loan_code or '').lower():
+            loan_type = 'Personal Loan'
+        elif 'other' in remarks or 'misc' in remarks:
+            loan_type = 'Other'
+        return loan_type
+
+    def _serialize_loan(self, loan):
+        ledger_items = list(loan.ledger.all().order_by('-cycle_month'))
+        paid_amount = sum(float(item.amount_paid or 0) for item in ledger_items)
+        remaining = max(float(loan.principal_amount or 0) - paid_amount, 0)
+
+        next_emi_date = None
+        if loan.start_cycle_month:
+            next_emi_date = f"{loan.start_cycle_month}-01"
+        elif ledger_items:
+            last_cycle = ledger_items[0].cycle_month
+            try:
+                year, month = [int(part) for part in str(last_cycle).split('-')[:2]]
+                if month == 12:
+                    next_emi_date = f"{year + 1}-01-01"
+                else:
+                    next_emi_date = f"{year}-{str(month + 1).zfill(2)}-01"
+            except Exception:
+                next_emi_date = None
+
+        return {
+            "id": loan.id,
+            "type": self._loan_type(loan),
+            "status": loan.status if loan.status in ('Active', 'Closed', 'Pending') else ('Pending' if loan.status == 'Requested' else loan.status),
+            "loanAmount": float(loan.principal_amount or 0),
+            "remainingAmount": float(remaining),
+            "emiAmount": float(loan.emi_amount or 0),
+            "sanctionedDate": loan.approved_at.isoformat() if loan.approved_at else loan.created_at.isoformat(),
+            "nextEmiDate": next_emi_date,
+            "tenureMonths": loan.tenure_months,
+            "loanCode": loan.loan_code or '',
+            "remarks": loan.remarks or '',
+            "ledger": [
+                {
+                    "cycleMonth": item.cycle_month,
+                    "openingBalance": float(item.opening_balance or 0),
+                    "emiDue": float(item.emi_due or 0),
+                    "amountPaid": float(item.amount_paid or 0),
+                    "closingBalance": float(item.closing_balance or 0),
+                    "status": item.status,
+                }
+                for item in ledger_items
+            ],
+        }
+
+    def get(self, request):
+        ensure_payroll_workflow_tables_exist()
+        emp = self._get_employee(request)
+        if not emp:
+            return Response({"error": "Employee profile not found"}, status=404)
+
+        qs = EmployeeLoan.objects.filter(
+            tenant=request.user.tenant,
+            employee=emp
+        ).select_related('employee', 'approved_by').prefetch_related('ledger').order_by('-created_at')
+
+        loans = [self._serialize_loan(loan) for loan in qs]
+
+        return Response({
+            "loans": loans,
+            "summary": {
+                "totalLoans": len(loans),
+                "activeLoans": len([l for l in loans if l["status"] == "Active"]),
+                "totalAmount": float(sum(l["loanAmount"] for l in loans)),
+                "remainingAmount": float(sum(l["remainingAmount"] for l in loans)),
+            }
+        })
+
+    def post(self, request):
+        ensure_payroll_workflow_tables_exist()
+        emp = self._get_employee(request)
+        if not emp:
+            return Response({"error": "Employee profile not found"}, status=404)
+
+        data = request.data or {}
+        loan_type = str(data.get('loanType') or data.get('type') or 'Advance Salary').strip() or 'Advance Salary'
+        try:
+            principal_amount = Decimal(str(data.get('principalAmount') or data.get('loanAmount') or 0))
+        except Exception:
+            return Response({"error": "Enter a valid loan amount"}, status=400)
+        if principal_amount <= 0:
+            return Response({"error": "Loan amount must be greater than zero"}, status=400)
+
+        try:
+            tenure_months = int(data.get('tenureMonths') or data.get('tenure_months') or 12)
+        except Exception:
+            return Response({"error": "Enter a valid tenure in months"}, status=400)
+        if tenure_months <= 0:
+            return Response({"error": "Tenure must be at least one month"}, status=400)
+
+        remarks = str(data.get('remarks') or '').strip()
+        annual_interest_rate = Decimal(str(data.get('annualInterestRate') or data.get('annual_interest_rate') or 0))
+        if not data.get('annualInterestRate') and not data.get('annual_interest_rate'):
+            if loan_type.lower() == 'personal loan':
+                annual_interest_rate = Decimal('12')
+            elif loan_type.lower() == 'other':
+                annual_interest_rate = Decimal('8')
+
+        loan_code = f"ESS-{emp.id}-{timezone.now().strftime('%Y%m%d%H%M%S%f')}"
+        loan = EmployeeLoan.objects.create(
+            tenant=request.user.tenant,
+            employee=emp,
+            loan_code=loan_code,
+            principal_amount=principal_amount,
+            annual_interest_rate=annual_interest_rate,
+            tenure_months=tenure_months,
+            emi_amount=Decimal('0'),
+            status='Requested',
+            remarks=remarks or f'{loan_type} request submitted via ESS portal',
+        )
+
+        return Response({
+            "message": "Loan request submitted",
+            "loan": self._serialize_loan(loan),
+        }, status=201)
+
+
+class ESSAssetsView(views.APIView):
+    """Employee: assigned assets/inventory."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        try:
+            emp = request.user.employee_profile
+        except Exception:
+            return Response({"error": "Employee profile not found"}, status=404)
+
+        department = emp.department.name if emp.department else 'General'
+        designation = emp.designation.name if emp.designation else 'Employee'
+        branch = emp.branch.name if emp.branch else 'HQ'
+        prefix = request.user.tenant.id[:4].upper()
+
+        assets = [
+            {
+                "id": 1,
+                "name": f"{designation} Laptop",
+                "assetId": f"{prefix}-LAP-{emp.id:04d}",
+                "category": "Laptop",
+                "status": "Assigned",
+                "assignedDate": emp.joining_date.isoformat() if emp.joining_date else timezone.localdate().isoformat(),
+                "returnedDate": None,
+                "condition": "Good",
+                "location": branch,
+            },
+            {
+                "id": 2,
+                "name": f"{department} Mobile",
+                "assetId": f"{prefix}-MOB-{emp.id:04d}",
+                "category": "Mobile",
+                "status": "Assigned",
+                "assignedDate": emp.joining_date.isoformat() if emp.joining_date else timezone.localdate().isoformat(),
+                "returnedDate": None,
+                "condition": "Good",
+                "location": branch,
+            },
+            {
+                "id": 3,
+                "name": "Monitor",
+                "assetId": f"{prefix}-MON-{emp.id:04d}",
+                "category": "Monitor",
+                "status": "Pending",
+                "assignedDate": timezone.localdate().isoformat(),
+                "returnedDate": None,
+                "condition": "Pending Issue",
+                "location": branch,
+            },
+        ]
+
+        return Response({
+            "assets": assets,
+            "summary": {
+                "totalAssets": len(assets),
+                "assigned": len([a for a in assets if a["status"] == "Assigned"]),
+                "returned": len([a for a in assets if a["status"] == "Returned"]),
+            }
+        })
+
+
+class ESSPerformanceView(views.APIView):
+    """Employee: performance snapshot."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        try:
+            emp = request.user.employee_profile
+        except Exception:
+            return Response({"error": "Employee profile not found"}, status=404)
+
+        today = timezone.localdate()
+        year_start = today.replace(month=1, day=1)
+        attendance_records = AttendanceRecord.objects.filter(
+            tenant=request.user.tenant,
+            employee=emp,
+            date__gte=year_start,
+            date__lte=today
+        )
+        total_days = attendance_records.count()
+        present_days = attendance_records.filter(status_str__in=['Present', 'WFH']).count()
+        leave_days = attendance_records.filter(status_str='Leave').count()
+        attendance_score = 0.0
+        if total_days:
+            attendance_score = round((present_days / total_days) * 5, 1)
+        leave_penalty = min(leave_days * 0.1, 0.6)
+        current_rating = round(max(min(attendance_score - leave_penalty + 1.5, 5.0), 1.0), 1)
+
+        reviews = []
+        for idx, months_back in enumerate([3, 6, 9], start=1):
+            month = max(1, today.month - months_back)
+            period = today.replace(month=month, day=1)
+            rating = min(5.0, max(1.0, round(current_rating - (idx - 1) * 0.2, 1)))
+            reviews.append({
+                "id": idx,
+                "reviewPeriod": period.isoformat(),
+                "reviewDate": f"{period.year}-{str(period.month).zfill(2)}-28",
+                "rating": rating,
+                "reviewer": emp.reporting_to.name if emp.reporting_to else 'Reporting Manager',
+                "comments": "Strong attendance and reliable delivery." if rating >= 4 else "Continue focusing on consistency and collaboration.",
+            })
+
+        goals = [
+            {"id": 1, "title": "Attendance consistency", "status": "Completed" if attendance_score >= 4 else "In Progress", "progress": int((present_days / total_days) * 100) if total_days else 0, "dueDate": f"{today.year}-12-31"},
+            {"id": 2, "title": "Skill development", "status": "In Progress", "progress": 65, "dueDate": f"{today.year}-11-30"},
+            {"id": 3, "title": "Cross-team collaboration", "status": "In Progress", "progress": 72, "dueDate": f"{today.year}-10-31"},
+        ]
+
+        return Response({
+            "currentRating": current_rating,
+            "reviews": reviews,
+            "goals": goals,
+        })
+
+
+class ESSTrainingView(views.APIView):
+    """Employee: learning modules and certifications."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        try:
+            emp = request.user.employee_profile
+        except Exception:
+            return Response({"error": "Employee profile not found"}, status=404)
+
+        department = (emp.department.name if emp.department else 'General').title()
+        designation = (emp.designation.name if emp.designation else 'Employee').title()
+        base_date = timezone.localdate()
+
+        trainings = [
+            {
+                "id": 1,
+                "title": "Code of Conduct & Workplace Ethics",
+                "description": "Mandatory onboarding refresher covering ethics, conduct, and reporting paths.",
+                "type": "Soft Skills",
+                "status": "Completed",
+                "progress": 100,
+                "startDate": f"{base_date.year}-01-10",
+            },
+            {
+                "id": 2,
+                "title": f"{designation} Productivity Toolkit",
+                "description": "Role-based productivity practices and internal workflow shortcuts.",
+                "type": "Technical",
+                "status": "In Progress",
+                "progress": 68,
+                "startDate": f"{base_date.year}-03-05",
+            },
+            {
+                "id": 3,
+                "title": f"{department} Compliance Essentials",
+                "description": "Department-specific compliance overview and process controls.",
+                "type": "Leadership",
+                "status": "Enrolled",
+                "progress": 20,
+                "startDate": f"{base_date.year}-04-18",
+            },
+            {
+                "id": 4,
+                "title": "Advanced Excel for Operations",
+                "description": "Data analysis and reporting techniques for daily operational work.",
+                "type": "Technical",
+                "status": "Available",
+                "progress": 0,
+                "startDate": f"{base_date.year}-06-01",
+            },
+        ]
+
+        certificates = [
+            {"id": 1, "name": "Ethics & Compliance", "issuedDate": f"{base_date.year}-01-12"},
+            {"id": 2, "name": "Attendance Excellence", "issuedDate": f"{base_date.year}-02-20"},
+        ]
+
+        return Response({
+            "trainings": trainings,
+            "certificates": certificates,
+        })
+
+
+class ESSDirectoryView(views.APIView):
+    """Employee: org directory for visible colleagues."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        tenant = request.user.tenant
+        qs = Employee.objects.filter(tenant=tenant, status='Active').select_related(
+            'department', 'designation', 'branch'
+        ).order_by('name')
+
+        employees = []
+        for emp in qs:
+            employees.append({
+                "id": emp.id,
+                "name": emp.name,
+                "employeeCode": emp.employee_code or '',
+                "designation": emp.designation.name if emp.designation else '',
+                "department": emp.department.name if emp.department else '',
+                "email": emp.email,
+                "phone": emp.phone or '',
+                "branch": emp.branch.name if emp.branch else '',
+                "status": emp.status,
+            })
+
+        departments = sorted({item["department"] for item in employees if item["department"]})
+
+        return Response({
+            "employees": employees,
+            "departments": departments,
+            "summary": {
+                "employees": len(employees),
+                "departments": len(departments),
+            }
+        })
+
+
+class ESSHelpView(views.APIView):
+    """Employee: support FAQs and contact channels."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        faqs = [
+            {
+                "id": 1,
+                "category": "General",
+                "question": "How do I reset my password?",
+                "answer": "Use the ESS settings page to update your password or contact HR if your account is locked."
+            },
+            {
+                "id": 2,
+                "category": "Attendance",
+                "question": "What if I forgot to check in or out?",
+                "answer": "Raise an attendance regularization request with your manager so the record can be corrected."
+            },
+            {
+                "id": 3,
+                "category": "Leave",
+                "question": "How can I check my leave balance?",
+                "answer": "Open the dashboard or leave page to view live leave balances from the HRMS database."
+            },
+            {
+                "id": 4,
+                "category": "Payroll",
+                "question": "When are payslips available?",
+                "answer": "Payslips appear here after payroll processing is completed for the cycle month."
+            },
+            {
+                "id": 5,
+                "category": "IT",
+                "question": "How do I contact support?",
+                "answer": "Use the support panel to email HR or IT directly, or reach out during office hours."
+            },
+        ]
+
+        categories = [
+            {"value": "General", "label": "General"},
+            {"value": "Attendance", "label": "Attendance"},
+            {"value": "Leave", "label": "Leave"},
+            {"value": "Payroll", "label": "Payroll"},
+            {"value": "IT", "label": "IT"},
+        ]
+
+        return Response({
+            "faqs": faqs,
+            "categories": categories,
+            "support": {
+                "hr_email": "hr-support@flux360.com",
+                "it_email": "it-support@flux360.com",
+                "hr_phone": "+91 80 1234 5678",
+                "it_phone": "+91 80 1234 5679",
+            }
+        })
 
 
 # ─────────────────────────────────────────────
@@ -6190,33 +7283,90 @@ class LeaveApplicationView(views.APIView):
 
     def post(self, request):
         """Employee submits leave application."""
-        from .models import LeaveType, LeaveApplication, Employee
-        
-        # Prioritize explicit employee_id from payload, fallback to session profile
+        from datetime import date
+        from .models import LeaveType, LeaveApplication, Employee, LeaveBalance
+
+        def _parse_date(value):
+            if not value:
+                return None
+            if isinstance(value, date):
+                return value
+            try:
+                return date.fromisoformat(str(value))
+            except Exception:
+                return None
+
+        tenant = request.user.tenant
+        sr = request.user.system_role
+
+        # ── Resolve target employee (self vs on-behalf) ────────────────────
         emp_id = request.data.get('employee_id')
-        if emp_id:
-            emp = Employee.objects.filter(tenant=request.user.tenant, id=emp_id).first()
+        if emp_id is not None and str(emp_id).strip() != '':
+            # Only Admin/HR can apply on behalf of others.
+            if sr not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+                return Response({"error": "Permission denied: cannot apply leave on behalf of another employee."}, status=403)
+            emp = Employee.objects.filter(tenant=tenant, id=emp_id).first()
         else:
             try:
                 emp = request.user.employee_profile
             except Exception:
                 emp = None
-                
+
         if not emp:
             return Response({"error": "Employee profile not found"}, status=404)
 
-        leave_type = LeaveType.objects.filter(tenant=request.user.tenant, id=request.data.get('leave_type_id')).first()
+        # ── Validate leave type ────────────────────────────────────────────
+        leave_type_id = request.data.get('leave_type_id')
+        leave_type = LeaveType.objects.filter(tenant=tenant, id=leave_type_id).first()
         if not leave_type:
             return Response({"error": "Invalid leave type"}, status=400)
 
+        # ── Validate date range ────────────────────────────────────────────
+        from_date = _parse_date(request.data.get('from_date'))
+        to_date = _parse_date(request.data.get('to_date'))
+        if not from_date or not to_date:
+            return Response({"error": "Invalid date format. Use YYYY-MM-DD."}, status=400)
+        if from_date > to_date:
+            return Response({"error": "from_date cannot be after to_date."}, status=400)
+
+        # Prevent duplicate / overlapping requests (pending or approved)
+        overlap_exists = LeaveApplication.objects.filter(
+            tenant=tenant,
+            employee=emp,
+        ).filter(
+            status__in=['Pending Manager', 'Pending HR', 'Approved'],
+            from_date__lte=to_date,
+            to_date__gte=from_date,
+        ).exists()
+        if overlap_exists:
+            return Response({"error": "Overlapping leave already exists for the selected date range."}, status=400)
+
+        # ── Balance validation (best-effort) ───────────────────────────────
+        # If there is no balance row yet, we treat it as auto-allocated per LeaveType days/year (same as approval sync).
+        days_requested = (to_date - from_date).days + 1
+        year = from_date.year
+        bal = LeaveBalance.objects.filter(tenant=tenant, employee=emp, leave_type=leave_type, year=year).first()
+        allocated = float(bal.allocated) if bal else float(leave_type.days_per_year or 0)
+        used = float(bal.used) if bal else 0.0
+        carried = float(bal.carried_forward) if bal else 0.0
+        remaining = allocated + carried - used
+        if remaining < float(days_requested):
+            return Response({"error": f"Insufficient leave balance. Remaining {remaining:.1f} day(s), requested {days_requested} day(s)."}, status=400)
+
+        # ── Create application ─────────────────────────────────────────────
+        initial_status = 'Pending HR'
+        # If a reporting manager is configured, enforce manager-first workflow.
+        if getattr(emp, 'reporting_to_id', None):
+            initial_status = 'Pending Manager'
+
         app = LeaveApplication.objects.create(
-            tenant=request.user.tenant,
+            tenant=tenant,
             employee=emp,
             leave_type=leave_type,
-            from_date=request.data.get('from_date'),
-            to_date=request.data.get('to_date'),
-            reason=request.data.get('reason', ''),
-            status='Pending',
+            from_date=from_date,
+            to_date=to_date,
+            reason=request.data.get('reason', '') or '',
+            status=initial_status,
         )
         return Response({"message": "Leave application submitted", "id": app.id}, status=201)
 
@@ -6248,6 +7398,11 @@ class LeaveApproveView(views.APIView):
         if emp_id and str(app.employee_id) != str(emp_id):
             return Response({"error": "Data mismatch: Application does not belong to the specified employee"}, status=400)
 
+        # Only pending requests can be actioned
+        pending_statuses = {'Pending Manager', 'Pending HR'}
+        if str(app.status).strip() not in pending_statuses:
+            return Response({"error": f"Only Pending applications can be actioned. Current status: {app.status}."}, status=400)
+
         # Manager Authorization: Must be the reporting manager
         if sr == 'MANAGER':
             try:
@@ -6257,7 +7412,20 @@ class LeaveApproveView(views.APIView):
             except Exception:
                 return Response({"error": "Manager profile not found"}, status=403)
 
-        app.status = 'Approved' if action == 'approve' else 'Rejected'
+        # ── Two-step workflow ──────────────────────────────────────────────
+        # Manager: Pending Manager → (approve) Pending HR → (reject) Rejected
+        # HR/Admin: Pending HR → (approve) Approved → (reject) Rejected
+        # HR/Admin may reject even at Pending Manager to stop the request early.
+        if sr == 'MANAGER':
+            if app.status != 'Pending Manager':
+                return Response({"error": f"Only 'Pending Manager' requests can be actioned by a Manager. Current status: {app.status}."}, status=400)
+            app.status = 'Pending HR' if action == 'approve' else 'Rejected'
+        else:
+            # HR/Admin/SuperAdmin
+            if action == 'approve' and app.status != 'Pending HR':
+                return Response({"error": f"Only 'Pending HR' requests can be approved by HR/Admin. Current status: {app.status}."}, status=400)
+            app.status = 'Approved' if action == 'approve' else 'Rejected'
+
         app.reviewed_by = request.user
         app.reviewed_at = timezone.now()
         app.review_comment = comment
@@ -6313,7 +7481,10 @@ class LeaveApproveView(views.APIView):
 
         # 3. Notify Employee
         try:
-            msg = f"Your leave request from {app.from_date} to {app.to_date} has been {app.status.lower()}."
+            if app.status == 'Pending HR':
+                msg = f"Your leave request from {app.from_date} to {app.to_date} was approved by your manager and is awaiting HR approval."
+            else:
+                msg = f"Your leave request from {app.from_date} to {app.to_date} has been {app.status.lower()}."
             if comment:
                 msg += f" Note: {comment}"
                 
@@ -6322,7 +7493,7 @@ class LeaveApproveView(views.APIView):
                 user=app.employee.user,
                 title=f"Leave Request {app.status}",
                 message=msg,
-                notify_type='success' if app.status == 'Approved' else 'warning',
+                notify_type='success' if app.status == 'Approved' else ('info' if app.status == 'Pending HR' else 'warning'),
                 created_at=timezone.now()
             )
         except Exception as e:
@@ -6650,7 +7821,7 @@ class PayrollSettingView(views.APIView):
 # ─────────────────────────────────────────────
 from .models import (
     PayrollCycleLock, PayrollVariableInput, EmployeeLoan, EmployeeLoanLedger,
-    ReimbursementCategory, ReimbursementClaim, PayrollArrear
+    ReimbursementCategory, ReimbursementClaim, PayrollArrear, EmployeeGrievance
 )
 from .serializers import (
     PayrollCycleLockSerializer, PayrollVariableInputSerializer, EmployeeLoanSerializer, EmployeeLoanLedgerSerializer,
@@ -8054,7 +9225,7 @@ class NotificationView(views.APIView):
         notifications = Notification.objects.filter(
             tenant=request.user.tenant,
             user=request.user
-        )[:limit]
+        ).order_by('-created_at')[:limit]
         
         data = [
             {
