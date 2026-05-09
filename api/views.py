@@ -2632,14 +2632,44 @@ class PayrollProcessView(views.APIView):
         action = request.data.get('action', 'process')
         cycle_month = request.data.get('cycle') or timezone.localdate().strftime('%Y-%m')
 
+        # Role gate: payroll processing is HR/Admin only
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+            return Response({'error': 'Permission denied'}, status=403)
+
+        # Validate action
+        allowed_actions = {'process', 'approve', 'pay', 'lock'}
+        if action not in allowed_actions:
+            return Response({'error': f"Invalid action. Allowed: {', '.join(sorted(allowed_actions))}."}, status=400)
+
+        # Validate cycle format (YYYY-MM)
+        try:
+            _y, _m = [int(x) for x in str(cycle_month).split('-')]
+            if _y < 2000 or _y > 2100 or _m < 1 or _m > 12:
+                raise ValueError("out of range")
+            cycle_month = f"{_y:04d}-{_m:02d}"
+        except Exception:
+            return Response({'error': 'Invalid cycle. Use YYYY-MM.'}, status=400)
+
         # Ensure workflow tables exist (inputs/loans/reimbursements/arrears/locks)
         ensure_payroll_workflow_tables_exist()
 
         records = PayrollRecord.objects.filter(tenant=tenant, cycle_month=cycle_month)
         
+        # Cycle lock (workflow lock table) should block any state transitions / processing
+        try:
+            cycle_lock = PayrollCycleLock.objects.filter(tenant=tenant, cycle_month=cycle_month).first()
+        except Exception:
+            cycle_lock = None
+        if cycle_lock and bool(getattr(cycle_lock, 'payroll_locked', False)):
+            return Response({'error': 'This payroll cycle is locked and cannot be modified.'}, status=400)
+
         # Check if cycle is locked
         if records.filter(status='Locked').exists():
              return Response({'error': 'This payroll cycle is locked and cannot be modified.'}, status=400)
+
+        # Require seed step before any action. UI already calls PayrollDataView which seeds records.
+        if not records.exists():
+            return Response({'error': f'No payroll records found for {cycle_month}. Please load payroll data first.'}, status=400)
 
         # Payroll settings used by the engine
         setting, _ = PayrollSetting.objects.get_or_create(
@@ -2695,6 +2725,13 @@ class PayrollProcessView(views.APIView):
                 )
             return Response({'message': 'Payroll cycle locked', 'updated': len(to_lock)})
 
+        # For processing, enforce upstream locks for consistency (attendance + leave)
+        if cycle_lock:
+            if not bool(getattr(cycle_lock, 'attendance_locked', False)):
+                return Response({'error': 'Attendance is not locked for this cycle. Lock attendance before processing payroll.'}, status=400)
+            if not bool(getattr(cycle_lock, 'leave_locked', False)):
+                return Response({'error': 'Leave is not locked for this cycle. Lock leave before processing payroll.'}, status=400)
+
         # 1. Determine calendar days in the cycle month
         import calendar as _calendar
         from datetime import datetime, timedelta
@@ -2740,8 +2777,7 @@ class PayrollProcessView(views.APIView):
                     present_report[eid] += 1
         except Exception:
             pass
-        except Exception:
-            pass
+        # (Second except removed — redundant/unreachable)
 
         # ── Process Pending records ────────────────────────────────────────────
         updated = 0
