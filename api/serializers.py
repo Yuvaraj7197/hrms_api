@@ -226,6 +226,37 @@ class PayrollVariableInputSerializer(serializers.ModelSerializer):
             'status', 'created_by', 'approved_by', 'created_at', 'updated_at',
         ]
 
+    def validate_cycle_month(self, value):
+        value = str(value or '').strip()
+        if not value or len(value) != 7 or value[4] != '-':
+            raise serializers.ValidationError('cycle_month must be in YYYY-MM format.')
+        try:
+            year, month = value.split('-')
+            year_i = int(year)
+            month_i = int(month)
+            if year_i < 2000 or month_i < 1 or month_i > 12:
+                raise ValueError
+        except Exception:
+            raise serializers.ValidationError('cycle_month must be in YYYY-MM format.')
+        return value
+
+    def validate_amount(self, value):
+        if value is None:
+            return value
+        if value < 0:
+            raise serializers.ValidationError('amount cannot be negative.')
+        return value
+
+    def validate(self, attrs):
+        input_type = str(attrs.get('input_type') or '').upper()
+        amount = attrs.get('amount')
+        meta = attrs.get('meta') or {}
+        if input_type == 'OVERTIME' and not isinstance(meta, dict):
+            raise serializers.ValidationError({'meta': 'meta must be a JSON object.'})
+        if input_type in {'INCENTIVE', 'BONUS', 'EARNING', 'ADJUSTMENT', 'REIMBURSEMENT'} and (amount is None or amount == 0):
+            raise serializers.ValidationError({'amount': 'amount is required for incentive/bonus/earning entries.'})
+        return attrs
+
 
 class EmployeeLoanSerializer(serializers.ModelSerializer):
     employee_name = serializers.CharField(source='employee.name', read_only=True, default='')
@@ -239,6 +270,41 @@ class EmployeeLoanSerializer(serializers.ModelSerializer):
             'tenure_months', 'emi_amount', 'start_cycle_month',
             'status', 'remarks', 'approved_by', 'approved_at', 'created_at',
         ]
+
+    def validate_principal_amount(self, value):
+        if value is None or value <= 0:
+            raise serializers.ValidationError('principal_amount must be greater than zero.')
+        return value
+
+    def validate_annual_interest_rate(self, value):
+        if value is None:
+            return value
+        if value < 0 or value > 100:
+            raise serializers.ValidationError('annual_interest_rate must be between 0 and 100.')
+        return value
+
+    def validate_tenure_months(self, value):
+        if value is None or value <= 0:
+            raise serializers.ValidationError('tenure_months must be greater than zero.')
+        return value
+
+    def validate_emi_amount(self, value):
+        if value is None or value < 0:
+            raise serializers.ValidationError('emi_amount cannot be negative.')
+        return value
+
+    def validate_start_cycle_month(self, value):
+        value = str(value or '').strip()
+        if value and (len(value) != 7 or value[4] != '-'):
+            raise serializers.ValidationError('start_cycle_month must be in YYYY-MM format.')
+        return value
+
+    def validate(self, attrs):
+        principal = attrs.get('principal_amount')
+        emi = attrs.get('emi_amount')
+        if principal and emi and emi > principal:
+            raise serializers.ValidationError({'emi_amount': 'emi_amount cannot exceed principal_amount.'})
+        return attrs
 
 
 class EmployeeLoanLedgerSerializer(serializers.ModelSerializer):

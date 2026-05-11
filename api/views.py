@@ -7390,24 +7390,17 @@ class LeaveApplicationView(views.APIView):
         tenant = request.user.tenant
         sr = request.user.system_role
 
-        if sr in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+        if sr in ['SUPER_ADMIN', 'ADMIN']:
             qs = LeaveApplication.objects.filter(tenant=tenant).select_related('employee', 'leave_type', 'employee__department')
-        elif sr == 'MANAGER':
-            try:
-                mgr = request.user.employee_profile
-                # Managers see leaves of people who report to them
-                qs = LeaveApplication.objects.filter(
-                    tenant=tenant, 
-                    employee__reporting_to=mgr
-                ).select_related('employee', 'leave_type', 'employee__department')
-            except Exception:
-                qs = LeaveApplication.objects.none()
         else:
-            try:
-                emp = request.user.employee_profile
-                qs = LeaveApplication.objects.filter(tenant=tenant, employee=emp).select_related('leave_type')
-            except Exception:
-                qs = LeaveApplication.objects.none()
+            scope_q = _employee_scope_filter(request)
+            if scope_q is None:
+                return Response({"error": "Employee mapping not found for your account."}, status=403)
+            scoped_employee_ids = Employee.objects.filter(tenant=tenant).filter(scope_q).values_list('id', flat=True)
+            qs = LeaveApplication.objects.filter(
+                tenant=tenant,
+                employee_id__in=list(scoped_employee_ids),
+            ).select_related('employee', 'leave_type', 'employee__department')
 
         data = [
             {
@@ -7451,9 +7444,15 @@ class LeaveApplicationView(views.APIView):
         # NOTE: ESS UI may include employee_id for "self" requests; we allow it only if it matches the session employee.
         emp_id = request.data.get('employee_id')
         if emp_id is not None and str(emp_id).strip() != '':
-            if sr in ['ADMIN', 'SUPER_ADMIN', 'HR']:
-                # Admin/HR can apply on behalf of others.
+            if sr in ['SUPER_ADMIN', 'ADMIN']:
                 emp = Employee.objects.filter(tenant=tenant, id=emp_id).first()
+            elif sr in ['HR', 'MANAGER']:
+                scope_q = _employee_scope_filter(request)
+                if scope_q is None:
+                    return Response({"error": "Employee mapping not found for your account."}, status=403)
+                emp = Employee.objects.filter(tenant=tenant, id=emp_id).filter(scope_q).first()
+                if not emp:
+                    return Response({"error": "You are not authorized to apply leave for this employee."}, status=403)
             else:
                 # Employee/Manager: only self-apply allowed.
                 try:
@@ -7504,13 +7503,17 @@ class LeaveApplicationView(views.APIView):
         # If there is no balance row yet, we treat it as auto-allocated per LeaveType days/year (same as approval sync).
         days_requested = (to_date - from_date).days + 1
         year = from_date.year
-        bal = LeaveBalance.objects.filter(tenant=tenant, employee=emp, leave_type=leave_type, year=year).first()
-        allocated = float(bal.allocated) if bal else float(leave_type.days_per_year or 0)
-        used = float(bal.used) if bal else 0.0
-        carried = float(bal.carried_forward) if bal else 0.0
-        remaining = allocated + carried - used
-        if remaining < float(days_requested):
-            return Response({"error": f"Insufficient leave balance. Remaining {remaining:.1f} day(s), requested {days_requested} day(s)."}, status=400)
+        unpaid_codes = {'LOP', 'LWP', 'UNPAID'}
+        leave_code = str(getattr(leave_type, 'code', '') or '').upper()
+        is_paid_leave = bool(getattr(leave_type, 'is_paid', True)) and leave_code not in unpaid_codes
+        if is_paid_leave:
+            bal = LeaveBalance.objects.filter(tenant=tenant, employee=emp, leave_type=leave_type, year=year).first()
+            allocated = float(bal.allocated) if bal else float(leave_type.days_per_year or 0)
+            used = float(bal.used) if bal else 0.0
+            carried = float(bal.carried_forward) if bal else 0.0
+            remaining = allocated + carried - used
+            if remaining < float(days_requested):
+                return Response({"error": f"Insufficient leave balance. Remaining {remaining:.1f} day(s), requested {days_requested} day(s)."}, status=400)
 
         # ── Create application ─────────────────────────────────────────────
         initial_status = 'Pending HR'
@@ -7537,7 +7540,7 @@ class LeaveApproveView(views.APIView):
     def post(self, request):
         from .models import LeaveApplication
         sr = request.user.system_role
-        if sr not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
+        if sr not in ['SUPER_ADMIN', 'ADMIN', 'HR', 'MANAGER']:
             return Response({"error": "Permission denied"}, status=403)
 
         app_id = request.data.get('application_id')
@@ -7549,9 +7552,23 @@ class LeaveApproveView(views.APIView):
             return Response({"error": "action must be approve or reject"}, status=400)
 
         try:
-            app = LeaveApplication.objects.select_related('employee').get(tenant=request.user.tenant, id=app_id)
+            app = LeaveApplication.objects.select_related('employee', 'leave_type').get(tenant=request.user.tenant, id=app_id)
         except LeaveApplication.DoesNotExist:
             return Response({"error": "Application not found"}, status=404)
+
+        # Strict hierarchy scoping for approvers
+        if sr == 'MANAGER':
+            mgr = getattr(request.user, 'employee_profile', None)
+            if not mgr:
+                return Response({"error": "Manager profile not found"}, status=403)
+            if app.employee.reporting_to_id != mgr.id:
+                return Response({"error": "You are not authorized to approve this leave request."}, status=403)
+        elif sr == 'HR':
+            hr_emp = getattr(request.user, 'employee_profile', None)
+            if not hr_emp:
+                return Response({"error": "HR profile not found"}, status=403)
+            if app.employee.reporting_hr_id != hr_emp.id and app.employee_id != hr_emp.id:
+                return Response({"error": "You are not authorized to approve this leave request."}, status=403)
 
         # Cross-validate employee_id if provided
         if emp_id and str(app.employee_id) != str(emp_id):
@@ -7561,15 +7578,6 @@ class LeaveApproveView(views.APIView):
         pending_statuses = {'Pending Manager', 'Pending HR'}
         if str(app.status).strip() not in pending_statuses:
             return Response({"error": f"Only Pending applications can be actioned. Current status: {app.status}."}, status=400)
-
-        # Manager Authorization: Must be the reporting manager
-        if sr == 'MANAGER':
-            try:
-                mgr = request.user.employee_profile
-                if app.employee.reporting_to_id != mgr.id:
-                    return Response({"error": "You are not authorized to approve this leave request. Only the reporting manager can approve it."}, status=403)
-            except Exception:
-                return Response({"error": "Manager profile not found"}, status=403)
 
         # ── Two-step workflow ──────────────────────────────────────────────
         # Manager: Pending Manager → (approve) Pending HR → (reject) Rejected
@@ -7595,11 +7603,12 @@ class LeaveApproveView(views.APIView):
             # Use raw IDs to be absolutely sure we target the requester (subordinate)
             target_employee_id = app.employee_id
             target_tenant_id = app.tenant_id
+            leave_code = str(getattr(app.leave_type, 'code', '') or '').upper()
+            is_paid_leave = bool(getattr(app.leave_type, 'is_paid', True)) and leave_code not in {'LOP', 'LWP', 'UNPAID'}
             
             with transaction.atomic():
                 # 1. Update Attendance Records for the requester (ID: target_employee_id)
                 # Smart Mapping: Match Attendance Status with specific Leave Type Code (CL, SL, EL, etc.)
-                leave_code = app.leave_type.code.upper()
                 status_obj = AttendanceStatus.objects.filter(code=leave_code).first()
                 if not status_obj:
                     status_obj = AttendanceStatus.objects.filter(code='LV').first()
@@ -7622,21 +7631,22 @@ class LeaveApproveView(views.APIView):
                         curr_date += timedelta(days=1)
 
                 # 2. Update Leave Balance for the requester (Self-Healing)
-                year = app.from_date.year
-                balance, created = LeaveBalance.objects.get_or_create(
-                    tenant_id=target_tenant_id,
-                    employee_id=target_employee_id,
-                    leave_type_id=app.leave_type_id,
-                    year=year,
-                    defaults={
-                        'allocated': app.leave_type.days_per_year,
-                        'used': 0,
-                        'carried_forward': 0
-                    }
-                )
-                
-                balance.used = float(balance.used) + app.days_count()
-                balance.save()
+                if is_paid_leave:
+                    year = app.from_date.year
+                    balance, created = LeaveBalance.objects.get_or_create(
+                        tenant_id=target_tenant_id,
+                        employee_id=target_employee_id,
+                        leave_type_id=app.leave_type_id,
+                        year=year,
+                        defaults={
+                            'allocated': app.leave_type.days_per_year,
+                            'used': 0,
+                            'carried_forward': 0
+                        }
+                    )
+                    
+                    balance.used = float(balance.used) + app.days_count()
+                    balance.save()
 
         # 3. Notify Employee
         try:
@@ -8758,16 +8768,22 @@ class LeaveBalanceView(views.APIView):
         employee_id = request.query_params.get('employee_id')
         year = request.query_params.get('year', str(timezone.localdate().year))
 
-        # If no employee_id specified, auto-scope to the requesting user's own employee profile
-        # for non-admin roles. Admin/HR should be able to fetch tenant-wide balances.
-        if (not employee_id) and (sr not in ['ADMIN', 'SUPER_ADMIN', 'HR']):
-            emp_profile = getattr(request.user, 'employee_profile', None)
-            if emp_profile:
-                employee_id = str(emp_profile.id)
-
         qs = LeaveBalance.objects.filter(tenant=tenant, year=year).select_related('leave_type', 'employee')
-        if employee_id:
-            qs = qs.filter(employee_id=employee_id)
+        if sr in ['SUPER_ADMIN', 'ADMIN']:
+            if employee_id:
+                qs = qs.filter(employee_id=employee_id)
+        else:
+            scope_q = _employee_scope_filter(request)
+            if scope_q is None:
+                return Response({"error": "Employee mapping not found for your account."}, status=403)
+            scoped_employee_ids = list(Employee.objects.filter(tenant=tenant).filter(scope_q).values_list('id', flat=True))
+            if employee_id:
+                employee_id_num = safe_int(employee_id)
+                if employee_id_num is None or employee_id_num not in [int(x) for x in scoped_employee_ids]:
+                    return Response({"error": "You are not authorized to access this employee record."}, status=403)
+                qs = qs.filter(employee_id=employee_id)
+            else:
+                qs = qs.filter(employee_id__in=scoped_employee_ids)
 
         # Deduplicate: one row per leave_type per employee
         seen = set()
