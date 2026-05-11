@@ -1852,7 +1852,8 @@ class OnboardingEmployeesView(views.APIView):
                         'username': generated_username,
                         'tenant': tenant,
                         # role FK left null; system_role resolves to 'EMPLOYEE' by default
-                        'is_verified': True
+                        'is_verified': True,
+                        'must_change_password': True
                     }
                 )
 
@@ -1909,7 +1910,7 @@ class OnboardingEmployeesView(views.APIView):
                     defaults={
                         'user': user,
                         'name': emp.get('name'),
-                        # 'phone': emp.get('phone') or '',
+                        'phone': emp.get('phone') or '',
                         'employee_code': emp.get('employeeCode') or emp.get('employee_code'),
                         'department': dept,
                         'designation': role,
@@ -5251,7 +5252,8 @@ class HREmployeeListView(views.APIView):
                     defaults={
                         'username': username,
                         'tenant': tenant,
-                        'is_verified': True
+                        'is_verified': True,
+                        'must_change_password': True
                     }
                 )
                 if not created:
@@ -6349,7 +6351,8 @@ class ESSPasswordChangeView(views.APIView):
             return Response({"error": "New password must be different from current password"}, status=400)
 
         user.set_password(str(new_password))
-        user.save(update_fields=['password'])
+        user.must_change_password = False
+        user.save(update_fields=['password', 'must_change_password'])
 
         # Issue fresh tokens so the client can keep a consistent session.
         refresh = RefreshToken.for_user(user)

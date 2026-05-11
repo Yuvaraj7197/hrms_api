@@ -46,6 +46,7 @@ class User(AbstractUser):
     role = models.ForeignKey('Role', on_delete=models.SET_NULL, null=True, blank=True, related_name='users')
     
     is_verified = models.BooleanField(default=False)
+    must_change_password = models.BooleanField(default=False)
 
     class Meta:
         db_table = "t_user"

@@ -22,7 +22,7 @@ class UserSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = User
-        fields = ['id', 'username', 'email', 'role', 'tenant', 'is_verified', 'employee_code']
+        fields = ['id', 'username', 'email', 'role', 'tenant', 'is_verified', 'employee_code', 'must_change_password']
 
 class RegisterSerializer(serializers.Serializer):
     company_name = serializers.CharField(max_length=255)
