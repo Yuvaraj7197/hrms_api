@@ -2251,10 +2251,14 @@ class EmployeeDocumentUploadView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, employee_id):
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER', 'EMPLOYEE']:
+            return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         employee = Employee.objects.filter(tenant=tenant, id=employee_id).first()
         if not employee:
             return Response({"error": "Employee not found"}, status=status.HTTP_404_NOT_FOUND)
+        if not _is_employee_in_scope(request, employee):
+            return _forbidden_employee_access()
 
         uploaded_file = request.FILES.get('file')
         document_type = request.data.get('document_type')
@@ -2289,6 +2293,11 @@ class EmployeeDocumentVerifyView(views.APIView):
             return Response({"error": "Permission denied"}, status=403)
 
         tenant = request.user.tenant
+        employee = Employee.objects.filter(tenant=tenant, id=employee_id).first()
+        if not employee:
+            return Response({"error": "Employee not found"}, status=status.HTTP_404_NOT_FOUND)
+        if not _is_employee_in_scope(request, employee):
+            return _forbidden_employee_access()
         doc = EmployeeDocument.objects.filter(
             tenant=tenant,
             employee_id=employee_id,
@@ -5188,6 +5197,52 @@ def require_roles(*allowed_roles):
     return decorator
 
 
+def _forbidden_employee_access(message="You are not authorized to access this employee record."):
+    return Response({"error": message}, status=403)
+
+
+def _resolve_actor_employee(request):
+    try:
+        return request.user.employee_profile
+    except Exception:
+        return None
+
+
+def _employee_scope_filter(request):
+    """
+    Hierarchy scope:
+    - SUPER_ADMIN / ADMIN: all tenant employees
+    - MANAGER: self + employees whose reporting_to == self
+    - HR: self + employees whose reporting_hr == self
+    - EMPLOYEE: self only
+    """
+    role = str(getattr(request.user, "system_role", "") or "").upper()
+    if role in ["SUPER_ADMIN", "ADMIN"]:
+        return Q()
+
+    actor = _resolve_actor_employee(request)
+    if not actor:
+        return None
+
+    if role == "MANAGER":
+        return Q(id=actor.id) | Q(reporting_to_id=actor.id)
+    if role == "HR":
+        return Q(id=actor.id) | Q(reporting_hr_id=actor.id)
+    if role == "EMPLOYEE":
+        return Q(id=actor.id)
+    return None
+
+
+def _is_employee_in_scope(request, employee):
+    scope_q = _employee_scope_filter(request)
+    if scope_q is None:
+        return False
+    return Employee.objects.filter(
+        tenant=request.user.tenant,
+        id=getattr(employee, "id", None),
+    ).filter(scope_q).exists()
+
+
 # ─────────────────────────────────────────────
 # TASK 2A — HR Employee Management
 # ─────────────────────────────────────────────
@@ -5198,31 +5253,29 @@ class HREmployeeListView(views.APIView):
     def get(self, request):
         ensure_master_tables_exist()
         ensure_branch_shift_tables_exist()
-        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER', 'EMPLOYEE']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         qs = Employee.objects.filter(tenant=tenant).select_related('department', 'designation', 'reporting_to').prefetch_related('documents')
-        
-        # MANAGER sees only their department
-        if request.user.system_role == 'MANAGER':
-            try:
-                mgr_emp = request.user.employee_profile
-                qs = qs.filter(department=mgr_emp.department)
-            except Exception:
-                qs = qs.none()
+        scope_q = _employee_scope_filter(request)
+        if scope_q is None:
+            return _forbidden_employee_access("Employee mapping not found for your account.")
+        qs = qs.filter(scope_q)
         
         serializer = EmployeeSerializer(qs, many=True, context={'request': request})
         return Response({"employees": serializer.data, "total": qs.count()})
 
     def post(self, request):
         """HR/Admin creates a new employee and optionally creates a User account."""
-        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR','MANAGER']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         payload = request.data
         ensure_branch_shift_tables_exist()
         ensure_employee_shift_assignment_tables_exist()
         ensure_hr_lifecycle_tables_exist()
+        actor_role = str(getattr(request.user, "system_role", "") or "").upper()
+        actor_emp = _resolve_actor_employee(request)
 
         # Auto-generate employee code if not provided
         emp_code = payload.get('employee_code') or self._generate_code(tenant)
@@ -5232,6 +5285,16 @@ class HREmployeeListView(views.APIView):
         manager = Employee.objects.filter(tenant=tenant, id=safe_int(payload.get('reporting_to_id'))).first()
         hr_manager = Employee.objects.filter(tenant=tenant, id=safe_int(payload.get('reporting_hr_id'))).first()
         branch = Branch.objects.filter(tenant=tenant, id=safe_int(payload.get('branch_id'))).first()
+        if actor_role in ['MANAGER', 'HR'] and not actor_emp:
+            return _forbidden_employee_access("Employee mapping not found for your account.")
+        if actor_role == 'MANAGER':
+            if manager and manager.id != actor_emp.id:
+                return _forbidden_employee_access("Manager can assign only their own reporting hierarchy.")
+            manager = actor_emp
+        if actor_role == 'HR':
+            if hr_manager and hr_manager.id != actor_emp.id:
+                return _forbidden_employee_access("HR can assign only their own reporting hierarchy.")
+            hr_manager = actor_emp
 
         with transaction.atomic():
             # Create login account if requested.
@@ -5402,13 +5465,15 @@ class HREmployeeDetailView(views.APIView):
         ensure_master_tables_exist()
         ensure_hr_lifecycle_tables_exist()
         ensure_branch_shift_tables_exist()
-        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER', 'EMPLOYEE']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         try:
             e = Employee.objects.select_related('department', 'designation', 'reporting_to').prefetch_related('documents').get(tenant=tenant, id=employee_id)
         except Employee.DoesNotExist:
             return Response({"error": "Employee not found"}, status=404)
+        if not _is_employee_in_scope(request, e):
+            return _forbidden_employee_access()
         
         serializer = EmployeeSerializer(e, context={'request': request})
         return Response(serializer.data)
@@ -5417,13 +5482,21 @@ class HREmployeeDetailView(views.APIView):
         ensure_hr_lifecycle_tables_exist()
         ensure_branch_shift_tables_exist()
         ensure_employee_shift_assignment_tables_exist()
-        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         try:
             e = Employee.objects.get(tenant=tenant, id=employee_id)
         except Employee.DoesNotExist:
             return Response({"error": "Not found"}, status=404)
+        actor_role = str(getattr(request.user, "system_role", "") or "").upper()
+        actor_emp = _resolve_actor_employee(request)
+        if not _is_employee_in_scope(request, e):
+            return _forbidden_employee_access("You are not authorized to modify this employee.")
+        if actor_role in ['MANAGER', 'HR'] and not actor_emp:
+            return _forbidden_employee_access("Employee mapping not found for your account.")
+        if actor_role == 'MANAGER':
+            return _forbidden_employee_access("Manager role cannot update employee records from this endpoint.")
 
         p = request.data
         e.name = p.get('name', e.name)
@@ -5481,9 +5554,15 @@ class HREmployeeDetailView(views.APIView):
             bid = p.get('branch_id')
             e.branch = Branch.objects.filter(tenant=tenant, id=safe_int(bid)).first() if bid else None
         if p.get('reporting_to_id'):
-            e.reporting_to = Employee.objects.filter(tenant=tenant, id=safe_int(p['reporting_to_id'])).first()
+            next_mgr = Employee.objects.filter(tenant=tenant, id=safe_int(p['reporting_to_id'])).first()
+            if actor_role == 'HR' and next_mgr and actor_emp and next_mgr.id != actor_emp.id:
+                return _forbidden_employee_access("HR can assign only their own reporting hierarchy.")
+            e.reporting_to = next_mgr
         if p.get('reporting_hr_id'):
-            e.reporting_hr = Employee.objects.filter(tenant=tenant, id=safe_int(p['reporting_hr_id'])).first()
+            next_hr = Employee.objects.filter(tenant=tenant, id=safe_int(p['reporting_hr_id'])).first()
+            if actor_role == 'HR' and next_hr and actor_emp and next_hr.id != actor_emp.id:
+                return _forbidden_employee_access("HR can assign only their own reporting hierarchy.")
+            e.reporting_hr = next_hr
         e.save()
 
         # Persist shift assignment history (effective-dated), if provided.
@@ -5567,9 +5646,14 @@ class EmployeeLifecycleView(views.APIView):
 
     def get(self, request, employee_id):
         ensure_hr_lifecycle_tables_exist()
-        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER', 'EMPLOYEE']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
+        emp = Employee.objects.filter(tenant=tenant, id=employee_id).first()
+        if not emp:
+            return Response({"error": "Employee not found"}, status=404)
+        if not _is_employee_in_scope(request, emp):
+            return _forbidden_employee_access()
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -5615,12 +5699,20 @@ class EmployeeTransferView(views.APIView):
 
     def post(self, request, employee_id):
         ensure_hr_lifecycle_tables_exist()
-        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         e = Employee.objects.filter(tenant=tenant, id=employee_id).first()
         if not e:
             return Response({"error": "Employee not found"}, status=404)
+        actor_role = str(getattr(request.user, "system_role", "") or "").upper()
+        actor_emp = _resolve_actor_employee(request)
+        if not _is_employee_in_scope(request, e):
+            return _forbidden_employee_access("You are not authorized to modify this employee.")
+        if actor_role in ['MANAGER', 'HR'] and not actor_emp:
+            return _forbidden_employee_access("Employee mapping not found for your account.")
+        if actor_role == 'MANAGER':
+            return _forbidden_employee_access("Manager role cannot transfer employees from this endpoint.")
 
         p = request.data or {}
         effective_from = p.get('effective_from') or timezone.localdate()
@@ -5633,6 +5725,8 @@ class EmployeeTransferView(views.APIView):
         to_dept = safe_int(p.get('to_department_id')) if p.get('to_department_id') else from_dept
         to_desg = safe_int(p.get('to_designation_id')) if p.get('to_designation_id') else from_desg
         to_mgr = safe_int(p.get('to_manager_id')) if p.get('to_manager_id') else from_mgr
+        if actor_role == 'HR' and to_mgr and actor_emp and to_mgr != actor_emp.id:
+            return _forbidden_employee_access("HR can assign only their own reporting hierarchy.")
 
         if to_dept:
             e.department = Department.objects.filter(tenant=tenant, id=to_dept).first()
@@ -5677,12 +5771,17 @@ class EmployeeSalaryRevisionView(views.APIView):
 
     def post(self, request, employee_id):
         ensure_hr_lifecycle_tables_exist()
-        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         e = Employee.objects.filter(tenant=tenant, id=employee_id).first()
         if not e:
             return Response({"error": "Employee not found"}, status=404)
+        actor_role = str(getattr(request.user, "system_role", "") or "").upper()
+        if not _is_employee_in_scope(request, e):
+            return _forbidden_employee_access("You are not authorized to modify this employee.")
+        if actor_role == 'MANAGER':
+            return _forbidden_employee_access("Manager role cannot revise salary from this endpoint.")
 
         p = request.data or {}
         effective_from = p.get('effective_from') or timezone.localdate()
@@ -5735,12 +5834,17 @@ class EmployeeExitView(views.APIView):
 
     def post(self, request, employee_id):
         ensure_hr_lifecycle_tables_exist()
-        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         e = Employee.objects.filter(tenant=tenant, id=employee_id).first()
         if not e:
             return Response({"error": "Employee not found"}, status=404)
+        actor_role = str(getattr(request.user, "system_role", "") or "").upper()
+        if not _is_employee_in_scope(request, e):
+            return _forbidden_employee_access("You are not authorized to modify this employee.")
+        if actor_role == 'MANAGER':
+            return _forbidden_employee_access("Manager role cannot initiate exits from this endpoint.")
 
         p = request.data or {}
         exit_type = p.get('exit_type') or 'Termination'
@@ -5783,12 +5887,17 @@ class EmployeeReinstateView(views.APIView):
 
     def post(self, request, employee_id):
         ensure_hr_lifecycle_tables_exist()
-        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         e = Employee.objects.filter(tenant=tenant, id=employee_id).first()
         if not e:
             return Response({"error": "Employee not found"}, status=404)
+        actor_role = str(getattr(request.user, "system_role", "") or "").upper()
+        if not _is_employee_in_scope(request, e):
+            return _forbidden_employee_access("You are not authorized to modify this employee.")
+        if actor_role == 'MANAGER':
+            return _forbidden_employee_access("Manager role cannot reinstate employees from this endpoint.")
 
         prev = e.status
         e.status = 'Active'
@@ -8344,9 +8453,14 @@ class EmployeeShiftAssignmentsView(views.APIView):
 
     def get(self, request, employee_id):
         ensure_employee_shift_assignment_tables_exist()
-        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER', 'EMPLOYEE']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
+        emp = Employee.objects.filter(tenant=tenant, id=employee_id).first()
+        if not emp:
+            return Response({"error": "Employee not found"}, status=404)
+        if not _is_employee_in_scope(request, emp):
+            return _forbidden_employee_access()
         with connection.cursor() as cursor:
             vendor = getattr(connection, "vendor", "")
             if vendor == "sqlite":
@@ -8390,13 +8504,18 @@ class EmployeeShiftAssignmentsView(views.APIView):
     def post(self, request, employee_id):
         ensure_employee_shift_assignment_tables_exist()
         ensure_hr_lifecycle_tables_exist()
-        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN', 'HR', 'MANAGER']:
             return Response({"error": "Permission denied"}, status=403)
         tenant = request.user.tenant
         try:
             e = Employee.objects.get(tenant=tenant, id=employee_id)
         except Employee.DoesNotExist:
             return Response({"error": "Employee not found"}, status=404)
+        actor_role = str(getattr(request.user, "system_role", "") or "").upper()
+        if not _is_employee_in_scope(request, e):
+            return _forbidden_employee_access("You are not authorized to modify this employee.")
+        if actor_role == 'MANAGER':
+            return _forbidden_employee_access("Manager role cannot assign shifts from this endpoint.")
 
         shift_id = request.data.get('shift_id')
         effective_from = request.data.get('effective_from') or request.data.get('shift_effective_from') or e.joining_date or timezone.localdate()
