@@ -7336,12 +7336,23 @@ class LeaveApplicationView(views.APIView):
         sr = request.user.system_role
 
         # ── Resolve target employee (self vs on-behalf) ────────────────────
+        # NOTE: ESS UI may include employee_id for "self" requests; we allow it only if it matches the session employee.
         emp_id = request.data.get('employee_id')
         if emp_id is not None and str(emp_id).strip() != '':
-            # Only Admin/HR can apply on behalf of others.
-            if sr not in ['ADMIN', 'SUPER_ADMIN', 'HR']:
-                return Response({"error": "Permission denied: cannot apply leave on behalf of another employee."}, status=403)
-            emp = Employee.objects.filter(tenant=tenant, id=emp_id).first()
+            if sr in ['ADMIN', 'SUPER_ADMIN', 'HR']:
+                # Admin/HR can apply on behalf of others.
+                emp = Employee.objects.filter(tenant=tenant, id=emp_id).first()
+            else:
+                # Employee/Manager: only self-apply allowed.
+                try:
+                    self_emp = request.user.employee_profile
+                except Exception:
+                    self_emp = None
+                if not self_emp:
+                    return Response({"error": "Employee profile not found"}, status=404)
+                if str(self_emp.id) != str(emp_id):
+                    return Response({"error": "Permission denied: cannot apply leave on behalf of another employee."}, status=403)
+                emp = self_emp
         else:
             try:
                 emp = request.user.employee_profile
