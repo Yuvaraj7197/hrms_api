@@ -17,6 +17,7 @@ from django.db import transaction, connection
 from django.db.models import Q
 from django.core.mail import send_mail
 from django.conf import settings
+from django.template.loader import render_to_string
 import random
 from rest_framework.permissions import AllowAny
 import string
@@ -26,6 +27,12 @@ import json
 import zipfile
 from django.http import HttpResponse
 from django.utils.text import slugify
+from pathlib import Path
+
+try:
+    from weasyprint import HTML as WeasyHTML
+except Exception:
+    WeasyHTML = None
 
 try:
     from reportlab.pdfgen import canvas as rl_canvas
@@ -1953,7 +1960,7 @@ class OnboardingSetupView(views.APIView):
         if 'companySize' in payload and 'company_size' not in payload:
             payload['company_size'] = payload.get('companySize')
 
-        serializer = OnboardingSerializer(tenant, data=payload, partial=True)
+        serializer = OnboardingSerializer(tenant, data=payload, partial=True, context={"request": request})
         if serializer.is_valid():
             serializer.save()
             step = payload.get('onboarding_step', 2)
@@ -3441,6 +3448,19 @@ class PayslipView(views.APIView):
     def get(self, request, record_id):
         try:
             record = PayrollRecord.objects.get(tenant=request.user.tenant, id=record_id)
+            out_format = (request.query_params.get('format') or 'json').lower().strip()
+
+            sr = getattr(request.user, 'system_role', None)
+            if sr in ['SUPER_ADMIN', 'ADMIN']:
+                pass
+            elif sr in ['HR', 'MANAGER']:
+                if not _is_employee_in_scope(request, record.employee):
+                    return _forbidden_employee_access("You are not authorized to access this payslip.")
+            else:
+                actor_emp = _resolve_actor_employee(request)
+                if not actor_emp or int(actor_emp.id) != int(record.employee_id):
+                    return _forbidden_employee_access("You are not authorized to access this payslip.")
+
             emp = record.employee
             # Calculate Previous Month for attendance lookback
             from datetime import datetime, timedelta
@@ -3458,7 +3478,7 @@ class PayslipView(views.APIView):
                 status__code__in=['P', 'PRESENT', 'L', 'LATE']
             ).count()
 
-            return Response({
+            payload = {
                 "company": {
                     "name": request.user.tenant.name if hasattr(request.user, 'tenant') else "Company Name",
                 },
@@ -3494,6 +3514,23 @@ class PayslipView(views.APIView):
                     "adjustments":    getattr(record, 'one_time_adjustments', []),
                     "payment_reference": getattr(record, 'payment_reference', None),
                 }
+            }
+
+            if out_format == 'pdf':
+                if WeasyHTML is None:
+                    return Response({"error": "PDF export unavailable (WeasyPrint not installed)"}, status=501)
+                try:
+                    pdf_bytes = _render_payslip_pdf_bytes(payload, request.user.tenant)
+                except Exception as exc:
+                    return Response({"error": f"Failed to generate payslip PDF: {str(exc)}"}, status=500)
+                resp = HttpResponse(pdf_bytes, content_type='application/pdf')
+                emp_code = slugify(str(emp.employee_code or emp.name or 'EMP')).upper().replace('-', '_') or 'EMP'
+                resp['Content-Disposition'] = f'attachment; filename="payslip_{emp_code}_{record.cycle_month}.pdf"'
+                resp['Access-Control-Expose-Headers'] = 'Content-Disposition'
+                return resp
+
+            return Response({
+                payload
             })
         except PayrollRecord.DoesNotExist:
             return Response({"error": "Record not found"}, status=404)
@@ -3560,182 +3597,43 @@ def _build_payslip_payload_for_record(record: PayrollRecord, tenant_name: str):
 
 def _render_payslip_pdf_bytes(payload: dict, tenant: Tenant) -> bytes:
     """
-    Render a clean, single-page payslip PDF (ReportLab Platypus).
+    Render a payslip PDF from the HTML template.
+
+    The HTML approach is easier to style and keeps the same payload shared
+    across the single-record download and the ZIP export.
     """
-    if SimpleDocTemplate is None or Table is None or colors is None:
-        raise RuntimeError("ReportLab Platypus is unavailable")
+    if WeasyHTML is None:
+        raise RuntimeError("WeasyPrint is unavailable")
 
     tenant_name = getattr(tenant, "name", "Company") or "Company"
-    tenant_addr = (getattr(tenant, "address", None) or "").strip()
-    tenant_phone = (getattr(tenant, "phone", None) or "").strip()
-    tenant_gst = (getattr(tenant, "gst_number", None) or "").strip()
-    tenant_pan = (getattr(tenant, "pan_number", None) or "").strip()
-
-    bio = io.BytesIO()
-    doc = SimpleDocTemplate(
-        bio,
-        pagesize=A4,
-        leftMargin=18 * mm,
-        rightMargin=18 * mm,
-        topMargin=16 * mm,
-        bottomMargin=14 * mm,
-        title=f"Payslip {payload.get('salary', {}).get('cycle', '')}",
+    tenant_logo_url = ""
+    tenant_logo = getattr(tenant, "logo", None)
+    if tenant_logo:
+        try:
+            tenant_logo_url = Path(tenant_logo.path).resolve().as_uri()
+        except Exception:
+            tenant_logo_url = ""
+    tenant_initials = "".join(
+        part[:1].upper()
+        for part in tenant_name.replace("&", " ").split()
+        if part[:1].isalpha()
+    )[:3] or "CO"
+    template_html = render_to_string(
+        "api/payslip_pdf.html",
+        {
+            "tenant": {
+                "name": tenant_name,
+                "initials": tenant_initials,
+                "logo_url": tenant_logo_url,
+                "address": (getattr(tenant, "address", None) or "").strip(),
+                "phone": (getattr(tenant, "phone", None) or "").strip(),
+                "gst_number": (getattr(tenant, "gst_number", None) or "").strip(),
+                "pan_number": (getattr(tenant, "pan_number", None) or "").strip(),
+            },
+            "payload": payload,
+        },
     )
-    styles = getSampleStyleSheet()
-
-    elems = []
-
-    # Header
-    header_left = f"<b>{tenant_name}</b><br/>"
-    if tenant_addr:
-        header_left += f"{tenant_addr}<br/>"
-    meta_bits = []
-    if tenant_phone:
-        meta_bits.append(f"Phone: {tenant_phone}")
-    if tenant_gst:
-        meta_bits.append(f"GST: {tenant_gst}")
-    if tenant_pan:
-        meta_bits.append(f"PAN: {tenant_pan}")
-    if meta_bits:
-        header_left += " | ".join(meta_bits)
-
-    cycle = payload["salary"]["cycle"]
-    status = payload["salary"]["status"]
-    header_right = f"<b>Payslip</b><br/>Cycle: {cycle}<br/>Status: {status}"
-
-    header_tbl = Table(
-        [[Paragraph(header_left, styles["Normal"]), Paragraph(header_right, styles["Normal"])]],
-        colWidths=[doc.width * 0.68, doc.width * 0.32],
-    )
-    header_tbl.setStyle(
-        TableStyle(
-            [
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-            ]
-        )
-    )
-    elems.append(header_tbl)
-    elems.append(Spacer(1, 6))
-
-    # Employee + summary block
-    emp = payload["employee"]
-    attendance = payload.get("attendance", {})
-    summary_tbl = Table(
-        [
-            ["Employee", f"{emp.get('name', '')} ({emp.get('code', '')})", "Net Pay", f"₹ {payload['salary']['net_pay']:.2f}"],
-            ["Department", emp.get("department", "—"), "Paid Days", f"{attendance.get('paid_days', '—')}"],
-            ["Designation", emp.get("designation", "—"), "LOP Days", f"{attendance.get('lop_days', '—')}"],
-            ["Bank", emp.get("bank_name") or "—", "A/C / IFSC", f"{emp.get('account_number') or '—'} / {emp.get('ifsc_code') or '—'}"],
-        ],
-        colWidths=[doc.width * 0.16, doc.width * 0.44, doc.width * 0.16, doc.width * 0.24],
-    )
-    summary_tbl.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
-                ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
-                ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
-                ("FONTNAME", (3, 0), (3, 0), "Helvetica-Bold"),
-                ("BACKGROUND", (2, 0), (3, 0), colors.HexColor("#EEF2FF")),
-                ("TEXTCOLOR", (2, 0), (3, 0), colors.HexColor("#3730A3")),
-                ("PADDING", (0, 0), (-1, -1), 6),
-            ]
-        )
-    )
-    elems.append(summary_tbl)
-    elems.append(Spacer(1, 10))
-
-    # Earnings & Deductions table
-    earnings = payload["salary"]["breakdown"].get("earnings", []) or []
-    deductions = payload["salary"]["breakdown"].get("deductions", []) or []
-    max_len = max(len(earnings), len(deductions), 1)
-
-    rows = [["Earnings", "Amount", "Deductions", "Amount"]]
-    for i in range(max_len):
-        e = earnings[i] if i < len(earnings) else {}
-        d = deductions[i] if i < len(deductions) else {}
-        rows.append(
-            [
-                str(e.get("name", "")) if e else "",
-                f"{float(e.get('amount', 0) or 0):.2f}" if e else "",
-                str(d.get("name", "")) if d else "",
-                f"{float(d.get('amount', 0) or 0):.2f}" if d else "",
-            ]
-        )
-
-    pay_tbl = Table(rows, colWidths=[doc.width * 0.38, doc.width * 0.12, doc.width * 0.38, doc.width * 0.12])
-    pay_tbl.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F172A")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
-                ("ALIGN", (1, 1), (1, -1), "RIGHT"),
-                ("ALIGN", (3, 1), (3, -1), "RIGHT"),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("PADDING", (0, 0), (-1, -1), 6),
-            ]
-        )
-    )
-    elems.append(pay_tbl)
-    elems.append(Spacer(1, 10))
-
-    # Totals row
-    totals_tbl = Table(
-        [
-            ["Gross Pay", f"{payload['salary']['gross_pay']:.2f}", "Total Deductions", f"{payload['salary']['total_deductions']:.2f}"],
-            ["Net Pay", f"{payload['salary']['net_pay']:.2f}", "", ""],
-        ],
-        colWidths=[doc.width * 0.25, doc.width * 0.25, doc.width * 0.25, doc.width * 0.25],
-    )
-    totals_tbl.setStyle(
-        TableStyle(
-            [
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
-                ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
-                ("FONTNAME", (2, 0), (2, 0), "Helvetica-Bold"),
-                ("FONTNAME", (0, 1), (0, 1), "Helvetica-Bold"),
-                ("BACKGROUND", (0, 1), (1, 1), colors.HexColor("#ECFDF5")),
-                ("TEXTCOLOR", (0, 1), (1, 1), colors.HexColor("#065F46")),
-                ("ALIGN", (1, 0), (1, -1), "RIGHT"),
-                ("ALIGN", (3, 0), (3, -1), "RIGHT"),
-                ("PADDING", (0, 0), (-1, -1), 6),
-            ]
-        )
-    )
-    elems.append(totals_tbl)
-    elems.append(Spacer(1, 12))
-
-    # Footer
-    footer_tbl = Table(
-        [
-            ["Prepared by", "", "Approved by", ""],
-            ["", "", "", ""],
-            ["This is a system generated payslip and does not require a signature.", "", "", ""],
-        ],
-        colWidths=[doc.width * 0.18, doc.width * 0.32, doc.width * 0.18, doc.width * 0.32],
-    )
-    footer_tbl.setStyle(
-        TableStyle(
-            [
-                ("LINEABOVE", (1, 1), (1, 1), 0.5, colors.grey),
-                ("LINEABOVE", (3, 1), (3, 1), 0.5, colors.grey),
-                ("SPAN", (0, 2), (3, 2)),
-                ("TEXTCOLOR", (0, 2), (3, 2), colors.grey),
-                ("FONTSIZE", (0, 2), (3, 2), 8),
-                ("PADDING", (0, 0), (-1, -1), 6),
-            ]
-        )
-    )
-    elems.append(footer_tbl)
-
-    doc.build(elems)
-    return bio.getvalue()
+    return WeasyHTML(string=template_html, base_url=str(settings.BASE_DIR)).write_pdf()
 
 
 class PayrollBankAdviceExportView(views.APIView):
@@ -3827,10 +3725,7 @@ class PayrollBankAdviceExportView(views.APIView):
 class PayrollPayslipsDownloadView(views.APIView):
     """
     GET /api/payroll/payslips/download/?cycle=YYYY-MM
-    Returns a ZIP of per-employee payslip JSON payloads.
-
-    (PDF generation is intentionally not included because no PDF library is pinned in this repo.
-     When you standardize PDF generation, we can switch files to .pdf without changing the UI.)
+    Returns a ZIP of per-employee payslip payloads rendered as JSON or PDF.
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -3861,8 +3756,8 @@ class PayrollPayslipsDownloadView(views.APIView):
 
                 if out_format != 'pdf':
                     return Response({"error": "Invalid format. Use format=pdf or format=json"}, status=400)
-                if rl_canvas is None or A4 is None:
-                    return Response({"error": "PDF export unavailable (reportlab not installed)"}, status=501)
+                if WeasyHTML is None:
+                    return Response({"error": "PDF export unavailable (WeasyPrint not installed)"}, status=501)
 
                 try:
                     pdf_bytes = _render_payslip_pdf_bytes(payload, tenant)

@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Payslip {{ payload.salary.cycle }}</title>
+    <style>
+        @page {
+            size: A4;
+            margin: 34mm 14mm 22mm 14mm;
+        }
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            margin: 0;
+            font-family: Arial, Helvetica, sans-serif;
+            color: #111827;
+            font-size: 11px;
+            line-height: 1.4;
+            background: #ffffff;
+        }
+        .sheet {
+            width: 100%;
+        }
+        .page-header {
+            position: fixed;
+            top: -28mm;
+            left: 0;
+            right: 0;
+            height: 22mm;
+            padding-bottom: 8px;
+            border-bottom: 2px solid #111827;
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 16px;
+        }
+        .brand {
+            flex: 1;
+            display: flex;
+            gap: 12px;
+            align-items: flex-start;
+        }
+        .brand-badge {
+            width: 42px;
+            height: 42px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #0f172a, #2563eb);
+            color: #ffffff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 13px;
+            font-weight: 700;
+            letter-spacing: .04em;
+            flex: 0 0 auto;
+            overflow: hidden;
+        }
+        .brand-badge img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
+        .brand-copy {
+            min-width: 0;
+        }
+        .company {
+            font-size: 18px;
+            font-weight: 700;
+            margin: 0 0 4px 0;
+        }
+        .meta {
+            margin: 0;
+            color: #4b5563;
+        }
+        .slip-box {
+            min-width: 180px;
+            padding: 10px 12px;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            background: #f8fafc;
+            box-shadow: inset 0 0 0 1px rgba(255,255,255,0.8);
+        }
+        .slip-box h1 {
+            margin: 0 0 6px 0;
+            font-size: 16px;
+        }
+        .slip-box p {
+            margin: 2px 0;
+        }
+        .section {
+            margin-top: 12px;
+        }
+        .section-title {
+            margin: 0 0 8px 0;
+            font-size: 12px;
+            font-weight: 700;
+            color: #0f172a;
+            text-transform: uppercase;
+            letter-spacing: .04em;
+        }
+        .grid {
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: fixed;
+        }
+        .grid td, .grid th {
+            border: 1px solid #d1d5db;
+            padding: 8px;
+            vertical-align: top;
+            word-wrap: break-word;
+        }
+        .grid th {
+            background: #f8fafc;
+            text-align: left;
+            font-weight: 700;
+        }
+        .kv {
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: fixed;
+        }
+        .kv td {
+            border: 1px solid #e5e7eb;
+            padding: 7px 8px;
+        }
+        .label {
+            width: 22%;
+            font-weight: 700;
+            background: #f9fafb;
+            color: #374151;
+        }
+        .value {
+            width: 28%;
+        }
+        .summary-row {
+            display: flex;
+            gap: 10px;
+            margin-top: 12px;
+        }
+        .card {
+            flex: 1;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            padding: 10px 12px;
+            background: #fff;
+        }
+        .card .title {
+            margin: 0 0 4px 0;
+            color: #6b7280;
+            text-transform: uppercase;
+            font-size: 10px;
+            letter-spacing: .04em;
+        }
+        .card .amount {
+            margin: 0;
+            font-size: 16px;
+            font-weight: 700;
+        }
+        .card.accent {
+            background: #0f172a;
+            border-color: #0f172a;
+        }
+        .card.accent .title,
+        .card.accent .amount {
+            color: #ffffff;
+        }
+        .muted {
+            color: #6b7280;
+        }
+        .right {
+            text-align: right;
+        }
+        .page-footer {
+            position: fixed;
+            bottom: -14mm;
+            left: 0;
+            right: 0;
+            height: 12mm;
+            border-top: 1px dashed #d1d5db;
+            padding-top: 6px;
+        }
+        .footer {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            color: #6b7280;
+            font-size: 10px;
+        }
+        .page-number::after {
+            content: "Page " counter(page) " of " counter(pages);
+        }
+        .signature-grid {
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: fixed;
+            margin-top: 12px;
+        }
+        .signature-grid td {
+            padding: 14px 8px 4px;
+        }
+        .sig-line {
+            border-top: 1px solid #9ca3af;
+            padding-top: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="sheet">
+        <div class="page-header">
+            <div class="header">
+                <div class="brand">
+                    <div class="brand-badge">
+                        {% if tenant.logo_url %}
+                            <img src="{{ tenant.logo_url }}" alt="{{ tenant.name|default:'Company' }} logo">
+                        {% else %}
+                            {{ tenant.initials|default:"CO" }}
+                        {% endif %}
+                    </div>
+                    <div class="brand-copy">
+                        <p class="company">{{ tenant.name|default:"Company" }}</p>
+                        {% if tenant.address %}<p class="meta">{{ tenant.address }}</p>{% endif %}
+                        <p class="meta">
+                            {% if tenant.phone %}Phone: {{ tenant.phone }}{% endif %}
+                            {% if tenant.gst_number %}{% if tenant.phone %} | {% endif %}GST: {{ tenant.gst_number }}{% endif %}
+                            {% if tenant.pan_number %}{% if tenant.phone or tenant.gst_number %} | {% endif %}PAN: {{ tenant.pan_number }}{% endif %}
+                        </p>
+                    </div>
+                </div>
+                <div class="slip-box">
+                    <h1>Payslip</h1>
+                    <p><strong>Cycle:</strong> {{ payload.salary.cycle }}</p>
+                    <p><strong>Status:</strong> {{ payload.salary.status|default:"—" }}</p>
+                    <p><strong>Record:</strong> #{{ payload.salary.id }}</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="page-footer">
+            <div class="footer">
+                <div>This is a system-generated payslip and does not require a physical signature.</div>
+                <div class="page-number"></div>
+            </div>
+        </div>
+
+        <div class="section">
+            <p class="section-title">Employee Summary</p>
+            <table class="kv">
+                <tr>
+                    <td class="label">Employee</td>
+                    <td class="value">{{ payload.employee.name|default:"—" }}{% if payload.employee.code %} ({{ payload.employee.code }}){% endif %}</td>
+                    <td class="label">Designation</td>
+                    <td class="value">{{ payload.employee.designation|default:"—" }}</td>
+                </tr>
+                <tr>
+                    <td class="label">Department</td>
+                    <td class="value">{{ payload.employee.department|default:"—" }}</td>
+                    <td class="label">Paid Days</td>
+                    <td class="value">{{ payload.attendance.paid_days|default:"—" }}</td>
+                </tr>
+                <tr>
+                    <td class="label">LOP Days</td>
+                    <td class="value">{{ payload.attendance.lop_days|default:"—" }}</td>
+                    <td class="label">Working Days</td>
+                    <td class="value">{{ payload.attendance.working_days|default:"—" }}</td>
+                </tr>
+                <tr>
+                    <td class="label">Bank</td>
+                    <td class="value">{{ payload.employee.bank_name|default:"—" }}</td>
+                    <td class="label">A/C / IFSC</td>
+                    <td class="value">{{ payload.employee.account_number|default:"—" }} / {{ payload.employee.ifsc_code|default:"—" }}</td>
+                </tr>
+            </table>
+        </div>
+
+        <div class="summary-row">
+            <div class="card">
+                <p class="title">Gross Pay</p>
+                <p class="amount">₹ {{ payload.salary.gross_pay|floatformat:2 }}</p>
+            </div>
+            <div class="card">
+                <p class="title">Total Deductions</p>
+                <p class="amount">₹ {{ payload.salary.total_deductions|floatformat:2 }}</p>
+            </div>
+            <div class="card accent">
+                <p class="title">Net Pay</p>
+                <p class="amount">₹ {{ payload.salary.net_pay|floatformat:2 }}</p>
+            </div>
+        </div>
+
+        <div class="section">
+            <p class="section-title">Earnings</p>
+            <table class="grid">
+                <tr>
+                    <th style="width: 70%;">Component</th>
+                    <th style="width: 30%;" class="right">Amount</th>
+                </tr>
+                {% for row in payload.salary.breakdown.earnings %}
+                    <tr>
+                        <td>{{ row.name|default:"" }}</td>
+                        <td class="right">{{ row.amount|default:0|floatformat:2 }}</td>
+                    </tr>
+                {% empty %}
+                    <tr>
+                        <td colspan="2" class="muted">No earnings were recorded for this payslip.</td>
+                    </tr>
+                {% endfor %}
+            </table>
+        </div>
+
+        <div class="section">
+            <p class="section-title">Deductions</p>
+            <table class="grid">
+                <tr>
+                    <th style="width: 70%;">Component</th>
+                    <th style="width: 30%;" class="right">Amount</th>
+                </tr>
+                {% for row in payload.salary.breakdown.deductions %}
+                    <tr>
+                        <td>{{ row.name|default:"" }}</td>
+                        <td class="right">{{ row.amount|default:0|floatformat:2 }}</td>
+                    </tr>
+                {% empty %}
+                    <tr>
+                        <td colspan="2" class="muted">No deductions were recorded for this payslip.</td>
+                    </tr>
+                {% endfor %}
+            </table>
+        </div>
+
+        {% if payload.salary.adjustments %}
+            <div class="section">
+                <p class="section-title">Adjustments</p>
+                <table class="grid">
+                    <tr>
+                        <th style="width: 70%;">Description</th>
+                        <th style="width: 30%;" class="right">Amount</th>
+                    </tr>
+                    {% for item in payload.salary.adjustments %}
+                        <tr>
+                            <td>{{ item.name|default:item.label|default:"Adjustment" }}</td>
+                            <td class="right">{{ item.amount|default:0|floatformat:2 }}</td>
+                        </tr>
+                    {% endfor %}
+                </table>
+            </div>
+        {% endif %}
+
+        <div class="section">
+            <p class="section-title">Payment Details</p>
+            <table class="kv">
+                <tr>
+                    <td class="label">Payment Reference</td>
+                    <td class="value">{{ payload.salary.payment_reference|default:"—" }}</td>
+                    <td class="label">Tax Regime</td>
+                    <td class="value">{{ payload.employee.tax_regime|default:"—" }}</td>
+                </tr>
+                <tr>
+                    <td class="label">UAN</td>
+                    <td class="value">{{ payload.employee.uan_number|default:"—" }}</td>
+                    <td class="label">PAN</td>
+                    <td class="value">{{ payload.employee.pan_number|default:"—" }}</td>
+                </tr>
+            </table>
+        </div>
+
+        <table class="signature-grid">
+            <tr>
+                <td style="width: 50%;">
+                    <div class="sig-line">Prepared By</div>
+                </td>
+                <td style="width: 50%;">
+                    <div class="sig-line">Approved By</div>
+                </td>
+            </tr>
+        </table>
+
+    </div>
+</body>
+</html>

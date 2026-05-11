@@ -6,14 +6,29 @@ from .models import (
 )
 
 class TenantSerializer(serializers.ModelSerializer):
+    logo_url = serializers.SerializerMethodField()
+
     class Meta:
         model = Tenant
         fields = [
             'id', 'name', 'domain', 'onboarding_step', 
             'address', 'phone', 'gst_number', 'pan_number', 
             'shift_start', 'shift_end', 'auto_attendance', 
-            'industry_type', 'company_size', 'country', 'currency', 'timezone'
+            'industry_type', 'company_size', 'country', 'currency', 'timezone',
+            'logo', 'logo_url'
         ]
+
+    def get_logo_url(self, obj):
+        request = self.context.get('request') if hasattr(self, 'context') else None
+        if not obj.logo:
+            return None
+        try:
+            url = obj.logo.url
+        except Exception:
+            return None
+        if request is not None:
+            return request.build_absolute_uri(url)
+        return url
 
 class UserSerializer(serializers.ModelSerializer):
     tenant = TenantSerializer(read_only=True)
@@ -38,7 +53,7 @@ class OnboardingSerializer(serializers.ModelSerializer):
     class Meta:
         model = Tenant
         fields = [
-            'name', 'domain', 'address', 'phone', 'gst_number', 'pan_number', 
+            'name', 'domain', 'address', 'phone', 'gst_number', 'pan_number', 'logo',
             'shift_start', 'shift_end', 'auto_attendance', 
             'industry_type', 'company_size', 'country', 'currency', 'timezone',
             'onboarding_step'
