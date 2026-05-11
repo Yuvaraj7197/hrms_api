@@ -4,7 +4,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import authenticate
 from django.utils import timezone
 from decimal import Decimal
-from datetime import timedelta
+from datetime import datetime, timedelta
 from .models import (
     User, Tenant, OTP, Department, Role, Employee, AttendanceRecord, PayrollRecord, 
     PayrollAuditLog, EmployeeDocument, AttendanceStatus, SalaryComponent, 
@@ -3446,94 +3446,123 @@ class EmployeeSalarySetupView(views.APIView):
 class PayslipView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
     def get(self, request, record_id):
+        sr = getattr(request.user, 'system_role', None)
+        pk = safe_int(record_id)
+        if pk is None:
+            return Response({"error": "Invalid payslip identifier."}, status=400)
+
+        tenant = request.user.tenant
+        record_qs = PayrollRecord.objects.select_related("employee", "employee__department", "employee__designation")
+        if tenant and sr not in ['SUPER_ADMIN', 'ADMIN']:
+            record_qs = record_qs.filter(tenant=tenant)
+            
+        record = record_qs.filter(id=pk).first()
+        if record is None:
+            cycle_hint = (request.query_params.get("cycle") or "").strip()[:7]
+            qs = PayrollRecord.objects.select_related(
+                "employee", "employee__department", "employee__designation"
+            )
+            if tenant and sr not in ['SUPER_ADMIN', 'ADMIN']:
+                qs = qs.filter(tenant=tenant)
+            
+            qs = qs.filter(employee_id=pk)
+            if cycle_hint:
+                qs = qs.filter(cycle_month=cycle_hint)
+            record = qs.order_by("-cycle_month", "-id").first()
+
+        if record is None:
+            return Response(
+                {
+                    "error": f"Payslip/Payroll Record not found for ID '{pk}'.",
+                    "details": {
+                        "tenant_id": getattr(tenant, 'id', None),
+                        "hint": "Ensure the ID is a valid PayrollRecord ID, or provide an Employee ID with ?cycle=YYYY-MM."
+                    }
+                },
+                status=404,
+            )
+
+        out_format = (request.query_params.get('format') or 'json').lower().strip()
+
+        sr = getattr(request.user, 'system_role', None)
+        if sr in ['SUPER_ADMIN', 'ADMIN']:
+            pass
+        elif sr in ['HR', 'MANAGER']:
+            if not _is_employee_in_scope(request, record.employee):
+                return _forbidden_employee_access("You are not authorized to access this payslip.")
+        else:
+            actor_emp = _resolve_actor_employee(request)
+            if not actor_emp or int(actor_emp.id) != int(record.employee_id):
+                return _forbidden_employee_access("You are not authorized to access this payslip.")
+
+        emp = record.employee
+        # Calculate Previous Month for attendance lookback
         try:
-            record = PayrollRecord.objects.get(tenant=request.user.tenant, id=record_id)
-            out_format = (request.query_params.get('format') or 'json').lower().strip()
+            _y, _m = map(int, str(record.cycle_month).split('-'))
+            _cur = datetime(_y, _m, 1)
+            _prev = _cur - timedelta(days=1)
+            attendance_cycle = _prev.strftime('%Y-%m')
+        except Exception:
+            attendance_cycle = record.cycle_month
 
-            sr = getattr(request.user, 'system_role', None)
-            if sr in ['SUPER_ADMIN', 'ADMIN']:
-                pass
-            elif sr in ['HR', 'MANAGER']:
-                if not _is_employee_in_scope(request, record.employee):
-                    return _forbidden_employee_access("You are not authorized to access this payslip.")
-            else:
-                actor_emp = _resolve_actor_employee(request)
-                if not actor_emp or int(actor_emp.id) != int(record.employee_id):
-                    return _forbidden_employee_access("You are not authorized to access this payslip.")
+        present_days = AttendanceRecord.objects.filter(
+            employee=emp,
+            date__startswith=attendance_cycle,
+            status__code__in=['P', 'PRESENT', 'L', 'LATE']
+        ).count()
 
-            emp = record.employee
-            # Calculate Previous Month for attendance lookback
-            from datetime import datetime, timedelta
-            try:
-                _y, _m = map(int, str(record.cycle_month).split('-'))
-                _cur = datetime(_y, _m, 1)
-                _prev = _cur - timedelta(days=1)
-                attendance_cycle = _prev.strftime('%Y-%m')
-            except Exception:
-                attendance_cycle = record.cycle_month
-
-            present_days = AttendanceRecord.objects.filter(
-                employee=emp, 
-                date__startswith=attendance_cycle,
-                status__code__in=['P', 'PRESENT', 'L', 'LATE']
-            ).count()
-
-            payload = {
-                "company": {
-                    "name": request.user.tenant.name if hasattr(request.user, 'tenant') else "Company Name",
-                },
-                "employee": {
-                    "name":           emp.name,
-                    "code":           emp.employee_code,
-                    "department":     emp.department.name if emp.department else 'N/A',
-                    "designation":    emp.designation.name if getattr(emp, 'designation', None) else 'N/A',
-                    "joining_date":   emp.joining_date.strftime('%Y-%m-%d') if emp.joining_date else None,
-                    "bank_name":      emp.bank_name,
-                    "account_number": emp.account_number,
-                    "ifsc_code":      emp.ifsc_code,
-                    "pan_number":     getattr(emp, 'pan_number', None),
-                    "uan_number":     getattr(emp, 'uan_number', None),
-                    "tax_regime":     getattr(emp, 'tax_regime', 'New'),
-                },
-                "attendance": {
-                    "working_days":   getattr(record, 'working_days', 30),
-                    "present_days":   present_days,
-                    "lop_days":       getattr(record, 'lop_days', 0),
-                    "paid_days":      getattr(record, 'working_days', 30) - getattr(record, 'lop_days', 0),
-                    "period":         attendance_cycle
-                },
-                "salary": {
-                    "id":             record.id,
-                    "cycle":          record.cycle_month,
-                    "status":         record.status,
-                    "base_salary":    float(record.base_salary),
-                    "gross_pay":      float(getattr(record, 'gross_pay', 0)),
-                    "total_deductions": float(getattr(record, 'deductions', 0)) + float(getattr(record, 'loan_emi', 0)) + float(getattr(record, 'tds_amount', 0)) + float(getattr(record, 'esi_amount', 0)),
-                    "net_pay":        float(record.net_pay),
-                    "breakdown":      record.breakdown or {"earnings": [], "deductions": []},
-                    "adjustments":    getattr(record, 'one_time_adjustments', []),
-                    "payment_reference": getattr(record, 'payment_reference', None),
-                }
+        payload = {
+            "company": {
+                "name": request.user.tenant.name if hasattr(request.user, 'tenant') else "Company Name",
+            },
+            "employee": {
+                "name":           emp.name,
+                "code":           emp.employee_code,
+                "department":     emp.department.name if emp.department else 'N/A',
+                "designation":    emp.designation.name if getattr(emp, 'designation', None) else 'N/A',
+                "joining_date":   emp.joining_date.strftime('%Y-%m-%d') if emp.joining_date else None,
+                "bank_name":      emp.bank_name,
+                "account_number": emp.account_number,
+                "ifsc_code":      emp.ifsc_code,
+                "pan_number":     getattr(emp, 'pan_number', None),
+                "uan_number":     getattr(emp, 'uan_number', None),
+                "tax_regime":     getattr(emp, 'tax_regime', 'New'),
+            },
+            "attendance": {
+                "working_days":   getattr(record, 'working_days', 30),
+                "present_days":   present_days,
+                "lop_days":       getattr(record, 'lop_days', 0),
+                "paid_days":      getattr(record, 'working_days', 30) - getattr(record, 'lop_days', 0),
+                "period":         attendance_cycle
+            },
+            "salary": {
+                "id":             record.id,
+                "cycle":          record.cycle_month,
+                "status":         record.status,
+                "base_salary":    float(record.base_salary),
+                "gross_pay":      float(getattr(record, 'gross_pay', 0)),
+                "total_deductions": float(getattr(record, 'deductions', 0)) + float(getattr(record, 'loan_emi', 0)) + float(getattr(record, 'tds_amount', 0)) + float(getattr(record, 'esi_amount', 0)),
+                "net_pay":        float(record.net_pay),
+                "breakdown":      record.breakdown or {"earnings": [], "deductions": []},
+                "adjustments":    getattr(record, 'one_time_adjustments', []),
+                "payment_reference": getattr(record, 'payment_reference', None),
             }
+        }
 
-            if out_format == 'pdf':
-                if WeasyHTML is None:
-                    return Response({"error": "PDF export unavailable (WeasyPrint not installed)"}, status=501)
-                try:
-                    pdf_bytes = _render_payslip_pdf_bytes(payload, request.user.tenant)
-                except Exception as exc:
-                    return Response({"error": f"Failed to generate payslip PDF: {str(exc)}"}, status=500)
-                resp = HttpResponse(pdf_bytes, content_type='application/pdf')
-                emp_code = slugify(str(emp.employee_code or emp.name or 'EMP')).upper().replace('-', '_') or 'EMP'
-                resp['Content-Disposition'] = f'attachment; filename="payslip_{emp_code}_{record.cycle_month}.pdf"'
-                resp['Access-Control-Expose-Headers'] = 'Content-Disposition'
-                return resp
+        if out_format == 'pdf':
+            if WeasyHTML is None:
+                return Response({"error": "PDF export unavailable (WeasyPrint not installed)"}, status=501)
+            try:
+                pdf_bytes = _render_payslip_pdf_bytes(payload, request.user.tenant)
+            except Exception as exc:
+                return Response({"error": f"Failed to generate payslip PDF: {str(exc)}"}, status=500)
+            resp = HttpResponse(pdf_bytes, content_type='application/pdf')
+            emp_code = slugify(str(emp.employee_code or emp.name or 'EMP')).upper().replace('-', '_') or 'EMP'
+            resp['Content-Disposition'] = f'attachment; filename="payslip_{emp_code}_{record.cycle_month}.pdf"'
+            resp['Access-Control-Expose-Headers'] = 'Content-Disposition'
+            return resp
 
-            return Response({
-                payload
-            })
-        except PayrollRecord.DoesNotExist:
-            return Response({"error": "Record not found"}, status=404)
+        return Response(payload)
 
 
 def _build_payslip_payload_for_record(record: PayrollRecord, tenant_name: str):
@@ -3543,7 +3572,6 @@ def _build_payslip_payload_for_record(record: PayrollRecord, tenant_name: str):
     """
     emp = record.employee
 
-    from datetime import datetime, timedelta
     try:
         _y, _m = map(int, str(record.cycle_month).split('-'))
         _cur = datetime(_y, _m, 1)
@@ -7258,7 +7286,7 @@ class LeaveTypeView(views.APIView):
         from .models import LeaveType
         types = LeaveType.objects.filter(tenant=request.user.tenant)
         return Response({"leave_types": [
-            {"id": t.id, "name": t.name, "days_per_year": t.days_per_year, "is_paid": t.is_paid}
+            {"id": t.id, "name": t.name, "code": t.code, "days_per_year": t.days_per_year, "is_paid": t.is_paid}
             for t in types
         ]})
 
@@ -8692,6 +8720,7 @@ class LeaveBalanceView(views.APIView):
                 "id": lb.id,
                 "employee_id": str(lb.employee_id),
                 "employee_name": lb.employee.name,
+                "leave_type_id": lb.leave_type_id,
                 "leave_type": lb.leave_type.name,
                 "leave_code": lb.leave_type.code,
                 "allocated": float(lb.allocated),
@@ -8763,6 +8792,47 @@ class SeedDefaultsView(views.APIView):
         try:
             seed_tenant_defaults(request.user.tenant)
             return Response({"message": "Master data seeded successfully for your tenant."})
+        except Exception as e:
+            return Response({"error": str(e)}, status=500)
+
+
+class AdminFreshResetView(views.APIView):
+    """
+    Admin-only destructive reset.
+
+    Deletes all tenant-scoped data, tenant/user accounts, and onboarding records
+    while leaving global master tables intact (m_industry / m_department / m_role
+    and other system lookup tables that are not tenant-owned).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        if request.user.system_role not in ['ADMIN', 'SUPER_ADMIN']:
+            return Response({"error": "Permission denied"}, status=403)
+
+        confirm = str(request.data.get('confirm') or '').strip().upper()
+        if confirm != 'RESET_ALL_TENANT_DATA':
+            return Response(
+                {"error": "Confirmation required. Send confirm=RESET_ALL_TENANT_DATA to proceed."},
+                status=400,
+            )
+
+        actor = request.user.username
+        tenant_name = getattr(getattr(request.user, 'tenant', None), 'name', None)
+
+        try:
+            with transaction.atomic():
+                # Remove all tenant/user data. Everything tenant-owned cascades from Tenant.
+                User.objects.all().delete()
+                Tenant.objects.all().delete()
+
+            return Response({
+                "status": "success",
+                "message": "All tenant data has been cleared. Master data has been preserved.",
+                "actor": actor,
+                "tenant": tenant_name,
+                "next_step": "Register a new tenant/company to start fresh.",
+            })
         except Exception as e:
             return Response({"error": str(e)}, status=500)
 

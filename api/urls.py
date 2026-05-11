@@ -52,13 +52,15 @@ urlpatterns = [
     path('attendance/export/',       views.AttendanceExportView.as_view(),        name='attendance_export'),
 
     # ── Payroll ────────────────────────────────────────
+    path('payroll/payslip/<int:record_id>/', views.PayslipView.as_view(),         name='payroll_payslip_detail'),
+    path('payroll/payslip/<int:record_id>',  views.PayslipView.as_view()),
     path('payroll/data/',            views.PayrollDataView.as_view(),             name='payroll_data'),
     path('payroll/process/',         views.PayrollProcessView.as_view(),          name='payroll_process'),
     path('payroll/simulate/',        views.PayrollSimulateView.as_view(),         name='payroll_simulate'),
     path('payroll/components/',      views.SalaryComponentView.as_view(),         name='salary_components'),
     path('payroll/structures/',      views.SalaryStructureView.as_view(),         name='salary_structures'),
     path('payroll/setup/',           views.EmployeeSalarySetupView.as_view(),     name='employee_salary_setup'),
-    path('payroll/payslip/<int:record_id>/', views.PayslipView.as_view(),         name='payroll_payslip_detail'),
+    path('test-routing/', views.DashboardView.as_view(), name='test_routing'),
     path('payroll/adjust/<int:record_id>/', views.PayrollAdjustmentView.as_view(),name='payroll_adjustment'),
     path('payroll/settings/',        views.PayrollSettingView.as_view(),          name='payroll_settings'),
     path('payroll/cycle-lock/',      views.PayrollCycleLockView.as_view(),        name='payroll_cycle_lock'),
@@ -119,6 +121,7 @@ urlpatterns = [
 
     # ── Admin Utilities ────────────────────────────────
     path('admin/seed-defaults/',     views.SeedDefaultsView.as_view(),           name='seed_defaults'),
+    path('admin/fresh-reset/',       views.AdminFreshResetView.as_view(),        name='admin_fresh_reset'),
     path('admin/setup-wizard/',      views.AdminSetupWizardView.as_view(),       name='admin_setup_wizard'),
     path('admin/permissions/',      views.AdminPermissionsView.as_view(),       name='admin_permissions'),
     path('admin/user-role-update/', views.UserRoleUpdateView.as_view(),        name='admin_user_role_update'),
